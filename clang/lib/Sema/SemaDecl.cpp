@@ -77,7 +77,7 @@
 
 using namespace clang;
 namespace clang {
-void cppshHideCommandNamedC(Sema &S, LookupResult &R, const IdentifierInfo *II,
+bool cppshHideCommandNamedC(Sema &S, LookupResult &R, const IdentifierInfo *II,
                             SourceLocation Loc);
 } // namespace clang
 using namespace sema;
@@ -935,8 +935,9 @@ Sema::NameClassification Sema::ClassifyName(Scope *S, CXXScopeSpec &SS,
   LookupResult Result(*this, Name, NameLoc, LookupOrdinaryName);
   LookupParsedName(Result, S, &SS, /*ObjectType=*/QualType(),
                    /*AllowBuiltinCreation=*/!CurMethod);
-  if (SS.isEmpty())
-    cppshHideCommandNamedC(*this, Result, Name, NameLoc);
+  // A C function hidden (cppsh: `sleep` is the program): not found, and not
+  // to be found again by typo correction either.
+  const bool CppshHid = SS.isEmpty() && cppshHideCommandNamedC(*this, Result, Name, NameLoc);
 
   if (SS.isInvalid())
     return NameClassification::Error();
@@ -965,7 +966,7 @@ Sema::NameClassification Sema::ClassifyName(Scope *S, CXXScopeSpec &SS,
       LookupBuiltin(Result);
   }
 
-  bool SecondTry = false;
+  bool SecondTry = CppshHid;
   bool IsFilteredTemplateName = false;
 
 Corrected:

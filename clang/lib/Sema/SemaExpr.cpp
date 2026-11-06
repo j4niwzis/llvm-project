@@ -141,14 +141,15 @@ static bool cppshInUserInput(Sema &S, SourceLocation L) {
 // name the user types finds: `sleep 30` runs the program. The C function is
 // still there as `::sleep`. (ActOnIdExpression, and ClassifyName, which
 // looks a name up on its own at the start of a statement.)
-void cppshHideCommandNamedC(Sema &S, LookupResult &R, const IdentifierInfo *II,
+bool cppshHideCommandNamedC(Sema &S, LookupResult &R, const IdentifierInfo *II,
                             SourceLocation Loc) {
   static constexpr llvm::StringLiteral Names[] = {
       "chmod", "chown", "chroot", "kill",  "link",   "mkdir",    "mkfifo",
       "mknod", "nice",  "rmdir",  "sleep", "sync",   "truncate", "unlink"};
   if (R.empty() || !II || !cppshInUserInput(S, Loc) ||
       !llvm::is_contained(Names, II->getName()))
-    return;
+    return false;
+  bool Hid = false;
   LookupResult::Filter F = R.makeFilter();
   while (F.hasNext()) {
     auto *FD = dyn_cast<FunctionDecl>(F.next()->getUnderlyingDecl());
@@ -157,10 +158,13 @@ void cppshHideCommandNamedC(Sema &S, LookupResult &R, const IdentifierInfo *II,
     // its headers as system ones (std.sh, built from source, may not).
     if (FD && FD->isExternC() &&
         FD->getDeclContext()->getRedeclContext()->isTranslationUnit() &&
-        !cppshInUserInput(S, FD->getLocation()))
+        !cppshInUserInput(S, FD->getLocation())) {
       F.erase();
+      Hid = true;
+    }
   }
   F.done();
+  return Hid;
 }
 
 // `e.name` on a std::variant the user typed (an entry of `ls`): the member
