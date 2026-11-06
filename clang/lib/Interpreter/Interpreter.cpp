@@ -755,7 +755,17 @@ static const char *const CppShStdModulePrelude = R"CPPSH(
 #include <unordered_set>
 #include <algorithm>
 #include <numeric>
+#define _1 __cppsh_orig_placeholder_1
+#define _2 __cppsh_orig_placeholder_2
+#define _3 __cppsh_orig_placeholder_3
+#define _4 __cppsh_orig_placeholder_4
+#define _5 __cppsh_orig_placeholder_5
 #include <functional>
+#undef _1
+#undef _2
+#undef _3
+#undef _4
+#undef _5
 #include <optional>
 #include <variant>
 #include <tuple>
@@ -888,6 +898,14 @@ struct cppsh_str {
     unsigned long slen = strlen(suf);
     return len_ >= slen && strcmp(c_str() + (len_ - slen), suf) == 0;
   }
+  cppsh_str substr(unsigned long pos = 0, unsigned long count = ~0UL) const {
+    if (pos >= len_)
+      return cppsh_str("", 0);
+    unsigned long rlen = len_ - pos;
+    if (count < rlen)
+      rlen = count;
+    return cppsh_str(c_str() + pos, rlen);
+  }
   void dump() const { printf("%s\n", c_str()); }
 
   friend cppsh_str operator+(const cppsh_str &a, const cppsh_str &b) {
@@ -935,34 +953,286 @@ constexpr const char *__cppsh_cstr(const T &v) {
     return static_cast<const char *>(v);
 }
 
+template <typename T>
+T &&__cppsh_declval() noexcept;
+
+namespace meta {
+
+struct info {
+  unsigned long long id = 0;
+  unsigned int kind = 0;
+  const char *name = nullptr;
+  const info *members = nullptr;
+  unsigned int num_members = 0;
+
+  constexpr bool operator==(const info &o) const noexcept {
+    return id == o.id && kind == o.kind;
+  }
+  constexpr bool operator!=(const info &o) const noexcept {
+    return !(*this == o);
+  }
+};
+
+struct info_range {
+  const info *data_ = nullptr;
+  unsigned int size_ = 0;
+  constexpr const info *begin() const noexcept { return data_; }
+  constexpr const info *end() const noexcept { return data_ + size_; }
+  constexpr unsigned int size() const noexcept { return size_; }
+  constexpr bool empty() const noexcept { return size_ == 0; }
+  constexpr const info &operator[](unsigned int i) const noexcept {
+    return data_[i];
+  }
+};
+
+template <typename T>
+constexpr info __reflect() noexcept {
+  return {};
+}
+
+template <unsigned long long Id, typename... Args>
+constexpr decltype(auto) __splice_call(Args &&...args);
+
+constexpr const char *identifier_of(info r) noexcept {
+  return r.name ? r.name : "";
+}
+constexpr bool is_type(info r) noexcept { return r.kind == 1; }
+constexpr bool is_nonstatic_data_member(info r) noexcept { return r.kind == 2; }
+constexpr bool is_member_function(info r) noexcept { return r.kind == 3; }
+constexpr bool is_function(info r) noexcept {
+  return r.kind == 3 || r.kind == 4;
+}
+constexpr info remove_cvref(info r) noexcept { return r; }
+constexpr info_range members_of(info r) noexcept {
+  return {r.members, r.num_members};
+}
+
+constexpr bool __streq(const char *a, const char *b) noexcept {
+  if (!a || !b)
+    return false;
+  while (*a && *b) {
+    if (*a != *b)
+      return false;
+    ++a;
+    ++b;
+  }
+  return *a == *b;
+}
+
+constexpr info find_member(info r, const char *target) noexcept {
+  for (info m : members_of(r))
+    if (__streq(identifier_of(m), target))
+      return m;
+  return {};
+}
+
+} // namespace meta
+
+template <typename T> struct __cppsh_rm_cvref { using type = T; };
+template <typename T> struct __cppsh_rm_cvref<T &> { using type = T; };
+template <typename T> struct __cppsh_rm_cvref<T &&> { using type = T; };
+template <typename T> struct __cppsh_rm_cvref<const T> { using type = T; };
+template <typename T> struct __cppsh_rm_cvref<const T &> { using type = T; };
+template <typename T> struct __cppsh_rm_cvref<const T &&> { using type = T; };
+
+template <typename F>
+struct cppsh_proj;
+
+template <typename T>
+inline constexpr bool __cppsh_is_proj = false;
+template <typename F>
+inline constexpr bool __cppsh_is_proj<cppsh_proj<F>> = true;
+
+template <typename Arg, typename... Xs>
+  requires (!__cppsh_is_proj<typename __cppsh_rm_cvref<Arg>::type>)
+constexpr Arg &&__cppsh_eval_arg(Arg &&arg, Xs &&...) noexcept {
+  return static_cast<Arg &&>(arg);
+}
+
+template <typename Arg, typename... Xs>
+  requires (__cppsh_is_proj<typename __cppsh_rm_cvref<Arg>::type>)
+constexpr auto __cppsh_eval_arg(Arg &&arg, Xs &&...xs)
+    -> decltype(static_cast<Arg &&>(arg)(static_cast<Xs &&>(xs)...)) {
+  return static_cast<Arg &&>(arg)(static_cast<Xs &&>(xs)...);
+}
+
+template <typename Obj, unsigned long long MemId>
+struct __cppsh_bound_member {
+  Obj obj;
+  template <typename... Args>
+  constexpr decltype(auto) operator()(Args &&...args) {
+    constexpr meta::info mem{MemId, 3};
+    return obj.[:mem:](static_cast<Args &&>(args)...);
+  }
+  template <typename... Args>
+  constexpr decltype(auto) operator()(Args &&...args) const {
+    constexpr meta::info mem{MemId, 3};
+    return obj.[:mem:](static_cast<Args &&>(args)...);
+  }
+};
+
+template <typename Prev, char... Cs>
+struct __cppsh_member_fn {
+  Prev prev;
+  static constexpr const char name[sizeof...(Cs) + 1] = {Cs..., '\0'};
+
+  template <typename... Xs>
+  static consteval bool is_data_member_eval() {
+    if constexpr (sizeof...(Xs) == 0) {
+      return false;
+    } else if constexpr (requires {
+                           __cppsh_declval<const Prev &>()(
+                               __cppsh_declval<Xs>()...);
+                         }) {
+      using ObjT =
+          decltype(__cppsh_declval<const Prev &>()(__cppsh_declval<Xs>()...));
+      constexpr meta::info mem = meta::find_member(^^ObjT, name);
+      return meta::is_nonstatic_data_member(mem);
+    } else {
+      return false;
+    }
+  }
+
+  template <typename... Xs>
+  static consteval bool is_method_eval() {
+    if constexpr (sizeof...(Xs) == 0) {
+      return false;
+    } else if constexpr (requires {
+                           __cppsh_declval<const Prev &>()(
+                               __cppsh_declval<Xs>()...);
+                         }) {
+      using ObjT =
+          decltype(__cppsh_declval<const Prev &>()(__cppsh_declval<Xs>()...));
+      constexpr meta::info mem = meta::find_member(^^ObjT, name);
+      return meta::is_member_function(mem);
+    } else {
+      return false;
+    }
+  }
+
+  template <typename... Xs>
+    requires (is_data_member_eval<Xs...>())
+  constexpr decltype(auto) operator()(Xs &&...xs) const {
+    auto &&obj = prev(static_cast<Xs &&>(xs)...);
+    constexpr meta::info mem = meta::find_member(^^decltype(obj), name);
+    return obj.[:mem:];
+  }
+
+  template <typename... Xs>
+    requires (is_method_eval<Xs...>())
+  constexpr auto bind_obj(Xs &&...xs) const {
+    using ObjT = decltype(prev(static_cast<Xs &&>(xs)...));
+    constexpr meta::info mem = meta::find_member(^^ObjT, name);
+    return __cppsh_bound_member<ObjT, mem.id>{
+        prev(static_cast<Xs &&>(xs)...)};
+  }
+};
+
+template <typename T>
+inline constexpr bool __cppsh_is_member_fn = false;
+template <typename Prev, char... Cs>
+inline constexpr bool __cppsh_is_member_fn<__cppsh_member_fn<Prev, Cs...>> =
+    true;
+
+template <typename F, typename... Args>
+inline constexpr bool __cppsh_is_data_member_eval = false;
+template <typename Prev, char... Cs, typename... Args>
+inline constexpr bool
+    __cppsh_is_data_member_eval<__cppsh_member_fn<Prev, Cs...>, Args...> =
+        __cppsh_member_fn<Prev, Cs...>::template is_data_member_eval<Args...>();
+
+template <typename MemberFn, typename CallLambda>
+struct __cppsh_call_fn {
+  MemberFn mem_fn;
+  CallLambda call_fn;
+  template <typename... Xs>
+    requires (MemberFn::template is_method_eval<Xs...>())
+  constexpr decltype(auto) operator()(Xs &&...xs) const {
+    return call_fn(static_cast<Xs &&>(xs)...);
+  }
+};
+
 template <typename F>
 struct cppsh_proj {
   F fn;
-  template <typename T>
-  constexpr decltype(auto) operator()(T &&x) const {
-    return fn(static_cast<T &&>(x));
+
+  template <typename... Args>
+    requires (!__cppsh_is_member_fn<F> &&
+              requires { fn(__cppsh_declval<Args>()...); })
+  constexpr decltype(auto) operator()(Args &&...args) const {
+    return fn(static_cast<Args &&>(args)...);
   }
+
+  template <typename... Args>
+    requires (__cppsh_is_member_fn<F> &&
+              __cppsh_is_data_member_eval<F, Args...>)
+  constexpr decltype(auto) operator()(Args &&...args) const {
+    return fn(static_cast<Args &&>(args)...);
+  }
+
+  template <typename... Args>
+    requires (__cppsh_is_member_fn<F> &&
+              !__cppsh_is_data_member_eval<F, Args...>)
+  constexpr auto operator()(Args &&...args) const {
+    auto call_l = [f = fn, ...a = static_cast<Args &&>(args)](
+                      auto &&...xs) -> decltype(auto) {
+      return f.bind_obj(static_cast<decltype(xs) &&>(xs)...)(
+          __cppsh_eval_arg(a, static_cast<decltype(xs) &&>(xs)...)...);
+    };
+    using CallFnT = __cppsh_call_fn<F, decltype(call_l)>;
+    return cppsh_proj<CallFnT>{CallFnT{fn, call_l}};
+  }
+
   template <char... Cs>
   constexpr auto operator_unresolved() const {
-    auto next = [prev = fn](auto &&x) -> decltype(auto) {
-      auto &&obj = prev(static_cast<decltype(x) &&>(x));
-      return obj.template __cppsh_member<Cs...>;
+    using NextT = __cppsh_member_fn<F, Cs...>;
+    return cppsh_proj<NextT>{NextT{fn}};
+  }
+
+  template <unsigned long long FnId, typename... Args>
+  static constexpr auto operator_apply(Args &&...args) {
+    constexpr meta::info Fn{FnId, 4};
+    auto next = [...a = static_cast<Args &&>(args)](auto &&...xs)
+        -> decltype([:Fn:](
+            __cppsh_eval_arg(a, static_cast<decltype(xs) &&>(xs)...)...)) {
+      return [:Fn:](
+          __cppsh_eval_arg(a, static_cast<decltype(xs) &&>(xs)...)...);
     };
     return cppsh_proj<decltype(next)>{next};
   }
+
   constexpr auto operator!() const {
-    auto p = [f = fn](auto &&x) { return !f(static_cast<decltype(x) &&>(x)); };
+    auto p = [f = fn](auto &&...xs)
+        -> decltype(!f(static_cast<decltype(xs) &&>(xs)...)) {
+      return !f(static_cast<decltype(xs) &&>(xs)...);
+    };
     return cppsh_proj<decltype(p)>{p};
   }
   constexpr auto operator-() const {
-    auto p = [f = fn](auto &&x) { return -f(static_cast<decltype(x) &&>(x)); };
+    auto p = [f = fn](auto &&...xs)
+        -> decltype(-f(static_cast<decltype(xs) &&>(xs)...)) {
+      return -f(static_cast<decltype(xs) &&>(xs)...);
+    };
     return cppsh_proj<decltype(p)>{p};
   }
 #define CPPSH_BINOP(OP)                                                        \
   template <typename R>                                                        \
   constexpr auto operator OP(R rhs) const {                                    \
-    auto p = [f = fn, r = rhs](auto &&x) {                                     \
-      return f(static_cast<decltype(x) &&>(x)) OP r;                           \
+    auto p = [f = fn, r = rhs](auto &&...xs)                                   \
+        -> decltype(f(static_cast<decltype(xs) &&>(xs)...)                     \
+                        OP __cppsh_eval_arg(                                   \
+                            r, static_cast<decltype(xs) &&>(xs)...)) {         \
+      return f(static_cast<decltype(xs) &&>(xs)...)                            \
+          OP __cppsh_eval_arg(r, static_cast<decltype(xs) &&>(xs)...);         \
+    };                                                                         \
+    return cppsh_proj<decltype(p)>{p};                                         \
+  }                                                                            \
+  template <typename L>                                                        \
+    requires (!__cppsh_is_proj<typename __cppsh_rm_cvref<L>::type>)            \
+  friend constexpr auto operator OP(L lhs, const cppsh_proj &rhs) {            \
+    auto p = [l = lhs, rf = rhs.fn](auto &&...xs)                              \
+        -> decltype(l OP rf(static_cast<decltype(xs) &&>(xs)...)) {            \
+      return l OP rf(static_cast<decltype(xs) &&>(xs)...);                     \
     };                                                                         \
     return cppsh_proj<decltype(p)>{p};                                         \
   }
@@ -989,16 +1259,31 @@ struct cppsh_placeholder_root {
   }
 };
 
+template <unsigned int I>
+struct cppsh_arg_n {
+  template <typename T0, typename... Ts>
+    requires (1 + sizeof...(Ts) >= I)
+  static constexpr decltype(auto) pick(T0 &&x0, Ts &&...xs) noexcept {
+    if constexpr (I == 1)
+      return static_cast<T0 &&>(x0);
+    else
+      return cppsh_arg_n<I - 1>::pick(static_cast<Ts &&>(xs)...);
+  }
+  template <typename... Xs>
+    requires (sizeof...(Xs) >= I)
+  constexpr decltype(auto) operator()(Xs &&...xs) const noexcept {
+    return pick(static_cast<Xs &&>(xs)...);
+  }
+};
+
 namespace placeholders {
 inline constexpr cppsh_proj<cppsh_placeholder_root> _{cppsh_placeholder_root{}};
+inline constexpr cppsh_proj<cppsh_arg_n<1>> _1{cppsh_arg_n<1>{}};
+inline constexpr cppsh_proj<cppsh_arg_n<2>> _2{cppsh_arg_n<2>{}};
+inline constexpr cppsh_proj<cppsh_arg_n<3>> _3{cppsh_arg_n<3>{}};
+inline constexpr cppsh_proj<cppsh_arg_n<4>> _4{cppsh_arg_n<4>{}};
+inline constexpr cppsh_proj<cppsh_arg_n<5>> _5{cppsh_arg_n<5>{}};
 } // namespace placeholders
-
-template <typename T> struct __cppsh_rm_cvref { using type = T; };
-template <typename T> struct __cppsh_rm_cvref<T &> { using type = T; };
-template <typename T> struct __cppsh_rm_cvref<T &&> { using type = T; };
-template <typename T> struct __cppsh_rm_cvref<const T> { using type = T; };
-template <typename T> struct __cppsh_rm_cvref<const T &> { using type = T; };
-template <typename T> struct __cppsh_rm_cvref<const T &&> { using type = T; };
 
 template <typename T>
 struct cppsh_vec {
@@ -1466,6 +1751,11 @@ static const char *const CppShStdShModulePrelude = R"CPPSH(
 #define __CPPSH_STD_SH_MODULE_LOADED 1
 using std::print;
 using std::placeholders::_;
+using std::placeholders::_1;
+using std::placeholders::_2;
+using std::placeholders::_3;
+using std::placeholders::_4;
+using std::placeholders::_5;
 using std::ranges::views::drop;
 using std::ranges::views::filter;
 using std::ranges::views::grep;

@@ -7298,6 +7298,298 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
       }
     }
 
+    Expr *NakedCallee = Fn->IgnoreParenImpCasts();
+    StringRef MetaCalleeName;
+    const TemplateArgument *MetaTA = nullptr;
+    QualType MetaReturnTy;
+    if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(NakedCallee)) {
+      if (ULE->getName().isIdentifier() && ULE->hasExplicitTemplateArgs() &&
+          ULE->getNumTemplateArgs() == 1) {
+        MetaCalleeName = ULE->getName().getAsIdentifierInfo()->getName();
+        MetaTA = &ULE->getTemplateArgs()[0].getArgument();
+        for (NamedDecl *D : ULE->decls()) {
+          if (auto *FTD =
+                  dyn_cast<FunctionTemplateDecl>(D->getUnderlyingDecl())) {
+            MetaReturnTy = FTD->getTemplatedDecl()->getReturnType();
+            break;
+          }
+        }
+      }
+    } else if (auto *DRE = dyn_cast<DeclRefExpr>(NakedCallee)) {
+      if (auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
+        if (FD->getIdentifier()) {
+          if (const TemplateArgumentList *TAL =
+                  FD->getTemplateSpecializationArgs()) {
+            if (TAL->size() == 1) {
+              MetaCalleeName = FD->getIdentifier()->getName();
+              MetaTA = &TAL->get(0);
+              MetaReturnTy = FD->getReturnType();
+            }
+          }
+        }
+      }
+    }
+    if (MetaTA) {
+      if (MetaCalleeName == "__reflect" &&
+          MetaTA->getKind() == TemplateArgument::Type &&
+          !MetaTA->getAsType()->isDependentType()) {
+        QualType ReflectedQT = MetaTA->getAsType();
+        QualType InfoTy = MetaReturnTy;
+        if (!InfoTy.isNull()) {
+          auto makeInfoInit = [&](uint64_t IdVal, uint32_t KindVal,
+                                  StringRef NameStr, Expr *MemPtrExpr,
+                                  uint32_t MemLenVal) -> Expr * {
+            Expr *IdE = IntegerLiteral::Create(
+                Context, llvm::APInt(64, IdVal), Context.UnsignedLongLongTy,
+                LParenLoc);
+            Expr *KindE = IntegerLiteral::Create(
+                Context, llvm::APInt(32, KindVal), Context.UnsignedIntTy,
+                LParenLoc);
+            QualType CharArrTy = Context.getConstantArrayType(
+                Context.CharTy.withConst(),
+                llvm::APInt(32, NameStr.size() + 1), nullptr,
+                ArraySizeModifier::Normal, 0);
+            Expr *NameLit = StringLiteral::Create(
+                Context, NameStr, StringLiteralKind::Ordinary,
+                /*Pascal=*/false, CharArrTy, LParenLoc);
+            Expr *PtrE = MemPtrExpr
+                             ? MemPtrExpr
+                             : new (Context) CXXNullPtrLiteralExpr(
+                                   Context.NullPtrTy, LParenLoc);
+            Expr *LenE = IntegerLiteral::Create(
+                Context, llvm::APInt(32, MemLenVal), Context.UnsignedIntTy,
+                LParenLoc);
+            Expr *Inits[5] = {IdE, KindE, NameLit, PtrE, LenE};
+            return ActOnInitList(LParenLoc, Inits, RParenLoc).get();
+          };
+
+          QualType BaseQT =
+              ReflectedQT.getNonReferenceType().getUnqualifiedType();
+          (void)isCompleteType(LParenLoc, BaseQT);
+          Expr *MemPtrExpr = nullptr;
+          SmallVector<Expr *, 16> MemberInits;
+          StringRef TypeNameStr = "";
+          if (CXXRecordDecl *RD = BaseQT->getAsCXXRecordDecl()) {
+            if (RD->getIdentifier())
+              TypeNameStr = RD->getName();
+            if (RD->hasDefinition()) {
+              RD = RD->getDefinition();
+              llvm::SmallPtrSet<const IdentifierInfo *, 32> SeenFields;
+              llvm::SmallPtrSet<const IdentifierInfo *, 32> SeenMethods;
+              auto collectMembers = [&](CXXRecordDecl *CurRD,
+                                        auto &Self) -> void {
+                if (!CurRD || !CurRD->hasDefinition())
+                  return;
+                CurRD = CurRD->getDefinition();
+                for (FieldDecl *Field : CurRD->fields()) {
+                  if (IdentifierInfo *FII = Field->getIdentifier()) {
+                    if (SeenFields.insert(FII).second)
+                      MemberInits.push_back(makeInfoInit(
+                          reinterpret_cast<uintptr_t>(Field), 2,
+                          FII->getName(), nullptr, 0));
+                  }
+                }
+                for (CXXMethodDecl *Method : CurRD->methods()) {
+                  if (IdentifierInfo *MII = Method->getIdentifier()) {
+                    if (SeenMethods.insert(MII).second)
+                      MemberInits.push_back(makeInfoInit(
+                          reinterpret_cast<uintptr_t>(Method), 3,
+                          MII->getName(), nullptr, 0));
+                  }
+                }
+                for (const CXXBaseSpecifier &BS : CurRD->bases()) {
+                  if (CXXRecordDecl *BaseRD =
+                          BS.getType()->getAsCXXRecordDecl())
+                    Self(BaseRD, Self);
+                }
+              };
+              collectMembers(RD, collectMembers);
+              if (!MemberInits.empty()) {
+                QualType ArrTy = Context.getConstantArrayType(
+                    InfoTy.withConst(),
+                    llvm::APInt(32, MemberInits.size()), nullptr,
+                    ArraySizeModifier::Normal, 0);
+                std::string ArrName =
+                    "__cppsh_meta_members_" +
+                    llvm::utohexstr(reinterpret_cast<uintptr_t>(RD));
+                IdentifierInfo *ArrII = &PP.getIdentifierTable().get(ArrName);
+                VarDecl *ArrVD = VarDecl::Create(
+                    Context, Context.getTranslationUnitDecl(), LParenLoc,
+                    LParenLoc, ArrII, ArrTy,
+                    Context.getTrivialTypeSourceInfo(ArrTy, LParenLoc),
+                    SC_Static);
+                ArrVD->setConstexpr(true);
+                ArrVD->setImplicit(true);
+                ExprResult ArrILE =
+                    ActOnInitList(LParenLoc, MemberInits, RParenLoc);
+                InitializedEntity ArrEntity =
+                    InitializedEntity::InitializeVariable(ArrVD);
+                InitializationKind ArrKind =
+                    InitializationKind::CreateDirectList(LParenLoc, LParenLoc,
+                                                         RParenLoc);
+                Expr *ArrArgs[1] = {ArrILE.get()};
+                InitializationSequence ArrSeq(*this, ArrEntity, ArrKind,
+                                              ArrArgs);
+                ExprResult ArrInit =
+                    ArrSeq.Perform(*this, ArrEntity, ArrKind, ArrArgs);
+                if (ArrInit.isUsable()) {
+                  ArrVD->setInit(ArrInit.get());
+                  ArrVD->setInitStyle(VarDecl::ListInit);
+                  Context.getTranslationUnitDecl()->addDecl(ArrVD);
+                  MemPtrExpr =
+                      BuildDeclRefExpr(ArrVD, ArrTy, VK_LValue, LParenLoc)
+                          .get();
+                }
+              }
+            }
+          }
+          Expr *TopILE = makeInfoInit(
+              reinterpret_cast<uintptr_t>(BaseQT.getAsOpaquePtr()), 1,
+              TypeNameStr, MemPtrExpr, MemberInits.size());
+          InitializedEntity Entity =
+              InitializedEntity::InitializeTemporary(InfoTy);
+          InitializationKind InitKind = InitializationKind::CreateDirectList(
+              LParenLoc, LParenLoc, RParenLoc);
+          Expr *InitArgs[1] = {TopILE};
+          InitializationSequence InitSeq(*this, Entity, InitKind, InitArgs);
+          return InitSeq.Perform(*this, Entity, InitKind, InitArgs);
+        }
+      } else if (MetaCalleeName == "__splice_call") {
+        uint64_t RawId = 0;
+        if (MetaTA->getKind() == TemplateArgument::Integral) {
+          RawId = MetaTA->getAsIntegral().getZExtValue();
+        } else if (MetaTA->getKind() == TemplateArgument::Expression &&
+                   !MetaTA->getAsExpr()->isValueDependent()) {
+          Expr::EvalResult EV;
+          if (MetaTA->getAsExpr()->EvaluateAsInt(EV, Context))
+            RawId = EV.Val.getInt().getZExtValue();
+        }
+        if (RawId) {
+          Expr *OrigFn =
+              reinterpret_cast<Expr *>(static_cast<uintptr_t>(RawId));
+          return BuildCallExpr(Scope, OrigFn, LParenLoc, ArgExprs, RParenLoc,
+                               ExecConfig, IsExecConfig, AllowRecovery);
+        }
+      }
+    }
+
+    if (!Fn->getType()->isRecordType() && Fn->getType() != Context.BoundMemberTy) {
+      CXXRecordDecl *ApplyRD = nullptr;
+      unsigned ApplyArgIdx = 0;
+      LookupResult ApplyR(*this, &PP.getIdentifierTable().get("operator_apply"),
+                          LParenLoc, LookupMemberName);
+      for (unsigned I = 0; I < ArgExprs.size(); ++I) {
+        Expr *A = ArgExprs[I];
+        if (!A || A->getType().isNull())
+          continue;
+        CXXRecordDecl *ARD = A->getType()->getAsCXXRecordDecl();
+        if (!ARD || !ARD->hasDefinition())
+          continue;
+        ApplyR.clear();
+        LookupQualifiedName(ApplyR, ARD);
+        ApplyR.suppressDiagnostics();
+        if (!ApplyR.empty()) {
+          ApplyRD = ARD;
+          ApplyArgIdx = I;
+          break;
+        }
+      }
+      if (ApplyRD) {
+        auto paramIsCalledInBody = [&](const Stmt *S, const ParmVarDecl *P,
+                                       auto &Self) -> bool {
+          if (!S || !P)
+            return false;
+          if (const auto *CE = dyn_cast<CallExpr>(S)) {
+            if (const Expr *C = CE->getCallee()) {
+              if (const auto *DRE =
+                      dyn_cast<DeclRefExpr>(C->IgnoreParenImpCasts()))
+                if (DRE->getDecl() == P)
+                  return true;
+            }
+          }
+          for (const Stmt *Child : S->children())
+            if (Child && Self(Child, P, Self))
+              return true;
+          return false;
+        };
+        auto isHigherOrderConsumer = [&]() -> bool {
+          SmallVector<NamedDecl *, 8> Decls;
+          if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(NakedCallee)) {
+            for (NamedDecl *D : ULE->decls())
+              Decls.push_back(D);
+          } else if (auto *DRE = dyn_cast<DeclRefExpr>(NakedCallee)) {
+            Decls.push_back(DRE->getDecl());
+          }
+          for (NamedDecl *RawD : Decls) {
+            NamedDecl *D = RawD->getUnderlyingDecl();
+            if (D->getIdentifier() &&
+                (D->getIdentifier()->isStr("operator_apply") ||
+                 D->getIdentifier()->isStr("__reflect") ||
+                 D->getIdentifier()->isStr("__splice_call") ||
+                 D->getIdentifier()->isStr("__cppsh_wrap")))
+              return true;
+            for (DeclContext *DC = D->getDeclContext(); DC;
+                 DC = DC->getParent()) {
+              if (auto *NS = dyn_cast<NamespaceDecl>(DC)) {
+                if (NS->getIdentifier() &&
+                    (NS->getIdentifier()->isStr("views") ||
+                     NS->getIdentifier()->isStr("ranges") ||
+                     NS->getIdentifier()->isStr("meta") ||
+                     NS->getIdentifier()->isStr("placeholders")))
+                  return true;
+              }
+            }
+            if (ApplyArgIdx > 0 && D->getIdentifier()) {
+              StringRef N = D->getIdentifier()->getName();
+              if (N == "sort" || N == "stable_sort" || N == "find_if" ||
+                  N == "find_if_not" || N == "count_if" || N == "remove_if" ||
+                  N == "replace_if" || N == "copy_if" || N == "all_of" ||
+                  N == "any_of" || N == "none_of" || N == "for_each" ||
+                  N == "partition" || N == "transform")
+                return true;
+            }
+            FunctionDecl *FD = dyn_cast<FunctionDecl>(D);
+            if (auto *FTD = dyn_cast<FunctionTemplateDecl>(D))
+              FD = FTD->getTemplatedDecl();
+            if (FD && ApplyArgIdx < FD->getNumParams()) {
+              const ParmVarDecl *P = FD->getParamDecl(ApplyArgIdx);
+              if (P->getType().getNonReferenceType()->getAsCXXRecordDecl() ==
+                  ApplyRD)
+                return true;
+              if (FD->hasBody() &&
+                  paramIsCalledInBody(FD->getBody(), P, paramIsCalledInBody))
+                return true;
+            }
+          }
+          return false;
+        };
+
+        if (!isHigherOrderConsumer()) {
+          uint64_t RawFnId = reinterpret_cast<uintptr_t>(Fn);
+          TemplateArgumentListInfo TArgs(LParenLoc, LParenLoc);
+          Expr *IdLit = IntegerLiteral::Create(
+              Context, llvm::APInt(64, RawFnId), Context.UnsignedLongLongTy,
+              LParenLoc);
+          TemplateArgument TA(
+              Context,
+              llvm::APSInt(llvm::APInt(64, RawFnId), /*isUnsigned=*/true),
+              Context.UnsignedLongLongTy);
+          TArgs.addArgument(TemplateArgumentLoc(TA, IdLit));
+          CXXScopeSpec ApplySS;
+          NestedNameSpecifier ApplyNNS(
+              Context.getCanonicalTagType(ApplyRD)->getTypePtr());
+          ApplySS.MakeTrivial(Context, ApplyNNS,
+                              SourceRange(LParenLoc, LParenLoc));
+          ExprResult ApplyCallee = BuildTemplateIdExpr(
+              ApplySS, LParenLoc, ApplyR, /*RequiresADL=*/false, &TArgs);
+          if (ApplyCallee.isUsable())
+            return BuildCallExpr(Scope, ApplyCallee.get(), LParenLoc, ArgExprs,
+                                 RParenLoc, ExecConfig, IsExecConfig,
+                                 AllowRecovery);
+        }
+      }
+    }
+
     // Determine whether this is a call to an object (C++ [over.call.object]).
     if (Fn->getType()->isRecordType())
       return BuildCallToObjectOfClassType(Scope, Fn, LParenLoc, ArgExprs,

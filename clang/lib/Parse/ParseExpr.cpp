@@ -1634,6 +1634,123 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
     return ParseObjCAtExpression(AtLoc);
   }
   case tok::caret:
+    if (getLangOpts().CPlusPlus && NextToken().is(tok::caret) &&
+        !NextToken().hasLeadingSpace()) {
+      SourceLocation Loc = ConsumeToken();
+      ConsumeToken(); // Eat second '^'
+      auto makeTok = [&](tok::TokenKind K, IdentifierInfo *II = nullptr) {
+        Token T;
+        T.startToken();
+        T.setKind(K);
+        T.setLocation(Loc);
+        if (II)
+          T.setIdentifierInfo(II);
+        return T;
+      };
+      bool IsType = false;
+      SmallVector<Token, 16> OpToks;
+      if (Tok.is(tok::kw_decltype)) {
+        IsType = true;
+        OpToks.push_back(Tok);
+        ConsumeToken();
+        if (Tok.is(tok::l_paren)) {
+          int Depth = 0;
+          while (!Tok.is(tok::eof)) {
+            if (Tok.is(tok::l_paren))
+              ++Depth;
+            else if (Tok.is(tok::r_paren)) {
+              OpToks.push_back(Tok);
+              ConsumeParen();
+              if (--Depth == 0)
+                break;
+              continue;
+            }
+            OpToks.push_back(Tok);
+            ConsumeAnyToken();
+          }
+        }
+      } else if (Tok.isOneOf(tok::kw_int, tok::kw_long, tok::kw_short,
+                             tok::kw_char, tok::kw_bool, tok::kw_float,
+                             tok::kw_double, tok::kw_unsigned, tok::kw_signed,
+                             tok::kw_void, tok::kw_const, tok::kw_volatile)) {
+        IsType = true;
+        while (Tok.isOneOf(tok::kw_int, tok::kw_long, tok::kw_short,
+                           tok::kw_char, tok::kw_bool, tok::kw_float,
+                           tok::kw_double, tok::kw_unsigned, tok::kw_signed,
+                           tok::kw_void, tok::kw_const, tok::kw_volatile,
+                           tok::star, tok::amp, tok::ampamp)) {
+          OpToks.push_back(Tok);
+          ConsumeToken();
+        }
+      } else if (Tok.is(tok::identifier) || Tok.is(tok::coloncolon)) {
+        if (Tok.is(tok::identifier) && !NextToken().is(tok::coloncolon)) {
+          IsType = static_cast<bool>(Actions.getTypeName(
+              *Tok.getIdentifierInfo(), Tok.getLocation(), getCurScope()));
+        } else {
+          IsType = true;
+        }
+        OpToks.push_back(Tok);
+        ConsumeToken();
+        while (Tok.is(tok::coloncolon)) {
+          IsType = true;
+          OpToks.push_back(Tok);
+          ConsumeToken();
+          if (Tok.is(tok::identifier)) {
+            OpToks.push_back(Tok);
+            ConsumeToken();
+          }
+        }
+        if (IsType && Tok.is(tok::less)) {
+          int Depth = 0;
+          while (!Tok.is(tok::eof)) {
+            if (Tok.is(tok::less))
+              ++Depth;
+            else if (Tok.is(tok::greater)) {
+              OpToks.push_back(Tok);
+              ConsumeToken();
+              if (--Depth == 0)
+                break;
+              continue;
+            }
+            OpToks.push_back(Tok);
+            ConsumeAnyToken();
+          }
+        }
+      }
+      SmallVector<Token, 32> Out;
+      Out.push_back(makeTok(tok::coloncolon));
+      Out.push_back(
+          makeTok(tok::identifier, &PP.getIdentifierTable().get("std")));
+      Out.push_back(makeTok(tok::coloncolon));
+      Out.push_back(
+          makeTok(tok::identifier, &PP.getIdentifierTable().get("meta")));
+      Out.push_back(makeTok(tok::coloncolon));
+      Out.push_back(
+          makeTok(tok::identifier, &PP.getIdentifierTable().get("__reflect")));
+      Out.push_back(makeTok(tok::less));
+      if (!IsType) {
+        Out.push_back(makeTok(tok::kw_decltype,
+                              &PP.getIdentifierTable().get("decltype")));
+        Out.push_back(makeTok(tok::l_paren));
+      }
+      Out.append(OpToks.begin(), OpToks.end());
+      if (!IsType)
+        Out.push_back(makeTok(tok::r_paren));
+      Out.push_back(makeTok(tok::greater));
+      Out.push_back(makeTok(tok::l_paren));
+      Out.push_back(makeTok(tok::r_paren));
+      Out.push_back(Tok);
+      MutableArrayRef<Token> Mem(
+          PP.getPreprocessorAllocator().Allocate<Token>(Out.size()),
+          Out.size());
+      std::copy(Out.begin(), Out.end(), Mem.begin());
+      PP.EnterTokenStream(std::move(Mem), /*DisableMacroExpansion=*/true,
+                          /*IsReinject=*/true);
+      ConsumeAnyToken(/*ConsumeCodeCompletionTok=*/true);
+      return ParseCastExpression(ParseKind, isAddressOfOperand, NotCastExpr,
+                                 isTypeCast, isVectorLiteral,
+                                 NotPrimaryExpression);
+    }
     Res = ParseBlockLiteralExpression();
     break;
   case tok::code_completion: {
@@ -1656,6 +1773,65 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
     goto ExpectedExpression;
   case tok::l_square:
     if (getLangOpts().CPlusPlus) {
+      if (NextToken().is(tok::colon) && !NextToken().hasLeadingSpace()) {
+        SourceLocation Loc = ConsumeBracket();
+        ConsumeToken(); // Eat ':'
+        SmallVector<Token, 16> InnerToks;
+        int BracketDepth = 0;
+        while (!Tok.is(tok::eof)) {
+          if (Tok.is(tok::l_square))
+            ++BracketDepth;
+          else if (Tok.is(tok::r_square) && BracketDepth > 0)
+            --BracketDepth;
+          else if (BracketDepth == 0 && Tok.is(tok::colon) &&
+                   NextToken().is(tok::r_square) &&
+                   !NextToken().hasLeadingSpace()) {
+            ConsumeToken();   // Eat ':'
+            ConsumeBracket(); // Eat ']'
+            break;
+          }
+          InnerToks.push_back(Tok);
+          ConsumeAnyToken();
+        }
+        auto makeTok = [&](tok::TokenKind K, IdentifierInfo *II = nullptr) {
+          Token T;
+          T.startToken();
+          T.setKind(K);
+          T.setLocation(Loc);
+          if (II)
+            T.setIdentifierInfo(II);
+          return T;
+        };
+        SmallVector<Token, 32> Out;
+        Out.push_back(makeTok(tok::coloncolon));
+        Out.push_back(
+            makeTok(tok::identifier, &PP.getIdentifierTable().get("std")));
+        Out.push_back(makeTok(tok::coloncolon));
+        Out.push_back(
+            makeTok(tok::identifier, &PP.getIdentifierTable().get("meta")));
+        Out.push_back(makeTok(tok::coloncolon));
+        Out.push_back(makeTok(tok::identifier,
+                              &PP.getIdentifierTable().get("__splice_call")));
+        Out.push_back(makeTok(tok::less));
+        Out.push_back(makeTok(tok::l_paren));
+        Out.append(InnerToks.begin(), InnerToks.end());
+        Out.push_back(makeTok(tok::r_paren));
+        Out.push_back(makeTok(tok::period));
+        Out.push_back(
+            makeTok(tok::identifier, &PP.getIdentifierTable().get("id")));
+        Out.push_back(makeTok(tok::greater));
+        Out.push_back(Tok);
+        MutableArrayRef<Token> Mem(
+            PP.getPreprocessorAllocator().Allocate<Token>(Out.size()),
+            Out.size());
+        std::copy(Out.begin(), Out.end(), Mem.begin());
+        PP.EnterTokenStream(std::move(Mem), /*DisableMacroExpansion=*/true,
+                            /*IsReinject=*/true);
+        ConsumeAnyToken(/*ConsumeCodeCompletionTok=*/true);
+        return ParseCastExpression(ParseKind, isAddressOfOperand, NotCastExpr,
+                                   isTypeCast, isVectorLiteral,
+                                   NotPrimaryExpression);
+      }
       if (getLangOpts().ObjC) {
         // C++11 lambda expressions and Objective-C message sends both start with a
         // square bracket.  There are three possibilities here:
@@ -2104,6 +2280,63 @@ Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
       // FIXME: Add support for explicit call of template constructor.
       SourceLocation TemplateKWLoc;
       UnqualifiedId Name;
+      if (getLangOpts().CPlusPlus &&
+          ((Tok.is(tok::l_square) && NextToken().is(tok::colon) &&
+            !NextToken().hasLeadingSpace()) ||
+           (Tok.is(tok::kw_template) && NextToken().is(tok::l_square) &&
+            GetLookAheadToken(2).is(tok::colon)))) {
+        if (Tok.is(tok::kw_template))
+          ConsumeToken();
+        SourceLocation Loc = ConsumeBracket();
+        ConsumeToken(); // Eat ':'
+        SmallVector<Token, 16> InnerToks;
+        int BracketDepth = 0;
+        while (!Tok.is(tok::eof)) {
+          if (Tok.is(tok::l_square))
+            ++BracketDepth;
+          else if (Tok.is(tok::r_square) && BracketDepth > 0)
+            --BracketDepth;
+          else if (BracketDepth == 0 && Tok.is(tok::colon) &&
+                   NextToken().is(tok::r_square) &&
+                   !NextToken().hasLeadingSpace()) {
+            ConsumeToken();   // Eat ':'
+            ConsumeBracket(); // Eat ']'
+            break;
+          }
+          InnerToks.push_back(Tok);
+          ConsumeAnyToken();
+        }
+        auto makeTok = [&](tok::TokenKind K, IdentifierInfo *II = nullptr) {
+          Token T;
+          T.startToken();
+          T.setKind(K);
+          T.setLocation(Loc);
+          if (II)
+            T.setIdentifierInfo(II);
+          return T;
+        };
+        SmallVector<Token, 32> Out;
+        Out.push_back(makeTok(tok::kw_template,
+                              &PP.getIdentifierTable().get("template")));
+        Out.push_back(makeTok(tok::identifier,
+                              &PP.getIdentifierTable().get("__cppsh_splice")));
+        Out.push_back(makeTok(tok::less));
+        Out.push_back(makeTok(tok::l_paren));
+        Out.append(InnerToks.begin(), InnerToks.end());
+        Out.push_back(makeTok(tok::r_paren));
+        Out.push_back(makeTok(tok::period));
+        Out.push_back(
+            makeTok(tok::identifier, &PP.getIdentifierTable().get("id")));
+        Out.push_back(makeTok(tok::greater));
+        Out.push_back(Tok);
+        MutableArrayRef<Token> Mem(
+            PP.getPreprocessorAllocator().Allocate<Token>(Out.size()),
+            Out.size());
+        std::copy(Out.begin(), Out.end(), Mem.begin());
+        PP.EnterTokenStream(std::move(Mem), /*DisableMacroExpansion=*/true,
+                            /*IsReinject=*/true);
+        ConsumeAnyToken(/*ConsumeCodeCompletionTok=*/true);
+      }
       if (getLangOpts().CPlusPlus && OpKind == tok::period &&
           Tok.is(tok::numeric_constant) && !LHS.isInvalid()) {
         std::string NumSpell = PP.getSpelling(Tok);

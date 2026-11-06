@@ -704,6 +704,41 @@ ExprResult Sema::BuildMemberReferenceExpr(
     NamedDecl *FirstQualifierInScope, const DeclarationNameInfo &NameInfo,
     const TemplateArgumentListInfo *TemplateArgs, const Scope *S,
     ActOnMemberAccessExtraArgs *ExtraArgs) {
+  if (Base && !BaseType.isNull() && TemplateArgs &&
+      NameInfo.getName().isIdentifier() &&
+      NameInfo.getName().getAsIdentifierInfo()->getName() ==
+          "__cppsh_splice") {
+    if (BaseType->isDependentType() ||
+        (TemplateArgs->size() == 1 &&
+         TemplateArgs->arguments()[0].getArgument().isDependent()))
+      return ActOnDependentMemberExpr(Base, BaseType, IsArrow, OpLoc, SS,
+                                      TemplateKWLoc, FirstQualifierInScope,
+                                      NameInfo, TemplateArgs);
+    uint64_t RawId = 0;
+    if (TemplateArgs->size() == 1) {
+      const TemplateArgument &TA = TemplateArgs->arguments()[0].getArgument();
+      if (TA.getKind() == TemplateArgument::Integral) {
+        RawId = TA.getAsIntegral().getZExtValue();
+      } else if (TA.getKind() == TemplateArgument::Expression &&
+                 !TA.getAsExpr()->isValueDependent()) {
+        Expr::EvalResult EV;
+        if (TA.getAsExpr()->EvaluateAsInt(EV, Context))
+          RawId = EV.Val.getInt().getZExtValue();
+      }
+    }
+    if (!RawId)
+      return ExprError();
+    NamedDecl *ND =
+        reinterpret_cast<NamedDecl *>(static_cast<uintptr_t>(RawId));
+    IdentifierInfo *TargetII = ND ? ND->getIdentifier() : nullptr;
+    if (!TargetII)
+      return ExprError();
+    DeclarationNameInfo TargetNameInfo(TargetII, NameInfo.getLoc());
+    return BuildMemberReferenceExpr(
+        Base, BaseType, OpLoc, IsArrow, SS, SourceLocation(),
+        FirstQualifierInScope, TargetNameInfo, /*TemplateArgs=*/nullptr, S,
+        ExtraArgs);
+  }
   if (Base && !BaseType.isNull() && !BaseType->isDependentType() &&
       TemplateArgs && NameInfo.getName().isIdentifier() &&
       NameInfo.getName().getAsIdentifierInfo()->getName() ==
