@@ -73,6 +73,7 @@
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/APInt.h"
 #include <cctype>
+#include <cstring>
 #include <cstdio>
 #if !defined(_WIN32)
 #include <sys/wait.h>
@@ -379,6 +380,30 @@ static Expr *cppshRuntimeRebuildOf(Sema &S, const VarDecl *VD) {
   if (!Var) {
     llvm::consumeError(Var.takeError());
     return nullptr;
+  }
+  // A C string (`h(\"..\")` handed over a const char *): the string it points
+  // to, as a literal -- a pointer into the running program is no constant,
+  // one to a literal is.
+  {
+    QualType T = VD->getType().getNonReferenceType();
+    if (const auto *PT = T->getAs<PointerType>();
+        PT && PT->getPointeeType()->isCharType()) {
+      const void *Slot = Var->toPtr<const void *>();
+      if (VD->getType()->isReferenceType())
+        Slot = *static_cast<const void *const *>(Slot);
+      const char *Str = *static_cast<const char *const *>(Slot);
+      if (!Str)
+        return nullptr;
+      llvm::StringRef Text(Str, ::strnlen(Str, 1 << 16));
+      ASTContext &Ctx = S.Context;
+      SourceLocation Loc = VD->getLocation();
+      QualType Char = Ctx.CharTy.withConst();
+      Expr *Lit = StringLiteral::Create(
+          Ctx, Text, StringLiteralKind::Ordinary, /*Pascal=*/false,
+          Ctx.getStringLiteralArrayType(Ctx.CharTy, Text.size()), Loc);
+      return S.ImpCastExprToType(Lit, Ctx.getPointerType(Char), CK_ArrayToPointerDecay)
+          .get();
+    }
   }
   llvm::Expected<llvm::orc::ExecutorAddr> Reader =
       CppshActiveInterpreter->getSymbolAddressFromLinkerName("__cppsh_snapshot_of");
