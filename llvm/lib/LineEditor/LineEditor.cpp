@@ -178,8 +178,12 @@ void refreshHint(EditLine *EL, LineEditor::InternalData *Data) {
   size_t Room = Cols > Used + 4 ? Cols - Used - 4 : 0;
   if (Hint.size() > Room)
     Hint = Room > 8 ? Hint.substr(0, Room - 3) + "..." : std::string();
+  // Dim, its colour switched off before a last space: libedit gives each
+  // literal sequence a cell of its own, and right-aligns the right prompt to
+  // the line's end -- a reset there sat in the last column, which the
+  // terminal did not get, and what was typed after came out dim.
   Data->RPrompt = Hint.empty() ? std::string()
-                               : "\001\033[90m\001 " + Hint + "\001\033[0m\001";
+                               : "\001\033[90m\001" + Hint + "\001\033[0m\001 ";
 }
 
 // A character typed: inserted, then the hint made again.

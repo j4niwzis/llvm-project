@@ -1199,6 +1199,17 @@ CodeGenModule::StackProtectorAttribute(const Decl *D) const {
 }
 
 void CodeGenModule::Release() {
+  // The top-level statements' function, in incremental mode, finished
+  // first: what finishing it emits -- the cleanups of its scope, a
+  // destructor call -- may reference deferred decls, which are emitted
+  // below. Finished after them, such a reference (a complete destructor,
+  // D1) was left undefined in the module.
+  if (Context.getLangOpts().IncrementalExtensions &&
+      GlobalTopLevelStmtBlockInFlight.first) {
+    const TopLevelStmtDecl *TLSD = GlobalTopLevelStmtBlockInFlight.second;
+    GlobalTopLevelStmtBlockInFlight.first->FinishFunction(TLSD->getEndLoc());
+    GlobalTopLevelStmtBlockInFlight = {nullptr, nullptr};
+  }
   Module *Primary = getContext().getCurrentNamedModule();
   if (CXX20ModuleInits && Primary && !Primary->isHeaderLikeModule())
     EmitModuleInitializers(Primary);
@@ -1211,13 +1222,6 @@ void CodeGenModule::Release() {
   emitMultiVersionFunctions();
   emitPFPFieldsWithEvaluatedOffset();
   emitGlobalDeleteForwardingBodies();
-
-  if (Context.getLangOpts().IncrementalExtensions &&
-      GlobalTopLevelStmtBlockInFlight.first) {
-    const TopLevelStmtDecl *TLSD = GlobalTopLevelStmtBlockInFlight.second;
-    GlobalTopLevelStmtBlockInFlight.first->FinishFunction(TLSD->getEndLoc());
-    GlobalTopLevelStmtBlockInFlight = {nullptr, nullptr};
-  }
 
   // Module implementations are initialized the same way as a regular TU that
   // imports one or more modules.

@@ -534,6 +534,20 @@ llvm::Expected<Expr *> Interpreter::convertExprToValue(Expr *E) {
   if (EWC)
     E = EWC->getSubExpr();
 
+  // What the expression is wrapped back in, once rewritten: the statement's
+  // own cleanups -- the temporaries it destroys at its end. Sema's cleanup
+  // state was reset when the statement's full-expression ended, so
+  // MaybeCreateExprWithCleanups alone gave back no ExprWithCleanups, and a
+  // temporary's destructor (`git pull`: std::sh::command's) became a cleanup
+  // of the whole top-level statement function -- emitted after the deferred
+  // decls were, its D1 never defined.
+  auto Rewrap = [&](Expr *R) -> Expr * {
+    if (EWC)
+      return ExprWithCleanups::Create(Ctx, R, EWC->cleanupsHaveSideEffects(),
+                                      EWC->getObjects());
+    return S.MaybeCreateExprWithCleanups(R);
+  };
+
   if (Ctx.getLangOpts().CPlusPlus && E) {
     Expr *CoreE = E->IgnoreParenImpCasts();
     bool IsZeroArgFn = false;
@@ -565,7 +579,7 @@ llvm::Expected<Expr *> Interpreter::convertExprToValue(Expr *E) {
       if (CallRes.isUsable()) {
         E = CallRes.get();
         if (E->getType()->isVoidType())
-          return S.MaybeCreateExprWithCleanups(E);
+          return Rewrap(E);
       }
     }
 
@@ -578,7 +592,7 @@ llvm::Expected<Expr *> Interpreter::convertExprToValue(Expr *E) {
         ExprResult Discarded = S.BuildCStyleCastExpr(
             E->getBeginLoc(), Ctx.getTrivialTypeSourceInfo(Ctx.VoidTy), E->getEndLoc(), E);
         if (Discarded.isUsable())
-          return S.MaybeCreateExprWithCleanups(Discarded.get());
+          return Rewrap(Discarded.get());
       }
       if (RName != "basic_string" && RName != "basic_string_view" &&
           RName != "sym" && !RD->lookup(&Ctx.Idents.get("begin")).empty()) {
@@ -595,7 +609,7 @@ llvm::Expected<Expr *> Interpreter::convertExprToValue(Expr *E) {
             ExprResult ShowCall = S.ActOnCallExpr(
                 S.getCurScope(), ShowFn.get(), E->getBeginLoc(), {E}, E->getEndLoc());
             if (ShowCall.isUsable())
-              return S.MaybeCreateExprWithCleanups(ShowCall.get());
+              return Rewrap(ShowCall.get());
           }
         }
       }
