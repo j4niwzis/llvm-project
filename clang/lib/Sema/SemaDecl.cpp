@@ -76,6 +76,10 @@
 #include <unordered_map>
 
 using namespace clang;
+namespace clang {
+void cppshHideCommandNamedC(Sema &S, LookupResult &R, const IdentifierInfo *II,
+                            SourceLocation Loc);
+} // namespace clang
 using namespace sema;
 
 Sema::DeclGroupPtrTy Sema::ConvertDeclToDeclGroup(Decl *Ptr, Decl *OwnedType) {
@@ -931,6 +935,8 @@ Sema::NameClassification Sema::ClassifyName(Scope *S, CXXScopeSpec &SS,
   LookupResult Result(*this, Name, NameLoc, LookupOrdinaryName);
   LookupParsedName(Result, S, &SS, /*ObjectType=*/QualType(),
                    /*AllowBuiltinCreation=*/!CurMethod);
+  if (SS.isEmpty())
+    cppshHideCommandNamedC(*this, Result, Name, NameLoc);
 
   if (SS.isInvalid())
     return NameClassification::Error();

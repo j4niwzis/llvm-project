@@ -136,6 +136,77 @@ static bool cppshInUserInput(Sema &S, SourceLocation L) {
   return SM.getBufferName(SM.getFileLoc(L)).starts_with("input_line_");
 }
 
+// The C functions named like the programs a shell runs (`sleep`, `kill`,
+// `mkdir`, from <unistd.h> and the like) taken out of what an unqualified
+// name the user types finds: `sleep 30` runs the program. The C function is
+// still there as `::sleep`. (ActOnIdExpression, and ClassifyName, which
+// looks a name up on its own at the start of a statement.)
+void cppshHideCommandNamedC(Sema &S, LookupResult &R, const IdentifierInfo *II,
+                            SourceLocation Loc) {
+  static constexpr llvm::StringLiteral Names[] = {
+      "chmod", "chown", "chroot", "kill",  "link",   "mkdir",    "mkfifo",
+      "mknod", "nice",  "rmdir",  "sleep", "sync",   "truncate", "unlink"};
+  if (R.empty() || !II || !cppshInUserInput(S, Loc) ||
+      !llvm::is_contained(Names, II->getName()))
+    return;
+  LookupResult::Filter F = R.makeFilter();
+  while (F.hasNext()) {
+    auto *FD = dyn_cast<FunctionDecl>(F.next()->getUnderlyingDecl());
+    if (FD && FD->isExternC() && S.getSourceManager().isInSystemHeader(FD->getLocation()))
+      F.erase();
+  }
+  F.done();
+}
+
+// `e.name` on a std::variant the user typed (an entry of `ls`): the member
+// of whichever alternative it holds -- std::sh::__cppsh_variant_get<'n',
+// 'a', 'm', 'e'>(e), the `_` projections' own variant access: the field
+// where every alternative has it, an optional or a variant where not.
+// Nothing where the variant itself has that member (index, emplace).
+ExprResult cppshVariantMember(Sema &S, Expr *Base, const DeclarationNameInfo &NameInfo,
+                              SourceLocation OpLoc) {
+  if (!Base || !NameInfo.getName().isIdentifier() || !cppshInUserInput(S, OpLoc))
+    return ExprEmpty();
+  QualType BT = Base->getType().getNonReferenceType();
+  if (BT->isDependentType())
+    return ExprEmpty();
+  auto *RD = BT->getAsCXXRecordDecl();
+  if (!RD || !RD->getIdentifier() || RD->getName() != "variant" || !RD->isInStdNamespace())
+    return ExprEmpty();
+  LookupResult Own(S, NameInfo, Sema::LookupMemberName);
+  S.LookupQualifiedName(Own, RD);
+  if (!Own.empty())
+    return ExprEmpty();
+  NamespaceDecl *Std = S.getStdNamespace();
+  if (!Std)
+    return ExprEmpty();
+  Preprocessor &PP = S.getPreprocessor();
+  SourceLocation Loc = NameInfo.getLoc();
+  LookupResult ShR(S, &PP.getIdentifierTable().get("sh"), Loc, Sema::LookupNamespaceName);
+  S.LookupQualifiedName(ShR, Std);
+  auto *Sh = ShR.getAsSingle<NamespaceDecl>();
+  if (!Sh)
+    return ExprEmpty();
+  LookupResult R(S, &PP.getIdentifierTable().get("__cppsh_variant_get"), Loc,
+                 Sema::LookupOrdinaryName);
+  S.LookupQualifiedName(R, Sh);
+  if (R.empty())
+    return ExprEmpty();
+  TemplateArgumentListInfo Args(Loc, Loc);
+  for (char C : NameInfo.getName().getAsIdentifierInfo()->getName()) {
+    Expr *Lit = new (S.Context)
+        CharacterLiteral(static_cast<unsigned char>(C), CharacterLiteralKind::Ascii,
+                         S.Context.CharTy, Loc);
+    Args.addArgument(TemplateArgumentLoc(TemplateArgument(Lit), Lit));
+  }
+  CXXScopeSpec SS;
+  ExprResult Fn = S.BuildTemplateIdExpr(SS, SourceLocation(), R, /*RequiresADL=*/false, &Args);
+  if (!Fn.isUsable())
+    return ExprEmpty();
+  Expr *CallArgs[1] = {Base};
+  return S.BuildCallExpr(nullptr, Fn.get(), Loc, CallArgs, Loc);
+}
+
 // Whether a local of this type is handed over by moving it (cppsh): it has
 // no copy constructor to use.
 bool cppshMoveOnly(Sema &S, QualType T) {
@@ -3319,23 +3390,8 @@ ExprResult Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
   if (R.isAmbiguous())
     return ExprError();
 
-  // cppsh: the C functions named like the programs a shell runs (`sleep`,
-  // `kill`, `mkdir`, from <unistd.h> and the like) hidden from a name the
-  // user types unqualified: `sleep 30` runs the program. The C function is
-  // still there as `::sleep`.
-  static constexpr llvm::StringLiteral CppshCommandNamedC[] = {
-      "chmod", "chown", "chroot", "kill",  "link",   "mkdir",    "mkfifo",
-      "mknod", "nice",  "rmdir",  "sleep", "sync",   "truncate", "unlink"};
-  if (!R.empty() && SS.isEmpty() && II && cppshInUserInput(*this, NameLoc) &&
-      llvm::is_contained(CppshCommandNamedC, II->getName())) {
-    LookupResult::Filter F = R.makeFilter();
-    while (F.hasNext()) {
-      auto *FD = dyn_cast<FunctionDecl>(F.next()->getUnderlyingDecl());
-      if (FD && FD->isExternC() && SourceMgr.isInSystemHeader(FD->getLocation()))
-        F.erase();
-    }
-    F.done();
-  }
+  if (SS.isEmpty())
+    cppshHideCommandNamedC(*this, R, II, NameLoc);
 
   // This could be an implicitly declared function reference if the language
   // mode allows it as a feature.

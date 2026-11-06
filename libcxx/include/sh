@@ -543,6 +543,15 @@ struct link_entry {
 };
 using fs_entry = std::variant<file_entry, dir_entry, link_entry>;
 
+// `e.name` on a variant (an entry of `ls`), as the compiler writes it: the
+// member of whichever alternative it holds -- the `_` projections' own
+// variant access (std::__cppsh_member_fn): the field where every
+// alternative has it, an optional or a variant where not.
+template <char... Cs, typename V>
+constexpr auto __cppsh_variant_get(V &&v) {
+  return std::__cppsh_member_fn<std::cppsh_placeholder_root, Cs...>{}(static_cast<V &&>(v));
+}
+
 // What `std::cin >> x` reads, asked for when the shell is on a terminal (the
 // compiler wraps the stream the user reads from in it): `x? `.
 inline std::istream &__cppsh_ask(std::istream &in, const char *what) {

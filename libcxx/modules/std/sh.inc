@@ -37,6 +37,7 @@ export namespace std {
     using std::sh::__cppsh_frame;
     using std::sh::__cppsh_cut;
     using std::sh::__cppsh_ask;
+    using std::sh::__cppsh_variant_get;
     using std::sh::__cppsh_background;
     using std::sh::background;
     using std::sh::bg;

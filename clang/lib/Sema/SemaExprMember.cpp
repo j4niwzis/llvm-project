@@ -26,6 +26,10 @@
 #include "clang/Sema/SemaOpenMP.h"
 
 using namespace clang;
+namespace clang {
+ExprResult cppshVariantMember(Sema &S, Expr *Base, const DeclarationNameInfo &NameInfo,
+                              SourceLocation OpLoc);
+} // namespace clang
 using namespace sema;
 
 typedef llvm::SmallPtrSet<const CXXRecordDecl*, 4> BaseSet;
@@ -704,6 +708,12 @@ ExprResult Sema::BuildMemberReferenceExpr(
     NamedDecl *FirstQualifierInScope, const DeclarationNameInfo &NameInfo,
     const TemplateArgumentListInfo *TemplateArgs, const Scope *S,
     ActOnMemberAccessExtraArgs *ExtraArgs) {
+  // cppsh: `e.name` on a std::variant -- the member of the alternative it
+  // holds (cppshVariantMember).
+  if (Base && !IsArrow && !TemplateArgs && SS.isEmpty() && !BaseType.isNull() &&
+      !BaseType->isDependentType())
+    if (ExprResult V = cppshVariantMember(*this, Base, NameInfo, OpLoc); !V.isUnset())
+      return V;
   if (Base && !BaseType.isNull() && TemplateArgs &&
       NameInfo.getName().isIdentifier() &&
       NameInfo.getName().getAsIdentifierInfo()->getName() ==
