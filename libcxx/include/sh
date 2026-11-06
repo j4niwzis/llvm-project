@@ -781,7 +781,15 @@ inline ls_view<Entry> __cppsh_ls_view(const Dir &d, ls_opts opts) {
 // set of them gives its own type.
 template <typename Dir = const char *>
 inline auto ls(Dir dir = ".", ls_opts opts = {}) {
-  if (opts.files_only)
+  if constexpr (std::is_same_v<Dir, ls_opts>) {
+    // `ls o`, the options alone, a value: the current directory by them.
+    if (dir.files_only)
+      return __cppsh_ls_view<file_entry>(".", dir);
+    else if (dir.dirs_only)
+      return __cppsh_ls_view<dir_entry>(".", dir);
+    else
+      return __cppsh_ls_view<fs_entry>(".", dir);
+  } else if (opts.files_only)
     return __cppsh_ls_view<file_entry>(dir, opts);
   else if (opts.dirs_only)
     return __cppsh_ls_view<dir_entry>(dir, opts);
