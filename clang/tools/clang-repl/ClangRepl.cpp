@@ -26,6 +26,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ManagedStatic.h" // llvm_shutdown
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Signals.h"
@@ -95,347 +96,31 @@ static llvm::cl::opt<bool> CppShEnabled(
                    "filter, sort_by, take)"),
     llvm::cl::init(false));
 
-static const char *const CppShRuntimePrelude = R"CPPSH(
-extern "C" int printf(const char *, ...);
-extern "C" int snprintf(char *, unsigned long, const char *, ...);
-extern "C" int system(const char *);
-extern "C" unsigned long strlen(const char *);
-extern "C" int strcmp(const char *, const char *);
-extern "C" void *malloc(unsigned long);
-extern "C" void *realloc(void *, unsigned long);
-extern "C" void free(void *);
-extern "C" void *memcpy(void *, const void *, unsigned long);
+static const char *const CppShRuntimePrelude = "import std.sh;";
 
-struct cppsh_str {
-  char buf[256];
-  unsigned long len = 0;
-  constexpr cppsh_str() : buf{0}, len(0) {}
-  cppsh_str(const char *s) {
-    len = s ? strlen(s) : 0;
-    if (len > 255) len = 255;
-    if (len) memcpy(buf, s, len);
-    buf[len] = '\0';
-  }
-  constexpr const char *c_str() const noexcept { return buf; }
-  constexpr unsigned long size() const noexcept { return len; }
-  friend bool operator==(const cppsh_str &a, const cppsh_str &b) {
-    return strcmp(a.buf, b.buf) == 0;
-  }
-  friend bool operator==(const cppsh_str &a, const char *b) {
-    return strcmp(a.buf, b ? b : "") == 0;
-  }
-  friend bool operator!=(const cppsh_str &a, const char *b) {
-    return strcmp(a.buf, b ? b : "") != 0;
-  }
-  friend bool operator<(const cppsh_str &a, const cppsh_str &b) {
-    return strcmp(a.buf, b.buf) < 0;
-  }
-  friend bool operator>(const cppsh_str &a, const cppsh_str &b) {
-    return strcmp(a.buf, b.buf) > 0;
-  }
-};
+static llvm::Error runFileOrCode(clang::Interpreter &Interp,
+                                 llvm::StringRef Input,
+                                 bool ForceFile = false) {
+  llvm::StringRef Trimmed = Input.trim();
+  bool IsFile = ForceFile ||
+                (!Trimmed.empty() && !Trimmed.contains('\n') &&
+                 !Trimmed.contains(';') && llvm::sys::fs::exists(Trimmed) &&
+                 !llvm::sys::fs::is_directory(Trimmed));
+  if (!IsFile)
+    return Interp.ParseAndExecute(Input);
 
-template <char... Cs>
-struct sym {
-  static constexpr const char value[sizeof...(Cs) + 1] = {Cs..., '\0'};
-  constexpr operator const char *() const noexcept { return value; }
-  operator cppsh_str() const { return cppsh_str(value); }
-  constexpr const char *c_str() const noexcept { return value; }
-  constexpr unsigned long size() const noexcept { return sizeof...(Cs); }
-  template <char... NextCs>
-  constexpr auto operator_unresolved() const noexcept {
-    return sym<Cs..., '.', NextCs...>{};
+  auto MBOrErr = llvm::MemoryBuffer::getFile(Trimmed);
+  if (!MBOrErr)
+    return llvm::createStringError(MBOrErr.getError(),
+                                   "failed to read script file '%s'",
+                                   Trimmed.str().c_str());
+  llvm::StringRef Content = (*MBOrErr)->getBuffer();
+  if (Content.starts_with("#!")) {
+    size_t NL = Content.find('\n');
+    Content = (NL == llvm::StringRef::npos) ? "" : Content.drop_front(NL + 1);
   }
-  constexpr auto operator-() const noexcept { return sym<'-', Cs...>{}; }
-  constexpr auto operator--() const noexcept { return sym<'-', '-', Cs...>{}; }
-  template <char... RCs>
-  constexpr auto operator-(sym<RCs...>) const noexcept {
-    return sym<Cs..., '-', RCs...>{};
-  }
-  template <char... RCs>
-  constexpr auto operator/(sym<RCs...>) const noexcept {
-    return sym<Cs..., '/', RCs...>{};
-  }
-  template <typename... Args>
-  int operator()(Args &&...args) const {
-    char cmd[2048];
-    unsigned long pos = 0;
-    auto appendStr = [&](const char *s) {
-      while (s && *s && pos + 1 < sizeof(cmd))
-        cmd[pos++] = *s++;
-      cmd[pos] = '\0';
-    };
-    appendStr(value);
-    auto appendOne = [&](const auto &a) {
-      appendStr(" ");
-      if constexpr (requires { static_cast<const char *>(a); }) {
-        appendStr(static_cast<const char *>(a));
-      } else if constexpr (requires { a.c_str(); }) {
-        appendStr(a.c_str());
-      } else {
-        char num[64];
-        snprintf(num, sizeof(num), "%lld", (long long)a);
-        appendStr(num);
-      }
-    };
-    (appendOne(args), ...);
-    return system(cmd);
-  }
-};
-
-template <char... Cs>
-constexpr auto operator_unresolved() noexcept {
-  return sym<Cs...>{};
+  return Interp.ParseAndExecute(Content);
 }
-
-constexpr unsigned long long operator""_KB(unsigned long long v) noexcept {
-  return v * 1024ULL;
-}
-constexpr unsigned long long operator""_MB(unsigned long long v) noexcept {
-  return v * 1024ULL * 1024ULL;
-}
-constexpr unsigned long long operator""_GB(unsigned long long v) noexcept {
-  return v * 1024ULL * 1024ULL * 1024ULL;
-}
-
-template <typename F>
-struct cppsh_proj {
-  F fn;
-  template <typename T>
-  constexpr decltype(auto) operator()(T &&x) const {
-    return fn(static_cast<T &&>(x));
-  }
-  template <char... Cs>
-  constexpr auto operator_unresolved() const {
-    auto next = [prev = fn](auto &&x) -> decltype(auto) {
-      auto &&obj = prev(static_cast<decltype(x) &&>(x));
-      return obj.template __cppsh_member<Cs...>;
-    };
-    return cppsh_proj<decltype(next)>{next};
-  }
-#define CPPSH_BINOP(OP)                                                        \
-  template <typename R>                                                        \
-  constexpr auto operator OP(R rhs) const {                                    \
-    auto p = [f = fn, r = rhs](auto &&x) {                                     \
-      return f(static_cast<decltype(x) &&>(x)) OP r;                           \
-    };                                                                         \
-    return cppsh_proj<decltype(p)>{p};                                         \
-  }
-  CPPSH_BINOP(==)
-  CPPSH_BINOP(!=)
-  CPPSH_BINOP(<)
-  CPPSH_BINOP(>)
-  CPPSH_BINOP(<=)
-  CPPSH_BINOP(>=)
-  CPPSH_BINOP(+)
-  CPPSH_BINOP(-)
-  CPPSH_BINOP(*)
-  CPPSH_BINOP(/)
-  CPPSH_BINOP(%)
-  CPPSH_BINOP(&&)
-  CPPSH_BINOP(||)
-#undef CPPSH_BINOP
-};
-
-struct cppsh_placeholder_root {
-  template <typename T>
-  constexpr T &&operator()(T &&x) const noexcept {
-    return static_cast<T &&>(x);
-  }
-};
-inline constexpr cppsh_proj<cppsh_placeholder_root> _{cppsh_placeholder_root{}};
-
-template <typename T>
-struct cppsh_vec {
-  T *data_ = nullptr;
-  unsigned long size_ = 0;
-  unsigned long cap_ = 0;
-  cppsh_vec() = default;
-  cppsh_vec(const cppsh_vec &o) {
-    for (unsigned long i = 0; i < o.size_; ++i)
-      push_back(o.data_[i]);
-  }
-  cppsh_vec &operator=(const cppsh_vec &o) {
-    if (this != &o) {
-      free(data_);
-      data_ = nullptr;
-      size_ = cap_ = 0;
-      for (unsigned long i = 0; i < o.size_; ++i)
-        push_back(o.data_[i]);
-    }
-    return *this;
-  }
-  ~cppsh_vec() { free(data_); }
-  void push_back(const T &v) {
-    if (size_ == cap_) {
-      cap_ = cap_ ? cap_ * 2 : 16;
-      data_ = static_cast<T *>(realloc(data_, cap_ * sizeof(T)));
-    }
-    data_[size_++] = v;
-  }
-  T *begin() { return data_; }
-  T *end() { return data_ + size_; }
-  const T *begin() const { return data_; }
-  const T *end() const { return data_ + size_; }
-  unsigned long size() const { return size_; }
-  T &operator[](unsigned long i) { return data_[i]; }
-  const T &operator[](unsigned long i) const { return data_[i]; }
-};
-
-struct file_entry {
-  cppsh_str name;
-  cppsh_str ext;
-  long long size = 0;
-  bool is_dir = false;
-  void dump() const {
-    printf("%s %-28s %10lld B\n", is_dir ? "[dir] " : "[file]", name.c_str(),
-           size);
-  }
-};
-
-struct ls_opts {
-  bool all = false;
-  bool recursive = false;
-  bool dirs_only = false;
-  bool files_only = false;
-};
-
-extern "C" {
-struct __cppsh_dirent {
-  unsigned long d_ino;
-  long d_off;
-  unsigned short d_reclen;
-  unsigned char d_type;
-  char d_name[256];
-};
-void *opendir(const char *);
-__cppsh_dirent *readdir(void *);
-int closedir(void *);
-int __xstat(int, const char *, void *);
-int stat(const char *, void *);
-}
-
-inline cppsh_vec<file_entry> ls(const char *dir = ".", ls_opts opts = {}) {
-  if (dir && dir[0] == '-') {
-    for (const char *p = dir + 1; *p; ++p)
-      if (*p == 'a')
-        opts.all = true;
-    dir = ".";
-  }
-  cppsh_vec<file_entry> out;
-  void *d = opendir(dir);
-  if (!d)
-    return out;
-  while (__cppsh_dirent *de = readdir(d)) {
-    const char *fname = de->d_name;
-    if (strcmp(fname, ".") == 0 || strcmp(fname, "..") == 0)
-      continue;
-    if (!opts.all && fname[0] == '.')
-      continue;
-    bool isDir = (de->d_type == 4);
-    char fullpath[1024];
-    snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, fname);
-    alignas(8) unsigned char stbuf[256] = {0};
-    long long fsize = 0;
-    if (stat(fullpath, stbuf) == 0) {
-      unsigned int mode = *reinterpret_cast<unsigned int *>(stbuf + 24);
-      isDir = ((mode & 0170000) == 0040000);
-      if (!isDir)
-        fsize = *reinterpret_cast<long long *>(stbuf + 48);
-    }
-    if (opts.dirs_only && !isDir)
-      continue;
-    if (opts.files_only && isDir)
-      continue;
-    const char *dot = nullptr;
-    for (const char *p = fname; *p; ++p)
-      if (*p == '.')
-        dot = p;
-    out.push_back({cppsh_str(fname), cppsh_str(dot ? dot : ""), fsize, isDir});
-  }
-  closedir(d);
-  return out;
-}
-
-template <typename Pred>
-struct cppsh_filter_stage {
-  Pred pred;
-  template <typename Rng>
-  friend auto operator|(Rng rng, const cppsh_filter_stage &s) {
-    Rng out;
-    for (auto &&item : rng)
-      if (s.pred(item))
-        out.push_back(item);
-    return out;
-  }
-};
-template <typename Pred>
-constexpr auto filter(Pred p) {
-  return cppsh_filter_stage<Pred>{p};
-}
-
-template <typename Proj>
-struct cppsh_sort_stage {
-  Proj proj;
-  template <typename Rng>
-  friend auto operator|(Rng rng, const cppsh_sort_stage &s) {
-    for (unsigned long i = 0; i < rng.size(); ++i)
-      for (unsigned long j = i + 1; j < rng.size(); ++j)
-        if (s.proj(rng[j]) < s.proj(rng[i])) {
-          auto tmp = rng[i];
-          rng[i] = rng[j];
-          rng[j] = tmp;
-        }
-    return rng;
-  }
-};
-template <typename Proj>
-constexpr auto sort_by(Proj p) {
-  return cppsh_sort_stage<Proj>{p};
-}
-
-struct cppsh_take_stage {
-  unsigned long n;
-  template <typename Rng>
-  friend auto operator|(Rng rng, const cppsh_take_stage &s) {
-    Rng out;
-    unsigned long i = 0;
-    for (auto &&item : rng) {
-      if (i++ >= s.n)
-        break;
-      out.push_back(item);
-    }
-    return out;
-  }
-};
-inline constexpr auto take(unsigned long n) { return cppsh_take_stage{n}; }
-
-struct cppsh_print_stage {
-  template <typename Rng>
-  friend void operator|(Rng rng, const cppsh_print_stage &) {
-    for (const auto &item : rng)
-      item.dump();
-  }
-};
-inline constexpr cppsh_print_stage show{};
-
-template <typename A, typename B>
-inline constexpr bool __cppsh_same = false;
-template <typename A>
-inline constexpr bool __cppsh_same<A, A> = true;
-
-template <typename T>
-void print(const T &v) {
-  if constexpr (requires { v.c_str(); })
-    printf("%s\n", v.c_str());
-  else if constexpr (requires { static_cast<const char *>(v); })
-    printf("%s\n", static_cast<const char *>(v));
-  else if constexpr (__cppsh_same<T, double> || __cppsh_same<T, float>)
-    printf("%g\n", (double)v);
-  else
-    printf("%lld\n", (long long)v);
-}
-)CPPSH";
 
 static llvm::Error sanitizeOopArguments(const char *ArgV0) {
   // Only one of -oop-executor and -oop-executor-connect can be used.
@@ -615,7 +300,11 @@ int main(int argc, const char **argv) {
   std::vector<const char *> ClangArgv(ClangArgs.size());
   std::transform(ClangArgs.begin(), ClangArgs.end(), ClangArgv.begin(),
                  [](const std::string &s) -> const char * { return s.data(); });
-  if (CppShEnabled || (OptInputs.empty() && llvm::sys::Process::StandardInIsUserInput()))
+  bool HasStdFlag = false;
+  for (const std::string &A : ClangArgs)
+    if (llvm::StringRef(A).starts_with("-std="))
+      HasStdFlag = true;
+  if (!HasStdFlag)
     ClangArgv.push_back("-std=gnu++20");
   // Initialize all targets (required for device offloading)
   llvm::InitializeAllTargetInfos();
@@ -715,8 +404,7 @@ int main(int argc, const char **argv) {
 
   bool HasError = false;
 
-  if (CppShEnabled ||
-      (OptInputs.empty() && llvm::sys::Process::StandardInIsUserInput())) {
+  if (CppShEnabled) {
     if (auto Err = Interp->ParseAndExecute(CppShRuntimePrelude)) {
       llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
       HasError = true;
@@ -724,7 +412,7 @@ int main(int argc, const char **argv) {
   }
 
   for (const std::string &input : OptInputs) {
-    if (auto Err = Interp->ParseAndExecute(input)) {
+    if (auto Err = runFileOrCode(*Interp, input)) {
       llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
       HasError = true;
     }
@@ -758,10 +446,19 @@ int main(int argc, const char **argv) {
       } else if (Input == R"(%cppsh)") {
         if (auto Err = Interp->ParseAndExecute(CppShRuntimePrelude))
           llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
+      } else if (Input == R"(%run)") {
+        auto Err = llvm::make_error<llvm::StringError>(
+            "%run expects 1 argument: the path to a script file\n",
+            std::error_code());
+        llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
+      } else if (Input.rfind("%run ", 0) == 0) {
+        if (auto Err = runFileOrCode(*Interp, Input.data() + 5,
+                                     /*ForceFile=*/true))
+          llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
       } else if (Input == R"(%help)") {
         llvm::outs() << "%help\t\tlist clang-repl %commands\n"
-                     << "%cppsh\t\tload C++ shell runtime (_, ls, filter, "
-                        "sort_by, take, show)\n"
+                     << "%cppsh\t\tload C++ shell runtime (import std.sh;)\n"
+                     << "%run\t<path>\texecute a C++/cppsh script file\n"
                      << "%undo\t\tundo the previous input\n"
                      << "%lib\t<path>\tlink a dynamic library\n"
                      << "%quit\t\texit clang-repl\n";

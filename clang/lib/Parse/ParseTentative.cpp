@@ -355,8 +355,10 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
     Out.append(RequiresToks.begin(), RequiresToks.end());
   }
 
-  if (Tok.is(tok::equal)) {
-    SourceLocation EqLoc = ConsumeToken();
+  if (Tok.isOneOf(tok::equal, tok::l_brace)) {
+    SourceLocation EqLoc = Tok.getLocation();
+    if (Tok.is(tok::equal))
+      ConsumeToken();
     SmallVector<Token, 32> BodyToks;
     int Depth = 0;
     while (!Tok.is(tok::eof)) {
@@ -365,6 +367,14 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
       else if (Tok.isOneOf(tok::r_paren, tok::r_brace, tok::r_square)) {
         if (Depth > 0)
           --Depth;
+        if (Depth == 0 && Tok.is(tok::r_brace) && !BodyToks.empty() &&
+            BodyToks.front().is(tok::l_brace)) {
+          BodyToks.push_back(Tok);
+          ConsumeBrace();
+          if (Tok.is(tok::semi))
+            ConsumeToken();
+          break;
+        }
       } else if (Depth == 0 && Tok.is(tok::semi)) {
         ConsumeToken();
         break;
@@ -448,7 +458,10 @@ bool Parser::isCXXDeclarationStatement(
             // Check if the next token is also an identifier and assume a
             // declaration. We cannot check if the scopes match because the
             // declarations could involve namespaces and friend declarations.
-            if (NextToken().is(tok::identifier))
+            if (NextToken().is(tok::identifier) &&
+                (PP.getSourceManager().isInSystemHeader(Tok.getLocation()) ||
+                 Actions.getTypeName(*II, Tok.getLocation(), getCurScope(),
+                                     &SS)))
               return true;
           }
           break;

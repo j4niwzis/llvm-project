@@ -127,12 +127,13 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
       return NextToken().is(tok::period);
     if (isFlagStart())
       return true;
-    return Tok.isOneOf(tok::identifier, tok::numeric_constant,
-                       tok::char_constant, tok::wide_char_constant,
-                       tok::utf8_char_constant, tok::utf16_char_constant,
-                       tok::utf32_char_constant, tok::string_literal,
-                       tok::wide_string_literal, tok::utf8_string_literal,
-                       tok::utf16_string_literal, tok::utf32_string_literal);
+    return Tok.isOneOf(tok::identifier, tok::annot_cxxscope,
+                       tok::numeric_constant, tok::char_constant,
+                       tok::wide_char_constant, tok::utf8_char_constant,
+                       tok::utf16_char_constant, tok::utf32_char_constant,
+                       tok::string_literal, tok::wide_string_literal,
+                       tok::utf8_string_literal, tok::utf16_string_literal,
+                       tok::utf32_string_literal);
   };
 
   if (!canStartArg())

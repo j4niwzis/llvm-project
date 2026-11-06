@@ -2933,6 +2933,12 @@ ExprResult Sema::BuildOperatorUnresolvedCall(Scope *S, SourceLocation Loc,
   else
     LookupQualifiedName(R, Context.getTranslationUnitDecl());
   R.suppressDiagnostics();
+  if (R.empty()) {
+    if (NamespaceDecl *StdNS = getStdNamespace()) {
+      LookupQualifiedName(R, StdNS);
+      R.suppressDiagnostics();
+    }
+  }
   if (R.empty())
     return ExprEmpty();
 
@@ -7168,13 +7174,14 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
       SmallVector<FunctionDecl *, 4> CandFDs;
       Expr *Naked = Fn->IgnoreParens();
       if (auto *DRE = dyn_cast<DeclRefExpr>(Naked)) {
-        if (auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl()))
+        if (auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl()->getUnderlyingDecl()))
           CandFDs.push_back(FD);
       } else if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(Naked)) {
         for (NamedDecl *ND : ULE->decls()) {
-          if (auto *FD = dyn_cast<FunctionDecl>(ND))
+          NamedDecl *UD = ND->getUnderlyingDecl();
+          if (auto *FD = dyn_cast<FunctionDecl>(UD))
             CandFDs.push_back(FD);
-          else if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND))
+          else if (auto *FTD = dyn_cast<FunctionTemplateDecl>(UD))
             CandFDs.push_back(FTD->getTemplatedDecl());
         }
       } else if (!Fn->isTypeDependent() && Fn->getType()->isRecordType()) {
@@ -7183,9 +7190,10 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             DeclarationName OpCall =
                 Context.DeclarationNames.getCXXOperatorName(OO_Call);
             for (NamedDecl *ND : CRD->lookup(OpCall)) {
-              if (auto *FD = dyn_cast<FunctionDecl>(ND))
+              NamedDecl *UD = ND->getUnderlyingDecl();
+              if (auto *FD = dyn_cast<FunctionDecl>(UD))
                 CandFDs.push_back(FD);
-              else if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND))
+              else if (auto *FTD = dyn_cast<FunctionTemplateDecl>(UD))
                 CandFDs.push_back(FTD->getTemplatedDecl());
             }
           }
