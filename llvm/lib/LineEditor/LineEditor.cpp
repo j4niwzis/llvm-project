@@ -382,12 +382,10 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
   ::el_set(Data->EL, EL_ADDFN, "hint_delete", "Delete back, then hint", ElHintDeleteFn);
   ::el_set(Data->EL, EL_ADDFN, "hint_enter", "Enter without the hint", ElHintEnterFn);
   for (int Ch = 0x20; Ch < 0x7f; ++Ch) {
-    // libedit reads '^' and '\\' in a key as escapes.
-    char Key[3] = {static_cast<char>(Ch), '\0', '\0'};
-    if (Ch == '^' || Ch == '\\') {
-      Key[0] = '\\';
-      Key[1] = static_cast<char>(Ch);
-    }
+    // Each key written as an octal escape: libedit's bind reads a key that
+    // starts with '-' as one of its switches, and '^', '\\' as escapes.
+    char Key[8];
+    std::snprintf(Key, sizeof Key, "\\%03o", Ch);
     ::el_set(Data->EL, EL_BIND, Key, "hint_insert", NULL);
   }
   ::el_set(Data->EL, EL_BIND, "^?", "hint_delete", NULL);
