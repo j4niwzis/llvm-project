@@ -59,7 +59,6 @@ using std::sh::tail;
 using std::sh::touch;
 using std::sh::write_file;
 using std::sh::wc_l;
-using std::sh::__cppsh_type_line;
 using std::placeholders::_;
 using std::placeholders::_1;
 using std::placeholders::_2;
