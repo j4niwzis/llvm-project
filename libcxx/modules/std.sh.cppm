@@ -1,0 +1,49 @@
+// -*- C++ -*-
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _LIBCPP_SH_USING
+#define _LIBCPP_SH_USING
+
+#include <sh>
+
+using std::print;
+using std::placeholders::_;
+using std::placeholders::_1;
+using std::placeholders::_2;
+using std::placeholders::_3;
+using std::placeholders::_4;
+using std::placeholders::_5;
+using std::ranges::views::drop;
+using std::ranges::views::filter;
+using std::ranges::views::grep;
+using std::ranges::views::reverse;
+using std::ranges::views::show;
+using std::ranges::views::sort_by;
+using std::ranges::views::take;
+using std::ranges::views::transform;
+using std::sh::append_file;
+using std::sh::cat;
+using std::sh::cd;
+using std::sh::env;
+using std::sh::file_entry;
+using std::sh::file_exists;
+using std::sh::line_entry;
+using std::sh::lines;
+using std::sh::lines_view;
+using std::sh::ls;
+using std::sh::ls_opts;
+using std::sh::ls_view;
+using std::sh::operator_unresolved;
+using std::sh::pwd;
+using std::sh::read_file;
+using std::sh::read_lines;
+using std::sh::sym;
+using std::sh::write_file;
+
+#endif // _LIBCPP_SH_USING

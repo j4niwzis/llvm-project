@@ -1120,6 +1120,7 @@ set(files
   mdspan
   memory
   memory_resource
+  meta
   mutex
   new
   numbers
@@ -1135,6 +1136,7 @@ set(files
   scoped_allocator
   semaphore
   set
+  sh
   shared_mutex
   source_location
   span

@@ -81,6 +81,7 @@ module;
 #include <mdspan>
 #include <memory>
 #include <memory_resource>
+#include <meta>
 #include <mutex>
 #include <new>
 #include <numbers>
@@ -96,6 +97,7 @@ module;
 #include <scoped_allocator>
 #include <semaphore>
 #include <set>
+#include <sh>
 #include <shared_mutex>
 #include <source_location>
 #include <span>

@@ -1,0 +1,423 @@
+// -*- C++ -*-
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _LIBCPP_SH
+#define _LIBCPP_SH
+
+#include <meta>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <numeric>
+#include <optional>
+#include <ranges>
+#include <set>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
+#include <variant>
+#include <vector>
+
+namespace std {
+
+template <typename T>
+constexpr const char *__cppsh_cstr(const T &v) {
+  if constexpr (requires { v.c_str(); })
+    return v.c_str();
+  else if constexpr (requires { v.name.c_str(); })
+    return v.name.c_str();
+  else
+    return static_cast<const char *>(v);
+}
+
+template <typename T>
+void print(const T &v) {
+  if constexpr (requires { v.dump(); })
+    v.dump();
+  else if constexpr (requires { std::cout << v; })
+    std::cout << v << '\n';
+}
+
+namespace ranges {
+namespace views {
+
+struct __cppsh_grep_pred {
+  std::string pat;
+  template <typename Item>
+  bool operator()(const Item &item) const {
+    if constexpr (requires { item.text; })
+      return item.text.find(pat) != std::string::npos;
+    else if constexpr (requires { item.name; })
+      return item.name.find(pat) != std::string::npos;
+    else if constexpr (requires { std::string_view(item); })
+      return std::string_view(item).find(pat) != std::string_view::npos;
+    else if constexpr (requires { item.c_str(); })
+      return std::strstr(item.c_str(), pat.c_str()) != nullptr;
+    else
+      return false;
+  }
+};
+
+template <typename Pat>
+inline auto grep(const Pat &p) {
+  return std::ranges::views::filter(
+      __cppsh_grep_pred{std::string(__cppsh_cstr(p))});
+}
+
+template <typename Proj>
+struct __cppsh_sort_stage {
+  Proj proj;
+  template <std::ranges::input_range Rng>
+  friend auto operator|(Rng &&rng, const __cppsh_sort_stage &s) {
+    using ElemT = std::ranges::range_value_t<Rng>;
+    std::vector<ElemT> out;
+    for (auto &&item : rng)
+      out.push_back(item);
+    std::ranges::sort(out, {}, s.proj);
+    return out;
+  }
+};
+
+template <typename Proj>
+constexpr auto sort_by(Proj p) {
+  return __cppsh_sort_stage<Proj>{p};
+}
+
+struct __cppsh_show_stage {
+  template <std::ranges::input_range Rng>
+  friend void operator|(Rng &&rng, const __cppsh_show_stage &) {
+    for (auto &&item : rng) {
+      if constexpr (requires { item.dump(); })
+        item.dump();
+      else
+        std::print(item);
+    }
+  }
+};
+inline constexpr __cppsh_show_stage show{};
+
+} // namespace views
+} // namespace ranges
+
+namespace sh {
+
+template <char... Cs>
+struct sym {
+  static constexpr const char value[sizeof...(Cs) + 1] = {Cs..., '\0'};
+  constexpr operator const char *() const noexcept { return value; }
+  operator std::string() const { return std::string(value, sizeof...(Cs)); }
+  constexpr operator std::string_view() const noexcept {
+    return std::string_view(value, sizeof...(Cs));
+  }
+  constexpr const char *c_str() const noexcept { return value; }
+  constexpr std::size_t size() const noexcept { return sizeof...(Cs); }
+  template <char... NextCs>
+  constexpr auto operator_unresolved() const noexcept {
+    return sym<Cs..., '.', NextCs...>{};
+  }
+  constexpr auto operator-() const noexcept { return sym<'-', Cs...>{}; }
+  constexpr auto operator--() const noexcept { return sym<'-', '-', Cs...>{}; }
+  template <char... RCs>
+  constexpr auto operator-(sym<RCs...>) const noexcept {
+    return sym<Cs..., '-', RCs...>{};
+  }
+  template <char... RCs>
+  constexpr auto operator/(sym<RCs...>) const noexcept {
+    return sym<Cs..., '/', RCs...>{};
+  }
+  template <typename... Args>
+  int operator()(Args &&...args) const {
+    std::ostringstream cmd;
+    cmd << value;
+    ((cmd << ' ' << args), ...);
+    return std::system(cmd.str().c_str());
+  }
+};
+
+template <char... Cs>
+constexpr auto operator_unresolved() noexcept {
+  return sym<Cs...>{};
+}
+
+struct file_entry {
+  std::string name;
+  std::string ext;
+  long long size = 0;
+  bool is_dir = false;
+  void dump() const {
+    std::printf("%s %-28s %10lld B\n", is_dir ? "[dir] " : "[file]",
+                name.c_str(), size);
+  }
+};
+
+struct ls_opts {
+  bool all = false;
+  bool recursive = false;
+  bool dirs_only = false;
+  bool files_only = false;
+};
+
+struct line_entry {
+  long long num = 0;
+  std::string text;
+  long long size = 0;
+  bool empty() const noexcept { return text.empty(); }
+  bool contains(std::string_view s) const noexcept {
+    return text.find(s) != std::string::npos;
+  }
+  bool starts_with(std::string_view s) const noexcept {
+    return text.starts_with(s);
+  }
+  bool ends_with(std::string_view s) const noexcept {
+    return text.ends_with(s);
+  }
+  const char *c_str() const noexcept { return text.c_str(); }
+  void dump() const { std::printf("%4lld | %s\n", num, text.c_str()); }
+};
+
+struct lines_view : public std::ranges::view_interface<lines_view> {
+  std::string path;
+
+  struct iterator {
+    using iterator_concept = std::input_iterator_tag;
+    using iterator_category = std::input_iterator_tag;
+    using value_type = line_entry;
+    using difference_type = std::ptrdiff_t;
+
+    std::shared_ptr<std::ifstream> stream;
+    long long line_no = 0;
+    line_entry cur{};
+    bool at_end = true;
+
+    iterator() = default;
+    explicit iterator(const std::string &p)
+        : stream(std::make_shared<std::ifstream>(p)) {
+      if (stream && stream->is_open()) {
+        at_end = false;
+        next();
+      }
+    }
+
+    void next() {
+      if (!stream) {
+        at_end = true;
+        return;
+      }
+      std::string s;
+      if (!std::getline(*stream, s)) {
+        stream.reset();
+        at_end = true;
+        return;
+      }
+      if (!s.empty() && s.back() == '\r')
+        s.pop_back();
+      ++line_no;
+      long long sz = static_cast<long long>(s.size());
+      cur = line_entry{line_no, std::move(s), sz};
+    }
+
+    const line_entry &operator*() const noexcept { return cur; }
+    const line_entry *operator->() const noexcept { return &cur; }
+    iterator &operator++() {
+      next();
+      return *this;
+    }
+    void operator++(int) { ++*this; }
+    bool operator==(std::default_sentinel_t) const noexcept { return at_end; }
+  };
+
+  lines_view() = default;
+  explicit lines_view(std::string p) : path(std::move(p)) {}
+
+  iterator begin() const { return iterator(path); }
+  constexpr std::default_sentinel_t end() const noexcept {
+    return std::default_sentinel;
+  }
+};
+
+struct ls_view : public std::ranges::view_interface<ls_view> {
+  std::string dir = ".";
+  ls_opts opts{};
+
+  struct iterator {
+    using iterator_concept = std::input_iterator_tag;
+    using iterator_category = std::input_iterator_tag;
+    using value_type = file_entry;
+    using difference_type = std::ptrdiff_t;
+
+    std::filesystem::directory_iterator it;
+    ls_opts opts{};
+    file_entry cur{};
+
+    iterator() = default;
+    iterator(const std::string &d, ls_opts o) : opts(o) {
+      std::error_code ec;
+      it = std::filesystem::directory_iterator(
+          d, std::filesystem::directory_options::skip_permission_denied, ec);
+      if (ec)
+        it = std::filesystem::directory_iterator{};
+      advance_to_valid();
+    }
+
+    void advance_to_valid() {
+      std::error_code ec;
+      while (it != std::filesystem::directory_iterator{}) {
+        const auto &de = *it;
+        std::string fname = de.path().filename().string();
+        if (!opts.all && !fname.empty() && fname[0] == '.') {
+          it.increment(ec);
+          continue;
+        }
+        bool isDir = de.is_directory(ec);
+        if ((opts.dirs_only && !isDir) || (opts.files_only && isDir)) {
+          it.increment(ec);
+          continue;
+        }
+        long long fsize = 0;
+        if (!isDir) {
+          auto raw_sz = de.file_size(ec);
+          if (!ec)
+            fsize = static_cast<long long>(raw_sz);
+        }
+        std::string ext = de.path().extension().string();
+        cur = file_entry{std::move(fname), std::move(ext), fsize, isDir};
+        return;
+      }
+    }
+
+    const file_entry &operator*() const noexcept { return cur; }
+    const file_entry *operator->() const noexcept { return &cur; }
+    iterator &operator++() {
+      std::error_code ec;
+      it.increment(ec);
+      advance_to_valid();
+      return *this;
+    }
+    void operator++(int) { ++*this; }
+    bool operator==(std::default_sentinel_t) const noexcept {
+      return it == std::filesystem::directory_iterator{};
+    }
+  };
+
+  ls_view() = default;
+  ls_view(std::string d, ls_opts o) : dir(std::move(d)), opts(o) {}
+
+  iterator begin() const { return iterator(dir, opts); }
+  constexpr std::default_sentinel_t end() const noexcept {
+    return std::default_sentinel;
+  }
+};
+
+template <typename Path>
+inline std::string read_file(const Path &p) {
+  std::ifstream ifs(__cppsh_cstr(p), std::ios::binary);
+  if (!ifs)
+    return {};
+  std::ostringstream oss;
+  oss << ifs.rdbuf();
+  return oss.str();
+}
+
+template <typename Path>
+inline lines_view read_lines(const Path &p) {
+  return lines_view(std::string(__cppsh_cstr(p)));
+}
+
+template <typename Path>
+inline lines_view lines(const Path &p) {
+  return read_lines(p);
+}
+
+template <typename Path, typename Content>
+inline bool write_file(const Path &p, const Content &c) {
+  std::ofstream ofs(__cppsh_cstr(p), std::ios::binary | std::ios::trunc);
+  if (!ofs)
+    return false;
+  ofs << __cppsh_cstr(c);
+  return ofs.good();
+}
+
+template <typename Path, typename Content>
+inline bool append_file(const Path &p, const Content &c) {
+  std::ofstream ofs(__cppsh_cstr(p), std::ios::binary | std::ios::app);
+  if (!ofs)
+    return false;
+  ofs << __cppsh_cstr(c);
+  return ofs.good();
+}
+
+template <typename Path>
+inline bool file_exists(const Path &p) {
+  std::error_code ec;
+  return std::filesystem::exists(__cppsh_cstr(p), ec);
+}
+
+inline ls_view ls(const char *dir = ".", ls_opts opts = {}) {
+  if (dir && dir[0] == '-') {
+    for (const char *p = dir + 1; *p; ++p)
+      if (*p == 'a')
+        opts.all = true;
+    dir = ".";
+  }
+  return ls_view(std::string(dir ? dir : "."), opts);
+}
+
+template <typename Path>
+inline void cat(const Path &p) {
+  std::ifstream ifs(__cppsh_cstr(p));
+  if (!ifs)
+    return;
+  std::cout << ifs.rdbuf();
+}
+
+inline std::string pwd() {
+  std::error_code ec;
+  return std::filesystem::current_path(ec).string();
+}
+
+template <typename Path>
+inline int cd(const Path &p) {
+  std::error_code ec;
+  std::filesystem::current_path(__cppsh_cstr(p), ec);
+  return ec ? -1 : 0;
+}
+
+template <typename Name>
+inline std::string env(const Name &n) {
+  const char *v = std::getenv(__cppsh_cstr(n));
+  return v ? std::string(v) : std::string{};
+}
+
+} // namespace sh
+} // namespace std
+
+constexpr unsigned long long operator""_KB(unsigned long long v) noexcept {
+  return v * 1024ULL;
+}
+constexpr unsigned long long operator""_MB(unsigned long long v) noexcept {
+  return v * 1024ULL * 1024ULL;
+}
+constexpr unsigned long long operator""_GB(unsigned long long v) noexcept {
+  return v * 1024ULL * 1024ULL * 1024ULL;
+}
+
+#endif // _LIBCPP_SH
