@@ -7668,7 +7668,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             continue;
           const FunctionDecl *BodyFD = nullptr;
           Stmt *PatBody = PatFD->getBody(BodyFD);
-          if (!PatBody || !PatFD->getReturnType()->isUndeducedType() ||
+          if (!PatBody || !PatFD->getReturnType()->getContainedAutoType() ||
               !stmtHasIf(PatBody, stmtHasIf))
             continue;
           for (unsigned I = 0;
