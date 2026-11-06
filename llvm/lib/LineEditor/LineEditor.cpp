@@ -202,9 +202,13 @@ unsigned char ElHintEnterFn(EditLine *EL, int) {
     ::fwrite(Line.data(), Line.size(), 1, Data->Out);
     ::fflush(Data->Out);
   }
-  // As libedit's own newline: the line ended with '\n' at its end.
+  // As libedit's own newline (ed-newline): the line ended with '\n' at its
+  // end, and the terminal taken to the next line -- which ed-newline does
+  // itself, and a function of ours returning CC_NEWLINE does not get.
   ::el_cursor(EL, static_cast<int>(LI->lastchar - LI->cursor));
   ::el_insertstr(EL, "\n");
+  ::fwrite("\n", 1, 1, Data->Out);
+  ::fflush(Data->Out);
   return CC_NEWLINE;
 }
 
