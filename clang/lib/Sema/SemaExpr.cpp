@@ -179,9 +179,15 @@ static bool cppshRefersTo(const Expr *E, const VarDecl *VD) {
 bool cppshMutates(const Stmt *S, const VarDecl *VD) {
   if (!S)
     return false;
-  if (auto *BO = dyn_cast<BinaryOperator>(S))
+  if (auto *BO = dyn_cast<BinaryOperator>(S)) {
     if (BO->isAssignmentOp() && cppshRefersTo(BO->getLHS(), VD))
       return true;
+    // `in >> v`, dependent yet (a template body): read into, as a stream
+    // extraction is.
+    if (BO->getOpcode() == BO_Shr && BO->isTypeDependent() &&
+        cppshRefersTo(BO->getRHS(), VD))
+      return true;
+  }
   if (auto *UO = dyn_cast<UnaryOperator>(S))
     if ((UO->isIncrementDecrementOp() || UO->getOpcode() == UO_AddrOf) &&
         cppshRefersTo(UO->getSubExpr(), VD))
@@ -208,8 +214,27 @@ bool cppshMutates(const Stmt *S, const VarDecl *VD) {
       if (!cppshRefersTo(CE->getArg(I), VD))
         continue;
       unsigned P = I - Skip;
-      if (!FPT || P >= FPT->getNumParams())
-        return true; // not known: as if changed
+      if (!FPT) {
+        // The callee not known yet (a dependent call in a template body): an
+        // assignment, an increment or a stream extraction changes what it
+        // is given; a plain call is taken not to -- as if changed, every
+        // parameter handed on in a library body (ls(dir, opts)) would lose
+        // its value.
+        auto *OCE = dyn_cast<CXXOperatorCallExpr>(CE);
+        if (!OCE)
+          continue;
+        OverloadedOperatorKind K = OCE->getOperator();
+        bool Assigns = K == OO_Equal || K == OO_PlusEqual || K == OO_MinusEqual ||
+                       K == OO_StarEqual || K == OO_SlashEqual || K == OO_PercentEqual ||
+                       K == OO_AmpEqual || K == OO_PipeEqual || K == OO_CaretEqual ||
+                       K == OO_LessLessEqual || K == OO_GreaterGreaterEqual ||
+                       K == OO_PlusPlus || K == OO_MinusMinus;
+        if ((Assigns && I == 0) || (K == OO_GreaterGreater && I == 1))
+          return true;
+        continue;
+      }
+      if (P >= FPT->getNumParams())
+        continue; // through C varargs: a copy
       QualType PT = FPT->getParamType(P);
       if (PT->isReferenceType() && !PT->getPointeeType().isConstQualified())
         return true;
