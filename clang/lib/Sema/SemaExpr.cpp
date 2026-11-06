@@ -152,7 +152,12 @@ void cppshHideCommandNamedC(Sema &S, LookupResult &R, const IdentifierInfo *II,
   LookupResult::Filter F = R.makeFilter();
   while (F.hasNext()) {
     auto *FD = dyn_cast<FunctionDecl>(F.next()->getUnderlyingDecl());
-    if (FD && FD->isExternC() && S.getSourceManager().isInSystemHeader(FD->getLocation()))
+    // A C function not of the user's own (declared outside what they
+    // typed): a header's, whether or not the module it came in with marks
+    // its headers as system ones (std.sh, built from source, may not).
+    if (FD && FD->isExternC() &&
+        FD->getDeclContext()->getRedeclContext()->isTranslationUnit() &&
+        !cppshInUserInput(S, FD->getLocation()))
       F.erase();
   }
   F.done();
