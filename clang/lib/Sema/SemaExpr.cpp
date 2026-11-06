@@ -91,6 +91,12 @@ std::optional<APValue> (*CppshRuntimeValueOf)(const VarDecl *) = nullptr;
 Expr *(*CppshRuntimeRebuildOf)(Sema &, const VarDecl *) = nullptr;
 extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
 extern llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
+// The first place the value specialization needed the value of a variable
+// this same input defines, not run yet: where the interpreter stages it --
+// running what comes before the top-level declaration holding this, then
+// compiling the rest with the variable's value known (Interpreter::
+// ParseAndExecute).
+SourceLocation CppshStageAt;
 } // namespace clang
 
 bool Sema::CanUseDecl(NamedDecl *D, bool TreatUnavailableAsInvalid) {
@@ -7819,6 +7825,16 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             if (!Ok) {
               if (auto *DRE = dyn_cast<DeclRefExpr>(ArgE->IgnoreParenImpCasts())) {
                 if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+                  // Defined by this same input, not run yet: its value is not
+                  // known now, nor its initializer's to be trusted (a read
+                  // from std::cin may come between) -- the input is staged
+                  // here, the rest compiled once what defines it has run.
+                  if (VD->hasGlobalStorage() &&
+                      VD->getTranslationUnitDecl() == Context.getTranslationUnitDecl()) {
+                    if (!CppshStageAt.isValid())
+                      CppshStageAt = ArgE->getBeginLoc();
+                    continue;
+                  }
                   // A variable a statement already run defined: its value
                   // now, from memory -- not its initializer, which a read
                   // from std::cin since has left behind.

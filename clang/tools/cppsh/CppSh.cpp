@@ -135,51 +135,6 @@ static std::string buildBashPrompt(bool LastFailed) {
   return P;
 }
 
-// The top-level statements of a piece of code, in order: split at each `;`
-// outside brackets, string and character literals and comments (a `'`
-// right after a letter or digit -- a digit separator, a `T'` -- opens
-// nothing).
-static std::vector<std::string> splitStatements(llvm::StringRef Code) {
-  std::vector<std::string> Out;
-  int Depth = 0;
-  size_t Start = 0;
-  for (size_t I = 0; I < Code.size(); ++I) {
-    char C = Code[I];
-    if (C == '"' ||
-        (C == '\'' && !(I > 0 && std::isalnum(static_cast<unsigned char>(Code[I - 1]))))) {
-      for (++I; I < Code.size() && Code[I] != C; ++I)
-        if (Code[I] == '\\')
-          ++I;
-      continue;
-    }
-    if (C == '/' && I + 1 < Code.size() && Code[I + 1] == '/') {
-      while (I < Code.size() && Code[I] != '\n')
-        ++I;
-      continue;
-    }
-    if (C == '/' && I + 1 < Code.size() && Code[I + 1] == '*') {
-      size_t End = Code.find("*/", I + 2);
-      I = End == llvm::StringRef::npos ? Code.size() : End + 1;
-      continue;
-    }
-    if (C == '(' || C == '[' || C == '{')
-      ++Depth;
-    else if ((C == ')' || C == ']' || C == '}') && Depth > 0)
-      --Depth;
-    else if (C == ';' && Depth == 0) {
-      Out.push_back(Code.substr(Start, I + 1 - Start).str());
-      Start = I + 1;
-    }
-  }
-  if (!Code.substr(Start).trim().empty())
-    Out.push_back(Code.substr(Start).str());
-  return Out;
-}
-
-// Code run a statement at a time: each compiled once the one before it has
-// run, so that what it reads -- a variable std::cin filled the statement
-// before -- is a value as it is compiled (the value specialization reads a
-// run statement's variables from memory). The first failure stops the rest.
 // The run variables a statement names that are not plain data -- a
 // std::string, a container -- snapshotted before it is compiled
 // (std::sh::__cppsh_snapshot), so that the value specialization of its
@@ -233,13 +188,18 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
   }
 }
 
+namespace clang {
+extern void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef);
+} // namespace clang
+
+// Code run as the interpreter stages it (Interpreter::ParseAndExecute): whole,
+// cut only where a value it defines is needed by what follows -- before each
+// piece, the snapshots of the variables it names.
 static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Code) {
-  for (const std::string &One : splitStatements(Code)) {
-    snapshotNamed(Interp, One);
-    if (llvm::Error Err = Interp.ParseAndExecute(One))
-      return Err;
-  }
-  return llvm::Error::success();
+  clang::CppshBeforeChunk = [](clang::Interpreter &I, llvm::StringRef Piece) {
+    snapshotNamed(I, Piece);
+  };
+  return Interp.ParseAndExecute(Code);
 }
 
 // The type of the expression at the cursor, for the line editor's hint:

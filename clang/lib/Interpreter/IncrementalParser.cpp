@@ -34,6 +34,10 @@
 
 namespace clang {
 
+// cppsh: where each top-level declaration of the input being parsed starts --
+// where the interpreter may stage it (Interpreter::ParseAndExecute).
+std::vector<SourceLocation> CppshTopLevelStarts;
+
 // IncrementalParser::IncrementalParser() {}
 
 IncrementalParser::IncrementalParser(CompilerInstance &Instance,
@@ -78,8 +82,11 @@ IncrementalParser::ParseOrWrapTopLevelDecl() {
 
   Parser::DeclGroupPtrTy ADecl;
   Sema::ModuleImportState ImportState;
+  CppshTopLevelStarts.clear();
+  CppshTopLevelStarts.push_back(P->getCurToken().getLocation());
   for (bool AtEOF = P->ParseFirstTopLevelDecl(ADecl, ImportState); !AtEOF;
-       AtEOF = P->ParseTopLevelDecl(ADecl, ImportState)) {
+       CppshTopLevelStarts.push_back(P->getCurToken().getLocation()),
+            AtEOF = P->ParseTopLevelDecl(ADecl, ImportState)) {
     if (ADecl && !Consumer->HandleTopLevelDecl(ADecl.get()))
       return llvm::make_error<llvm::StringError>("Parsing failed. "
                                                  "The consumer rejected a decl",

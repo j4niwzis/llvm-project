@@ -67,6 +67,7 @@
 #include "llvm/Transforms/Utils/Cloning.h" // for CloneModule
 #include "clang/AST/APValue.h"
 #include "clang/AST/RecordLayout.h"
+#include "clang/Frontend/TextDiagnosticBuffer.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/APInt.h"
@@ -1356,23 +1357,95 @@ llvm::Error Interpreter::Execute(PartialTranslationUnit &T) {
   return llvm::Error::success();
 }
 
+namespace clang {
+extern SourceLocation CppshStageAt;
+extern std::vector<SourceLocation> CppshTopLevelStarts;
+// What the shell does before each piece of an input is compiled (cppsh: the
+// snapshots of the variables it names); none by default.
+void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef) = nullptr;
+} // namespace clang
+
+// Staged: an input is compiled whole, its diagnostics held back. Where the
+// value specialization needed the value of a variable this same input
+// defines (CppshStageAt), that PTU is dropped -- nothing of it ran -- and the
+// input is run up to the top-level declaration holding that need (itself
+// staged, as it may need its own), then the rest compiled again, the
+// variable's value now known: `o = read_opts(); ls o | take 2` on one line,
+// a script, alike. Where nothing needed it, the input runs as it was
+// compiled, its diagnostics given as they came.
 llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
+  for (;;) {
+    if (CppshBeforeChunk)
+      CppshBeforeChunk(*this, Code);
 
-  auto PTU = Parse(Code);
-  if (!PTU)
-    return PTU.takeError();
-  if (PTU->TheModule)
-    if (llvm::Error Err = Execute(*PTU))
+    DiagnosticsEngine &Diags = getCompilerInstance()->getDiagnostics();
+    DiagnosticConsumer *Client = Diags.getClient();
+    bool Owns = Diags.ownsClient();
+    std::unique_ptr<DiagnosticConsumer> Owned;
+    if (Owns)
+      Owned = Diags.takeClient();
+    TextDiagnosticBuffer Held;
+    Diags.setClient(&Held, /*ShouldOwnClient=*/false);
+
+    CppshStageAt = SourceLocation();
+    auto PTU = Parse(Code);
+
+    // Where to stage: the start of the top-level declaration holding the
+    // need, in this input; none where the need is in its first one.
+    size_t Split = 0;
+    if (CppshStageAt.isValid()) {
+      SourceManager &SM = getCompilerInstance()->getSourceManager();
+      SourceLocation Need = SM.getFileLoc(CppshStageAt);
+      FileID In = SM.getFileID(Need);
+      unsigned NeedOffset = SM.getFileOffset(Need);
+      for (SourceLocation Start : CppshTopLevelStarts) {
+        if (Start.isInvalid())
+          continue;
+        Start = SM.getFileLoc(Start);
+        if (SM.getFileID(Start) != In)
+          continue;
+        unsigned Offset = SM.getFileOffset(Start);
+        if (Offset <= NeedOffset && Offset > Split && Offset < Code.size())
+          Split = Offset;
+      }
+    }
+
+    if (Owns)
+      Diags.setClient(Owned.release(), /*ShouldOwnClient=*/true);
+    else
+      Diags.setClient(Client, /*ShouldOwnClient=*/false);
+
+    if (Split == 0) {
+      // As it was compiled: its diagnostics, then it runs.
+      Held.FlushDiagnostics(Diags);
+      Diags.Reset(/*soft=*/true);
+      if (!PTU)
+        return PTU.takeError();
+      if (PTU->TheModule)
+        if (llvm::Error Err = Execute(*PTU))
+          return Err;
+      if (LastValue.isValid()) {
+        if (!V) {
+          LastValue.dump();
+          LastValue.clear();
+        } else
+          *V = std::move(LastValue);
+      }
+      return llvm::Error::success();
+    }
+
+    // Staged: this compilation dropped, what comes before run, the rest again.
+    if (PTU) {
+      if (llvm::Error Err = Undo())
+        llvm::consumeError(std::move(Err));
+    } else {
+      llvm::consumeError(PTU.takeError());
+    }
+    Diags.Reset(/*soft=*/true);
+    if (llvm::Error Err = ParseAndExecute(Code.substr(0, Split), nullptr))
       return Err;
-
-  if (LastValue.isValid()) {
-    if (!V) {
-      LastValue.dump();
-      LastValue.clear();
-    } else
-      *V = std::move(LastValue);
+    Code = Code.substr(Split);
   }
-  return llvm::Error::success();
 }
 
 llvm::Expected<llvm::orc::ExecutorAddr>
