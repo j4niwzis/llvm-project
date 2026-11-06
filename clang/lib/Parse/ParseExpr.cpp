@@ -27,6 +27,7 @@
 #include "clang/Basic/PrettyStackTrace.h"
 #include "clang/Lex/LiteralSupport.h"
 #include "clang/Parse/Parser.h"
+#include "clang/Sema/Lookup.h"
 #include "clang/Parse/RAIIObjectsForParser.h"
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
@@ -122,10 +123,17 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
            !NextToken().hasLeadingSpace() &&
            NextToken().isOneOf(tok::identifier, tok::numeric_constant);
   };
+  // A word that starts with what a path or a pattern starts with, glued to
+  // what follows: `/tmp`, `./a.out`, `~/src`, `*.cpp`.
+  auto isPathStart = [&]() -> bool {
+    return Tok.isOneOf(tok::slash, tok::period, tok::tilde, tok::star, tok::unknown) &&
+           Tok.hasLeadingSpace() && !NextToken().hasLeadingSpace() &&
+           !NextToken().isOneOf(tok::eof, tok::semi, tok::pipe, tok::annot_repl_input_end);
+  };
   auto canStartArg = [&]() -> bool {
     if (Tok.is(tok::l_brace))
       return NextToken().is(tok::period);
-    if (isFlagStart())
+    if (isFlagStart() || isPathStart())
       return true;
     return Tok.isOneOf(tok::identifier, tok::annot_cxxscope,
                        tok::numeric_constant, tok::char_constant,
@@ -139,10 +147,66 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
   if (!canStartArg())
     return LHS;
 
+  // The joined-word rule: a word written without spaces in it -- `HEAD~1`,
+  // `user@host:/tmp`, `*.cpp`, `--color=auto`, `~/src`, `a:b` -- with what
+  // only a shell word has (`~ : @ * = ?`, or a path's start), one symbol of
+  // its text as written (operator_unresolved, sym). Not where it starts
+  // with a name C++ knows -- a variable, a function: `x.size`, `v.at(0)` --
+  // nor a string or a braced list. `(a - b)` is how a C++ expression is
+  // written among the words.
+  auto joinedWord = [&]() -> ExprResult {
+    if (Tok.isOneOf(tok::l_brace, tok::l_paren) || isTokenStringLiteral())
+      return ExprEmpty();
+    auto endsWord = [](const Token &T) {
+      return T.hasLeadingSpace() || T.isAtStartOfLine() ||
+             T.isOneOf(tok::eof, tok::semi, tok::pipe, tok::pipepipe, tok::ampamp,
+                       tok::r_paren, tok::r_brace, tok::r_square, tok::comma,
+                       tok::l_brace, tok::annot_repl_input_end);
+    };
+    auto shellOnly = [](const Token &T) {
+      return T.isOneOf(tok::tilde, tok::colon, tok::star, tok::equal, tok::question,
+                       tok::unknown);
+    };
+    bool Shell = shellOnly(Tok) || isPathStart();
+    unsigned Glued = 0;
+    while (!endsWord(GetLookAheadToken(Glued + 1))) {
+      Shell = Shell || shellOnly(GetLookAheadToken(Glued + 1));
+      ++Glued;
+    }
+    if (!Glued || !Shell)
+      return ExprEmpty();
+    if (Tok.is(tok::identifier)) {
+      LookupResult Known(Actions, Tok.getIdentifierInfo(), Tok.getLocation(),
+                         Sema::LookupOrdinaryName);
+      Actions.LookupName(Known, getCurScope());
+      if (!Known.empty())
+        return ExprEmpty();
+    }
+    SourceLocation Begin = Tok.getLocation();
+    SourceLocation Last = GetLookAheadToken(Glued).getLocation();
+    StringRef Text = Lexer::getSourceText(CharSourceRange::getTokenRange(Begin, Last),
+                                          PP.getSourceManager(), getLangOpts());
+    if (Text.empty())
+      return ExprEmpty();
+    std::string Word = Text.str();
+    for (unsigned I = 0; I <= Glued; ++I)
+      ConsumeAnyToken();
+    ExprResult Sym = Actions.BuildOperatorUnresolvedCall(getCurScope(), Begin, Word);
+    if (!Sym.isUsable())
+      return ExprError();
+    return Sym;
+  };
+
   ExprVector ArgExprs;
   SourceLocation StartLoc = Tok.getLocation();
   while (canStartArg()) {
     ExprResult Arg;
+    if (ExprResult Word = joinedWord(); Word.isUsable() || Word.isInvalid()) {
+      if (Word.isInvalid())
+        return ExprError();
+      ArgExprs.push_back(Word.get());
+      continue;
+    }
     if (Tok.is(tok::l_brace)) {
       Arg = ParseBraceInitializer();
     } else {
