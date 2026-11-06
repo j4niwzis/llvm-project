@@ -72,7 +72,12 @@
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/APInt.h"
+#include <cctype>
 #include <cstdio>
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #define DEBUG_TYPE "clang-repl"
 
@@ -1422,56 +1427,79 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   CppshLastResult = "__cppsh_res" + Tag;
 }
 
-// Diagnostics held back while an input is compiled, kept whole -- location,
-// ranges, fix-its, notes in their order -- and given as they came where the
-// compilation stands (a TextDiagnosticBuffer kept only a location and a
-// message, and the errors came out without where they were).
-namespace {
-class HeldDiagnostics : public DiagnosticConsumer {
-public:
-  std::vector<StoredDiagnostic> All;
-  void HandleDiagnostic(DiagnosticsEngine::Level Level,
-                        const Diagnostic &Info) override {
-    DiagnosticConsumer::HandleDiagnostic(Level, Info);
-    All.emplace_back(Level, Info);
+// Whether an input may need staging: it holds more than one top-level
+// statement (a `;` at the top, with more after it, outside literals and
+// comments). One statement never needs a value it defines itself.
+static bool cppshSeveralStatements(llvm::StringRef Code) {
+  int Depth = 0;
+  for (size_t I = 0; I < Code.size(); ++I) {
+    char C = Code[I];
+    if (C == '"' || (C == '\'' && !(I > 0 && std::isalnum(static_cast<unsigned char>(Code[I - 1]))))) {
+      for (++I; I < Code.size() && Code[I] != C; ++I)
+        if (Code[I] == '\\')
+          ++I;
+      continue;
+    }
+    if (C == '/' && I + 1 < Code.size() && Code[I + 1] == '/') {
+      while (I < Code.size() && Code[I] != '\n')
+        ++I;
+      continue;
+    }
+    if (C == '/' && I + 1 < Code.size() && Code[I + 1] == '*') {
+      size_t End = Code.find("*/", I + 2);
+      I = End == llvm::StringRef::npos ? Code.size() : End + 1;
+      continue;
+    }
+    if (C == '(' || C == '[' || C == '{')
+      ++Depth;
+    else if ((C == ')' || C == ']' || C == '}') && Depth > 0)
+      --Depth;
+    else if (C == ';' && Depth == 0 && !Code.substr(I + 1).trim().empty())
+      return true;
   }
+  return false;
+}
+
+// Where an input is to be staged, as a probe found it: the offset to run up
+// to (0: nowhere), and the call to hoist there, where one is ([0, 0): none).
+namespace {
+struct CppshStagePlan {
+  size_t Split = 0, HoistBegin = 0, HoistEnd = 0;
 };
 } // namespace
 
-// Staged: an input is compiled whole, its diagnostics held back. Where the
-// value specialization needed the value of a variable this same input
-// defines (CppshStageAt), that PTU is dropped -- nothing of it ran -- and the
-// input is run up to the top-level declaration holding that need (itself
-// staged, as it may need its own), then the rest compiled again, the
-// variable's value now known: `o = read_opts(); ls o | take 2` on one line,
-// a script, alike. Where nothing needed it, the input runs as it was
-// compiled, its diagnostics given as they came.
-llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
-  // The input as staging rewrites it: a hoisted call replaced by its result.
-  std::string Rewritten;
-  for (;;) {
-    if (CppshBeforeChunk)
-      CppshBeforeChunk(*this, Code);
-
-    DiagnosticsEngine &Diags = getCompilerInstance()->getDiagnostics();
-    DiagnosticConsumer *Client = Diags.getClient();
-    bool Owns = Diags.ownsClient();
-    std::unique_ptr<DiagnosticConsumer> Owned;
-    if (Owns)
-      Owned = Diags.takeClient();
-    HeldDiagnostics Held;
-    Diags.setClient(&Held, /*ShouldOwnClient=*/false);
-
+// The probe: the input compiled in a fork of the shell -- never in the
+// session, whose AST and code generator an undone compilation does not leave
+// as they were (an undone function stayed deferred in the code generator, and
+// came back beside its own redefinition) -- its diagnostics nowhere, the
+// stage point and the hoisted call sent back down a pipe.
+static CppshStagePlan cppshProbe(Interpreter &Interp, llvm::StringRef Code) {
+  CppshStagePlan Plan;
+#if defined(_WIN32)
+  (void)Interp;
+  (void)Code;
+  return Plan;
+#else
+  int Fds[2];
+  if (::pipe(Fds) != 0)
+    return Plan;
+  pid_t Child = ::fork();
+  if (Child < 0) {
+    ::close(Fds[0]);
+    ::close(Fds[1]);
+    return Plan;
+  }
+  if (Child == 0) {
+    ::close(Fds[0]);
+    CompilerInstance &CI = *Interp.getCompilerInstance();
+    CI.getDiagnostics().setClient(new IgnoringDiagConsumer(), /*ShouldOwnClient=*/true);
     CppshStageAt = SourceLocation();
     CppshHoistBegin = CppshHoistEnd = SourceLocation();
-    auto PTU = Parse(Code);
-    SourceLocation HoistBegin = CppshHoistBegin, HoistEnd = CppshHoistEnd;
-
-    // Where to stage: the start of the top-level declaration holding the
-    // need, in this input; none where the need is in its first one.
-    size_t Split = 0;
+    if (auto PTU = Interp.Parse(Code); !PTU)
+      llvm::consumeError(PTU.takeError());
+    CppshStagePlan Found;
     if (CppshStageAt.isValid()) {
-      SourceManager &SM = getCompilerInstance()->getSourceManager();
+      SourceManager &SM = CI.getSourceManager();
       SourceLocation Need = SM.getFileLoc(CppshStageAt);
       FileID In = SM.getFileID(Need);
       unsigned NeedOffset = SM.getFileOffset(Need);
@@ -1482,21 +1510,71 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
         if (SM.getFileID(Start) != In)
           continue;
         unsigned Offset = SM.getFileOffset(Start);
-        if (Offset <= NeedOffset && Offset > Split && Offset < Code.size())
-          Split = Offset;
+        if (Offset <= NeedOffset && Offset > Found.Split && Offset < Code.size())
+          Found.Split = Offset;
+      }
+      if (Found.Split && CppshHoistBegin.isValid() && CppshHoistEnd.isValid()) {
+        SourceLocation B = SM.getFileLoc(CppshHoistBegin), E = SM.getFileLoc(CppshHoistEnd);
+        size_t BOff = SM.getFileOffset(B);
+        size_t EOff = SM.getFileOffset(E) +
+                      Lexer::MeasureTokenLength(E, SM, CI.getLangOpts());
+        if (BOff >= Found.Split && EOff <= Code.size() && BOff < EOff) {
+          Found.HoistBegin = BOff;
+          Found.HoistEnd = EOff;
+        }
       }
     }
+    std::string Out = std::to_string(Found.Split) + " " + std::to_string(Found.HoistBegin) +
+                      " " + std::to_string(Found.HoistEnd) + "\n";
+    ssize_t Ignored = ::write(Fds[1], Out.data(), Out.size());
+    (void)Ignored;
+    ::_exit(0);
+  }
+  ::close(Fds[1]);
+  std::string Got;
+  char Buf[128];
+  for (;;) {
+    ssize_t N = ::read(Fds[0], Buf, sizeof Buf);
+    if (N < 0 && errno == EINTR)
+      continue;
+    if (N <= 0)
+      break;
+    Got.append(Buf, static_cast<size_t>(N));
+  }
+  ::close(Fds[0]);
+  while (::waitpid(Child, nullptr, 0) < 0 && errno == EINTR) {
+  }
+  unsigned long long S = 0, B = 0, E = 0;
+  if (std::sscanf(Got.c_str(), "%llu %llu %llu", &S, &B, &E) == 3) {
+    Plan.Split = S;
+    Plan.HoistBegin = B;
+    Plan.HoistEnd = E;
+  }
+  return Plan;
+#endif
+}
 
-    if (Owns)
-      Diags.setClient(Owned.release(), /*ShouldOwnClient=*/true);
-    else
-      Diags.setClient(Client, /*ShouldOwnClient=*/false);
+// Staged: where the value specialization needs the value of a variable an
+// input defines, or the result of a staged function it calls (as a probe
+// finds out, in a fork), the input is run up to the top-level declaration
+// holding that need -- staged itself, as it may need its own -- a hoisted
+// call run on its own and its result put in its place, and the rest compiled
+// then, the values known: `o = read_opts(); ls o | take 2` on one line, a
+// script, alike. Each piece is compiled in the session once, for real.
+llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
+  // The input as staging rewrites it: a hoisted call replaced by its result.
+  std::string Rewritten;
+  for (;;) {
+    if (CppshBeforeChunk)
+      CppshBeforeChunk(*this, Code);
 
-    if (Split == 0) {
-      // As it was compiled: its diagnostics, then it runs.
-      for (const StoredDiagnostic &D : Held.All)
-        Diags.Report(D);
-      Diags.Reset(/*soft=*/true);
+    CppshStagePlan Plan;
+    if (cppshSeveralStatements(Code))
+      Plan = cppshProbe(*this, Code);
+
+    if (Plan.Split == 0) {
+      // As it is: compiled, run, its value shown.
+      auto PTU = Parse(Code);
       if (!PTU)
         return PTU.takeError();
       if (PTU->TheModule)
@@ -1512,37 +1590,24 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
       return llvm::Error::success();
     }
 
-    // Staged: this compilation dropped, what comes before run, the rest again.
-    if (PTU) {
-      if (llvm::Error Err = Undo())
-        llvm::consumeError(std::move(Err));
-    } else {
-      llvm::consumeError(PTU.takeError());
-    }
-    Diags.Reset(/*soft=*/true);
-    if (llvm::Error Err = ParseAndExecute(Code.substr(0, Split), nullptr))
+    // What comes before the need, run first.
+    if (llvm::Error Err = ParseAndExecute(Code.substr(0, Plan.Split), nullptr))
       return Err;
 
     // A call of a staged function the need was: run on its own, its result
     // -- the continuation's global -- in its place for the rest.
-    std::string Rest = Code.substr(Split).str();
-    if (HoistBegin.isValid() && HoistEnd.isValid()) {
-      SourceManager &SM = getCompilerInstance()->getSourceManager();
-      SourceLocation B = SM.getFileLoc(HoistBegin), E = SM.getFileLoc(HoistEnd);
-      unsigned BOff = SM.getFileOffset(B);
-      unsigned EOff = SM.getFileOffset(E) +
-                      Lexer::MeasureTokenLength(E, SM, getCompilerInstance()->getLangOpts());
-      if (BOff >= Split && EOff <= Code.size() && BOff < EOff) {
-        std::string Call = Code.substr(BOff, EOff - BOff).str();
-        CppshLastResult.clear();
-        CppshInHoist = true;
-        llvm::Error Err = ParseAndExecute(Call + ";", nullptr);
-        CppshInHoist = false;
-        if (Err)
-          return Err;
-        if (!CppshLastResult.empty())
-          Rest = Rest.substr(0, BOff - Split) + CppshLastResult + Rest.substr(EOff - Split);
-      }
+    std::string Rest = Code.substr(Plan.Split).str();
+    if (Plan.HoistEnd > Plan.HoistBegin) {
+      std::string Call = Code.substr(Plan.HoistBegin, Plan.HoistEnd - Plan.HoistBegin).str();
+      CppshLastResult.clear();
+      CppshInHoist = true;
+      llvm::Error Err = ParseAndExecute(Call + ";", nullptr);
+      CppshInHoist = false;
+      if (Err)
+        return Err;
+      if (!CppshLastResult.empty())
+        Rest = Rest.substr(0, Plan.HoistBegin - Plan.Split) + CppshLastResult +
+               Rest.substr(Plan.HoistEnd - Plan.Split);
     }
     Rewritten = std::move(Rest);
     Code = Rewritten;
