@@ -632,9 +632,9 @@ struct ReplListCompleter {
     return Found;
   }
 
-  static clang::QualType chainTypeImpl(clang::Sema &S, llvm::StringRef Before,
-                                       const std::vector<ChainPart> &Parts,
-                                       unsigned Depth);
+  // (A member function's body sees every member of its class, wherever it
+  // is declared: chainTypeImpl, below, needs no declaration here -- a class
+  // member cannot be declared twice.)
   static clang::QualType chainType(clang::Sema &S, llvm::StringRef Before,
                                    const std::vector<ChainPart> &Parts,
                                    unsigned Depth = 0) {
