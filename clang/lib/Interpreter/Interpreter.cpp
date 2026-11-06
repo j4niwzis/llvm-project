@@ -1433,12 +1433,21 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   const std::vector<std::string> &Names = CppshCutLocalNames[Id];
   const std::vector<std::string> &Types = CppshCutLocalTypes[Id];
   std::string Code, Params, Args;
+  // A type marked `&&` (no copy): moved -- the frame it is in is left as
+  // soon as the continuation has run.
+  std::vector<std::string> Tys;
   for (unsigned I = 0; I < N && I < Names.size(); ++I) {
+    std::string Ty = Types[I];
+    bool Move = llvm::StringRef(Ty).starts_with("&&");
+    if (Move)
+      Ty = Ty.substr(2);
+    Tys.push_back(Ty);
     std::string Global = "__cppsh_f" + Tag + "_" + Names[I];
-    Code += "auto &" + Global + " = *static_cast<" + Types[I] + " *>((void *)" +
+    Code += "auto &" + Global + " = *static_cast<" + Ty + " *>((void *)" +
             std::to_string(reinterpret_cast<uintptr_t>(Frame[I])) + "ULL);\n";
     Params += std::string(Params.empty() ? "" : ", ") + "auto " + Names[I];
-    Args += std::string(Args.empty() ? "" : ", ") + Global;
+    Args += std::string(Args.empty() ? "" : ", ") +
+            (Move ? "static_cast<" + Ty + " &&>(" + Global + ")" : Global);
   }
   const std::string &LoopRest =
       Id < CppshCutLoopRests.size() ? CppshCutLoopRests[Id] : std::string();
@@ -1451,14 +1460,18 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
     // never constants, as the next iteration changes them; its need cut again.
     std::string RefParams, RefArgs;
     for (unsigned I = 0; I < N && I < Names.size(); ++I) {
-      RefParams += std::string(RefParams.empty() ? "" : ", ") + Types[I] + " &" + Names[I];
-      RefArgs += std::string(RefArgs.empty() ? "" : ", ") + "const_cast<" + Types[I] +
+      RefParams += std::string(RefParams.empty() ? "" : ", ") + Tys[I] + " &" + Names[I];
+      RefArgs += std::string(RefArgs.empty() ? "" : ", ") + "const_cast<" + Tys[I] +
                  " &>(" + Names[I] + ")";
     }
+    // The flag a `break` of the iteration sets: the loop not run on.
+    std::string Flag = "__cppsh_brk" + std::to_string(Id);
+    RefParams += std::string(RefParams.empty() ? "" : ", ") + "bool " + Flag;
+    RefArgs += std::string(RefArgs.empty() ? "" : ", ") + Flag;
     Code += "auto __cppsh_loop" + Tag + "(" + RefParams + ") {\n" + LoopRest + "\n}\n";
-    Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {\ndo { " +
-            CppshCutRemainders[Id] + "\n} while (false);\nreturn __cppsh_loop" + Tag +
-            "(" + RefArgs + ");\n}\n";
+    Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {\nbool " + Flag +
+            " = false;\ndo { " + CppshCutRemainders[Id] +
+            "\n} while (false);\nreturn __cppsh_loop" + Tag + "(" + RefArgs + ");\n}\n";
   }
   Code += "auto __cppsh_res" + Tag +
           " = ::std::sh::__cppsh_value([] { return __cppsh_cont" + Tag + "(" + Args +

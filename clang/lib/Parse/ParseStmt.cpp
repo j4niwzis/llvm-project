@@ -1142,6 +1142,7 @@ extern bool CppshCutNeeded;
 extern std::set<const FunctionDecl *> CppshCutFunctions;
 extern std::vector<std::string> CppshCutRemainders;
 extern std::vector<std::string> CppshCutLoopRests;
+bool cppshMoveOnly(Sema &S, QualType T);
 extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
 } // namespace clang
 
@@ -1153,6 +1154,11 @@ static bool CppshNextCompoundIsBody = false;
 // blocks in the blocks around them.
 static SourceLocation CppshBodyOpen;
 static std::vector<unsigned> CppshOpenCuts;
+// The range-fors being parsed (their bodies), and where those of the body of
+// the function being parsed start: their iterators, hidden from lookup,
+// handed over by a cut in them all the same.
+static SmallVector<CXXForRangeStmt *, 4> CppshRangeFors;
+static size_t CppshRangeBase = 0;
 
 // Whether a block of code (as text) always returns: a `return` at its top
 // level, as a statement of its own -- after nothing, `;`, `{` or `}` (not the
@@ -1179,66 +1185,97 @@ static bool cppshAlwaysReturns(StringRef Code, const LangOptions &LO) {
   return false;
 }
 
-// Whether code (as text) holds a `break` of its own: one not inside a loop or
-// a switch it holds itself. A continuation finishes an iteration in
-// `do { ... } while (false)`, where such a break would leave only that.
-static bool cppshHasOwnBreak(StringRef Code, const LangOptions &LO) {
-  SmallVector<Token, 64> Toks;
+// Code (as text) as tokens, each with its offset in it.
+struct CppshTok {
+  Token T;
+  size_t Off;
+};
+static SmallVector<CppshTok, 64> cppshLex(StringRef Code, const LangOptions &LO) {
+  SmallVector<CppshTok, 64> Toks;
   Lexer L(SourceLocation(), LO, Code.begin(), Code.begin(), Code.end());
   Token T;
   while (true) {
     L.LexFromRawLexer(T);
     if (T.is(tok::eof))
       break;
-    Toks.push_back(T);
+    size_t End = L.getBufferLocation() - Code.begin();
+    Toks.push_back({T, End - T.getLength()});
   }
-  auto isWord = [&](size_t I, StringRef W) {
-    return I < Toks.size() && Toks[I].is(tok::raw_identifier) &&
-           Toks[I].getRawIdentifier() == W;
+  return Toks;
+}
+
+// The tokens of code that are the word W of its own: not inside a loop
+// (SkipLoops) or a switch (SkipSwitch) the code holds itself -- its own
+// `break`s, `continue`s, `case` labels.
+static SmallVector<size_t, 4> cppshOwnWords(ArrayRef<CppshTok> Toks, StringRef W,
+                                            bool SkipLoops, bool SkipSwitch) {
+  auto isWord = [&](size_t I, StringRef X) {
+    return I < Toks.size() && Toks[I].T.is(tok::raw_identifier) &&
+           Toks[I].T.getRawIdentifier() == X;
   };
-  // Past a balanced group opening at I.
   auto skipGroup = [&](size_t I) {
     int Depth = 0;
     for (; I < Toks.size(); ++I) {
-      if (Toks[I].isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
+      if (Toks[I].T.isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
         ++Depth;
-      else if (Toks[I].isOneOf(tok::r_paren, tok::r_brace, tok::r_square) && --Depth <= 0)
+      else if (Toks[I].T.isOneOf(tok::r_paren, tok::r_brace, tok::r_square) &&
+               --Depth <= 0)
         return I + 1;
     }
     return I;
   };
-  // Past a statement starting at I: a block, or up to its `;`.
   auto skipStmt = [&](size_t I) {
-    if (I < Toks.size() && Toks[I].is(tok::l_brace))
+    if (I < Toks.size() && Toks[I].T.is(tok::l_brace))
       return skipGroup(I);
     for (; I < Toks.size(); ++I) {
-      if (Toks[I].isOneOf(tok::l_paren, tok::l_brace, tok::l_square)) {
+      if (Toks[I].T.isOneOf(tok::l_paren, tok::l_brace, tok::l_square)) {
         I = skipGroup(I) - 1;
         continue;
       }
-      if (Toks[I].is(tok::semi))
+      if (Toks[I].T.is(tok::semi))
         return I + 1;
     }
     return I;
   };
+  SmallVector<size_t, 4> Found;
   for (size_t I = 0; I < Toks.size();) {
-    if (isWord(I, "break"))
-      return true;
-    if (isWord(I, "for") || isWord(I, "while") || isWord(I, "switch")) {
+    if (isWord(I, W)) {
+      Found.push_back(I++);
+      continue;
+    }
+    if ((SkipLoops && (isWord(I, "for") || isWord(I, "while"))) ||
+        (SkipSwitch && isWord(I, "switch"))) {
       ++I;
-      if (I < Toks.size() && Toks[I].is(tok::l_paren))
+      if (I < Toks.size() && Toks[I].T.is(tok::l_paren))
         I = skipGroup(I);
       I = skipStmt(I);
       continue;
     }
-    if (isWord(I, "do")) {
+    if (SkipLoops && isWord(I, "do")) {
       I = skipStmt(I + 1);
       continue;
     }
     ++I;
   }
-  return false;
+  return Found;
 }
+
+// Code with its own `break`s replaced by By.
+static std::string cppshReplaceOwnBreaks(StringRef Code, const LangOptions &LO,
+                                         StringRef By) {
+  SmallVector<CppshTok, 64> Toks = cppshLex(Code, LO);
+  std::string Out;
+  size_t At = 0;
+  for (size_t I : cppshOwnWords(Toks, "break", true, true)) {
+    Out += Code.substr(At, Toks[I].Off - At).str();
+    Out += By.str();
+    At = Toks[I].Off + Toks[I].T.getLength();
+  }
+  Out += Code.substr(At).str();
+  return Out;
+}
+
+static unsigned CppshBreakFlags = 0;
 
 // A loop a cut was made in (CppshOpenCuts from OpenBefore on): each such cut
 // finishes the iteration (its remainder, in `do { ... } while (false)`, made
@@ -1268,41 +1305,119 @@ static void cppshWrapLoop(Sema &S, Preprocessor &PP, size_t OpenBefore,
     std::string Inc = text(F->getInc());
     Restart = (Inc.empty() ? "" : Inc + "; ") + "for (; " + text(F->getCond()) + "; " +
               Inc + ") " + text(F->getBody());
+  } else if (auto *RF = dyn_cast<CXXForRangeStmt>(Loop)) {
+    // Its iterators (handed over): on from the next element.
+    auto varOf = [](Stmt *X) -> VarDecl * {
+      auto *DS = dyn_cast_or_null<DeclStmt>(X);
+      return DS ? dyn_cast_or_null<VarDecl>(DS->getSingleDecl()) : nullptr;
+    };
+    VarDecl *B = varOf(RF->getBeginStmt()), *E = varOf(RF->getEndStmt());
+    VarDecl *LV = RF->getLoopVariable();
+    if (B && E && LV && !isa<DecompositionDecl>(LV) && B->getIdentifier() &&
+        E->getIdentifier()) {
+      std::string Var =
+          Lexer::getSourceText(CharSourceRange::getTokenRange(LV->getBeginLoc(),
+                                                              LV->getLocation()),
+                               SM, LO)
+              .str();
+      std::string Bn = B->getName().str(), En = E->getName().str();
+      Restart = "++" + Bn + "; for (; " + Bn + " != " + En + "; ++" + Bn + ") { " + Var +
+                " = *" + Bn + "; " + text(RF->getBody()) + " }";
+    }
   }
   unsigned ID = S.getDiagnostics().getCustomDiagID(DiagnosticsEngine::Error, "%0");
   if (Restart.empty()) {
     S.Diag(Loop->getBeginLoc(), ID)
         << "a value only running the function gives is needed in this loop, and "
-           "it cannot be run on from an iteration (a range-for, or a condition "
-           "declaring a variable): not staged yet";
+           "it cannot be run on from an iteration (a condition declaring a "
+           "variable, or a structured binding): not staged yet";
     Res = StmtError();
     return;
   }
+  // A `break` of the iteration finished: a flag, the loop not run on.
   for (size_t I = OpenBefore; I < CppshOpenCuts.size(); ++I) {
-    std::string &Inner = CppshCutRemainders[CppshOpenCuts[I]];
-    std::string &Rest = CppshCutLoopRests[CppshOpenCuts[I]];
-    std::string &Iteration = Rest.empty() ? Inner : Rest;
-    if (cppshHasOwnBreak(Iteration, LO)) {
-      S.Diag(Loop->getBeginLoc(), ID)
-          << "a break follows, in this loop, a value only running the function "
-             "gives: not staged yet";
+    unsigned Id = CppshOpenCuts[I];
+    std::string &Inner = CppshCutRemainders[Id];
+    std::string &Rest = CppshCutLoopRests[Id];
+    if (Rest.empty()) {
+      // The innermost loop of the cut: the continuation declares the flag
+      // (__cppsh_cut_run), hands it to __cppsh_loopK.
+      std::string Flag = "__cppsh_brk" + std::to_string(Id);
+      Inner = cppshReplaceOwnBreaks(Inner, LO, "{ " + Flag + " = true; break; }");
+      Rest = "if (!" + Flag + ") { " + Restart + " }";
+    } else {
+      std::string Flag = "__cppsh_obrk" + std::to_string(CppshBreakFlags++);
+      Rest = "{ bool " + Flag + " = false; do { " +
+             cppshReplaceOwnBreaks(Rest, LO, "{ " + Flag + " = true; break; }") +
+             " } while (false); if (!" + Flag + ") { " + Restart + " } }";
+    }
+  }
+}
+
+// A switch a cut was made in: the rest of its case, and the cases after it it
+// falls through to, run in `do { ... } while (false)` -- its `break`s leave
+// that -- their labels dropped (nothing jumps to them there).
+static void cppshWrapSwitch(Sema &S, size_t OpenBefore, StmtResult &Res) {
+  if (CppshOpenCuts.size() <= OpenBefore || !Res.isUsable())
+    return;
+  const LangOptions &LO = S.getLangOpts();
+  unsigned ID = S.getDiagnostics().getCustomDiagID(DiagnosticsEngine::Error, "%0");
+  for (size_t I = OpenBefore; I < CppshOpenCuts.size(); ++I) {
+    unsigned Id = CppshOpenCuts[I];
+    std::string &To = CppshCutLoopRests[Id].empty() ? CppshCutRemainders[Id]
+                                                    : CppshCutLoopRests[Id];
+    SmallVector<CppshTok, 64> Toks = cppshLex(To, LO);
+    if (!cppshOwnWords(Toks, "continue", true, false).empty()) {
+      S.Diag(Res.get()->getBeginLoc(), ID)
+          << "a continue follows, in this switch, a value only running the "
+             "function gives: not staged yet";
       Res = StmtError();
       return;
     }
-    Rest = Rest.empty() ? Restart : "do { " + Rest + " } while (false); " + Restart;
+    // The labels: `case ... :` and `default :`, up to their colon.
+    SmallVector<std::pair<size_t, size_t>, 4> Drop;
+    auto upToColon = [&](size_t J) {
+      int Depth = 0;
+      for (; J < Toks.size(); ++J) {
+        if (Toks[J].T.isOneOf(tok::l_paren, tok::l_square, tok::l_brace))
+          ++Depth;
+        else if (Toks[J].T.isOneOf(tok::r_paren, tok::r_square, tok::r_brace))
+          --Depth;
+        else if (Depth == 0 && Toks[J].T.is(tok::colon))
+          return J;
+      }
+      return J;
+    };
+    for (size_t J : cppshOwnWords(Toks, "case", false, true)) {
+      size_t C = upToColon(J);
+      if (C < Toks.size())
+        Drop.push_back({Toks[J].Off, Toks[C].Off + 1});
+    }
+    for (size_t J : cppshOwnWords(Toks, "default", false, true))
+      if (J + 1 < Toks.size() && Toks[J + 1].T.is(tok::colon))
+        Drop.push_back({Toks[J].Off, Toks[J + 1].Off + 1});
+    llvm::sort(Drop);
+    std::string Out;
+    size_t At = 0;
+    for (auto [B, E] : Drop) {
+      if (B < At)
+        continue;
+      Out += To.substr(At, B - At);
+      At = E;
+    }
+    Out += To.substr(At);
+    To = "do { " + Out + " } while (false);";
   }
 }
 
 // Whether a block parsed in this scope may be cut: in the body of a function
-// (not a lambda), outside any switch, which a continuation could not re-enter
-// (a loop it runs on from its next step: cppshWrapLoop).
+// (not a lambda): a loop a continuation runs on from its next step
+// (cppshWrapLoop), a switch it finishes the case of (cppshWrapSwitch).
 static bool cppshCutsIn(Sema &S, Scope *Sc) {
   FunctionDecl *FD = S.getCurFunctionDecl();
   if (!FD || S.getCurFunctionDecl(/*AllowLambda=*/true) != FD || CppshBodyOpen.isInvalid())
     return false;
   for (; Sc && !(Sc->getFlags() & Scope::FnScope); Sc = Sc->getParent())
-    if (Sc->getFlags() & Scope::SwitchScope)
-      return false;
   return Sc != nullptr;
 }
 
@@ -1352,12 +1467,16 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
   const bool CppshBody = std::exchange(CppshNextCompoundIsBody, false);
   const SourceLocation CppshSavedBodyOpen = CppshBodyOpen;
   const size_t CppshOpenAtBody = CppshOpenCuts.size();
-  if (CppshBody)
+  const size_t CppshSavedRangeBase = CppshRangeBase;
+  if (CppshBody) {
     CppshBodyOpen = T.getOpenLocation();
+    CppshRangeBase = CppshRangeFors.size();
+  }
   llvm::scope_exit CppshRestoreBody([&] {
     if (CppshBody) {
       CppshBodyOpen = CppshSavedBodyOpen;
       CppshOpenCuts.resize(CppshOpenAtBody);
+      CppshRangeBase = CppshSavedRangeBase;
     }
   });
   const bool CppshCuts =
@@ -1385,13 +1504,21 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
       if (Sc->getFlags() & Scope::FnScope)
         break;
     }
+    for (size_t R = CppshRangeBase; R < CppshRangeFors.size(); ++R)
+      for (Stmt *DSt : {CppshRangeFors[R]->getBeginStmt(), CppshRangeFors[R]->getEndStmt()})
+        if (auto *DS = dyn_cast_or_null<DeclStmt>(DSt))
+          if (auto *VD = dyn_cast_or_null<VarDecl>(DS->getSingleDecl());
+              VD && VD->getIdentifier() && Seen.insert(VD->getIdentifier()).second)
+            Live.push_back(VD);
     std::vector<std::string> Names, Types;
     PrintingPolicy Policy(Actions.Context.getLangOpts());
     for (VarDecl *VD : Live) {
       Names.push_back(VD->getName().str());
-      Types.push_back(TypeName::getFullyQualifiedName(
-          VD->getType().getNonReferenceType().getUnqualifiedType(),
-          Actions.Context, Policy, /*WithGlobalNsPrefix=*/true));
+      // `&&` first: handed over by moving it (a type with no copy).
+      Types.push_back(std::string(cppshMoveOnly(Actions, VD->getType()) ? "&&" : "") +
+                      TypeName::getFullyQualifiedName(
+                          VD->getType().getNonReferenceType().getUnqualifiedType(),
+                          Actions.Context, Policy, /*WithGlobalNsPrefix=*/true));
     }
     unsigned Id = CppshCutRemainders.size();
     CppshCutRemainders.push_back(Rest.str());
@@ -2044,6 +2171,7 @@ StmtResult Parser::ParseSwitchStatement(SourceLocation *TrailingElseLoc,
                                         LabelDecl *PrecedingLabel) {
   assert(Tok.is(tok::kw_switch) && "Not a switch stmt!");
   SourceLocation SwitchLoc = ConsumeToken();  // eat the 'switch'.
+  const size_t CppshOpenBefore = CppshOpenCuts.size();
 
   if (Tok.isNot(tok::l_paren)) {
     Diag(Tok, diag::err_expected_lparen_after) << "switch";
@@ -2121,7 +2249,10 @@ StmtResult Parser::ParseSwitchStatement(SourceLocation *TrailingElseLoc,
   InnerScope.Exit();
   SwitchScope.Exit();
 
-  return Actions.ActOnFinishSwitchStmt(SwitchLoc, Switch.get(), Body.get());
+  StmtResult CppshSwitch =
+      Actions.ActOnFinishSwitchStmt(SwitchLoc, Switch.get(), Body.get());
+  cppshWrapSwitch(Actions, CppshOpenBefore, CppshSwitch);
+  return CppshSwitch;
 }
 
 StmtResult Parser::ParseWhileStatement(SourceLocation *TrailingElseLoc,
@@ -2722,6 +2853,14 @@ StmtResult Parser::ParseForStatement(SourceLocation *TrailingElseLoc,
   // the other parts.
   getCurScope()->EnterLoopBody(PrecedingLabel);
 
+  // cppsh: a range-for, its iterators handed over by a cut in its body.
+  bool CppshRangePushed = false;
+  if (ForRangeInfo.ParsedForRangeDecl() && ForRangeStmt.isUsable())
+    if (auto *RF = dyn_cast<CXXForRangeStmt>(ForRangeStmt.get())) {
+      CppshRangeFors.push_back(RF);
+      CppshRangePushed = true;
+    }
+
   bool BodyStartsWithAttr = Tok.isOneOf(tok::l_square, tok::kw___attribute);
   SourceLocation BodyBeginLoc = Tok.getLocation();
 
@@ -2750,6 +2889,8 @@ StmtResult Parser::ParseForStatement(SourceLocation *TrailingElseLoc,
 
   // Read the body statement.
   StmtResult Body(ParseStatement(TrailingElseLoc));
+  if (CppshRangePushed)
+    CppshRangeFors.pop_back();
 
   if (Body.isUsable())
     MIChecker.Check();

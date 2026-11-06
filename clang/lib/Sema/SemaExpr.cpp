@@ -131,6 +131,19 @@ static bool cppshInUserInput(Sema &S, SourceLocation L) {
   return SM.getBufferName(SM.getFileLoc(L)).starts_with("input_line_");
 }
 
+// Whether a local of this type is handed over by moving it (cppsh): it has
+// no copy constructor to use.
+bool cppshMoveOnly(Sema &S, QualType T) {
+  T = T.getNonReferenceType();
+  if (T->isDependentType())
+    return false;
+  CXXRecordDecl *RD = T->getAsCXXRecordDecl();
+  if (!RD || !RD->hasDefinition())
+    return false;
+  CXXConstructorDecl *Copy = S.LookupCopyingConstructor(RD->getDefinition(), 0);
+  return !Copy || Copy->isDeleted();
+}
+
 // std::sh::<Name>, as an expression to call.
 static ExprResult cppshShCallee(Sema &S, StringRef Name, SourceLocation Loc) {
   NamespaceDecl *Std = S.getStdNamespace();
@@ -199,9 +212,10 @@ void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
   PrintingPolicy Policy(S.Context.getLangOpts());
   for (VarDecl *VD : Live) {
     Names.push_back(VD->getName().str());
-    Types.push_back(TypeName::getFullyQualifiedName(
-        VD->getType().getNonReferenceType().getUnqualifiedType(), S.Context, Policy,
-        /*WithGlobalNsPrefix=*/true));
+    Types.push_back(std::string(cppshMoveOnly(S, VD->getType()) ? "&&" : "") +
+                    TypeName::getFullyQualifiedName(
+                        VD->getType().getNonReferenceType().getUnqualifiedType(),
+                        S.Context, Policy, /*WithGlobalNsPrefix=*/true));
   }
   unsigned Id = CppshCutRemainders.size();
   CppshCutRemainders.push_back(Rest.str());
