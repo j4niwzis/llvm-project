@@ -7327,21 +7327,30 @@ HeaderFileInfo ASTReader::GetHeaderFileInfo(FileEntryRef FE) {
 
 void ASTReader::ReadPragmaDiagnosticMappings(DiagnosticsEngine &Diag) {
   using DiagState = DiagnosticsEngine::DiagState;
+  if (!Diag.DiagStatesByLoc.FirstDiagState) {
+    if (Diag.DiagStates.empty())
+      Diag.DiagStates.emplace_back(*Diag.getDiagnosticIDs());
+    Diag.DiagStatesByLoc.FirstDiagState = &Diag.DiagStates.front();
+    if (!Diag.DiagStatesByLoc.CurDiagState)
+      Diag.DiagStatesByLoc.CurDiagState = Diag.DiagStatesByLoc.FirstDiagState;
+  }
   SmallVector<DiagState *, 32> DiagStates;
 
   for (ModuleFile &F : ModuleMgr) {
     unsigned Idx = 0;
-    auto &Record = F.PragmaDiagMappings;
-    if (Record.empty())
+    if (F.PragmaDiagMappings.empty())
       continue;
+    auto Record = std::move(F.PragmaDiagMappings);
+    F.PragmaDiagMappings.clear();
 
     DiagStates.clear();
 
     auto ReadDiagState = [&](const DiagState &BasedOn,
-                             bool IncludeNonPragmaStates) {
+                             bool IncludeNonPragmaStates) -> DiagState * {
       unsigned BackrefID = Record[Idx++];
       if (BackrefID != 0)
-        return DiagStates[BackrefID - 1];
+        return BackrefID <= DiagStates.size() ? DiagStates[BackrefID - 1]
+                                              : Diag.DiagStatesByLoc.FirstDiagState;
 
       // A new DiagState was created here.
       Diag.DiagStates.push_back(BasedOn);
@@ -7373,7 +7382,7 @@ void ASTReader::ReadPragmaDiagnosticMappings(DiagnosticsEngine &Diag) {
     };
 
     // Read the first state.
-    DiagState *FirstState;
+    DiagState *FirstState = Diag.DiagStatesByLoc.FirstDiagState;
     if (F.Kind == MK_ImplicitModule) {
       // Implicitly-built modules are reused with different diagnostic
       // settings.  Use the initial diagnostic state from Diag to simulate this
@@ -7387,6 +7396,12 @@ void ASTReader::ReadPragmaDiagnosticMappings(DiagnosticsEngine &Diag) {
       Idx = 3 + Record[2] * 2;
       assert(Idx < Record.size() &&
              "Invalid data, not enough state change pairs in initial state");
+      if (F.OriginalSourceFileID.isValid()) {
+        auto &OrigTrans =
+            Diag.DiagStatesByLoc.Files[F.OriginalSourceFileID].StateTransitions;
+        if (OrigTrans.empty())
+          OrigTrans.push_back({FirstState, 0});
+      }
     } else if (F.isModule()) {
       // For an explicit module, preserve the flags from the module build
       // command line (-w, -Weverything, -Werror, ...) along with any explicit
@@ -7406,8 +7421,12 @@ void ASTReader::ReadPragmaDiagnosticMappings(DiagnosticsEngine &Diag) {
       // Set up the root buffer of the module to start with the initial
       // diagnostic state of the module itself, to cover files that contain no
       // explicit transitions (for which we did not serialize anything).
-      Diag.DiagStatesByLoc.Files[F.OriginalSourceFileID]
-          .StateTransitions.push_back({FirstState, 0});
+      if (F.OriginalSourceFileID.isValid()) {
+        auto &OrigTrans =
+            Diag.DiagStatesByLoc.Files[F.OriginalSourceFileID].StateTransitions;
+        if (OrigTrans.empty())
+          OrigTrans.push_back({FirstState, 0});
+      }
     } else {
       // For prefix ASTs, start with whatever the user configured on the
       // command line.
@@ -7428,13 +7447,26 @@ void ASTReader::ReadPragmaDiagnosticMappings(DiagnosticsEngine &Diag) {
       // we won't be changing the diagnostic state within imported FileIDs
       // (other than perhaps appending to the main source file, which has no
       // parent).
-      auto &F = Diag.DiagStatesByLoc.Files[FID];
-      F.StateTransitions.reserve(F.StateTransitions.size() + Transitions);
+      auto &FileEntry = Diag.DiagStatesByLoc.Files[FID];
+      FileEntry.StateTransitions.reserve(FileEntry.StateTransitions.size() +
+                                         Transitions + 1);
       for (unsigned I = 0; I != Transitions; ++I) {
         unsigned Offset = Record[Idx++];
         auto *State = ReadDiagState(*FirstState, false);
-        F.StateTransitions.push_back({State, Offset});
+        if (!State)
+          State = FirstState;
+        if (FileEntry.StateTransitions.empty() && Offset != 0)
+          FileEntry.StateTransitions.push_back({FirstState, 0});
+        if (!FileEntry.StateTransitions.empty() &&
+            FileEntry.StateTransitions.back().Offset == Offset) {
+          FileEntry.StateTransitions.back().State = State;
+        } else if (FileEntry.StateTransitions.empty() ||
+                   FileEntry.StateTransitions.back().Offset < Offset) {
+          FileEntry.StateTransitions.push_back({State, Offset});
+        }
       }
+      if (FileEntry.StateTransitions.empty())
+        FileEntry.StateTransitions.push_back({FirstState, 0});
     }
 
     // Read the final state.

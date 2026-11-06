@@ -196,22 +196,36 @@ void DiagnosticsEngine::DiagStateMap::append(SourceManager &SrcMgr,
 DiagnosticsEngine::DiagState *
 DiagnosticsEngine::DiagStateMap::lookup(SourceManager &SrcMgr,
                                         SourceLocation Loc) const {
+  DiagState *FallbackState = FirstDiagState ? FirstDiagState : CurDiagState;
   // Common case: we have not seen any diagnostic pragmas.
   if (Files.empty())
-    return FirstDiagState;
+    return FallbackState;
+
+  if (Loc.isInvalid())
+    return CurDiagState ? CurDiagState : FirstDiagState;
 
   FileIDAndOffset Decomp = SrcMgr.getDecomposedLoc(Loc);
   const File *F = getFile(SrcMgr, Decomp.first);
-  return F->lookup(Decomp.second);
+  if (F)
+    if (DiagState *S = F->lookup(Decomp.second))
+      return S;
+  return FallbackState;
 }
 
 DiagnosticsEngine::DiagState *
 DiagnosticsEngine::DiagStateMap::File::lookup(unsigned Offset) const {
+  if (StateTransitions.empty())
+    return (Parent && Parent != this) ? Parent->lookup(ParentOffset) : nullptr;
   auto OnePastIt =
       llvm::partition_point(StateTransitions, [=](const DiagStatePoint &P) {
         return P.Offset <= Offset;
       });
-  assert(OnePastIt != StateTransitions.begin() && "missing initial state");
+  if (OnePastIt == StateTransitions.begin()) {
+    if (Parent && Parent != this)
+      if (DiagState *S = Parent->lookup(ParentOffset))
+        return S;
+    return StateTransitions.front().State;
+  }
   return OnePastIt[-1].State;
 }
 
@@ -230,28 +244,31 @@ DiagnosticsEngine::DiagStateMap::getFile(SourceManager &SrcMgr,
 DiagnosticsEngine::DiagStateMap::File *
 DiagnosticsEngine::DiagStateMap::getFileUncached(SourceManager &SrcMgr,
                                                  FileID ID) const {
+  DiagState *FallbackState = FirstDiagState ? FirstDiagState : CurDiagState;
   // Get or insert the File for this ID.
   auto Range = Files.equal_range(ID);
-  if (Range.first != Range.second)
-    return &Range.first->second;
+  if (Range.first != Range.second) {
+    auto &Existing = Range.first->second;
+    if (Existing.StateTransitions.empty())
+      Existing.StateTransitions.push_back({FallbackState, 0});
+    else if (!Existing.StateTransitions.front().State)
+      Existing.StateTransitions.front().State = FallbackState;
+    return &Existing;
+  }
   auto &F = Files.insert(Range.first, std::make_pair(ID, File()))->second;
+  F.StateTransitions.push_back({FallbackState, 0});
 
   // We created a new File; look up the diagnostic state at the start of it and
   // initialize it.
   if (ID.isValid()) {
     FileIDAndOffset Decomp = SrcMgr.getDecomposedIncludedLoc(ID);
-    F.Parent = getFile(SrcMgr, Decomp.first);
-    F.ParentOffset = Decomp.second;
-    F.StateTransitions.push_back({F.Parent->lookup(Decomp.second), 0});
-  } else {
-    // This is the (imaginary) root file into which we pretend all top-level
-    // files are included; it descends from the initial state.
-    //
-    // FIXME: This doesn't guarantee that we use the same ordering as
-    // isBeforeInTranslationUnit in the cases where someone invented another
-    // top-level file and added diagnostic pragmas to it. See the code at the
-    // end of isBeforeInTranslationUnit for the quirks it deals with.
-    F.StateTransitions.push_back({FirstDiagState, 0});
+    if (Decomp.first != ID) {
+      F.Parent = getFile(SrcMgr, Decomp.first);
+      F.ParentOffset = Decomp.second;
+      if (F.Parent)
+        if (DiagState *ParentState = F.Parent->lookup(Decomp.second))
+          F.StateTransitions[0].State = ParentState;
+    }
   }
   return &F;
 }

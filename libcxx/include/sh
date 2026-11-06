@@ -84,27 +84,40 @@ inline auto grep(const Pat &p) {
 }
 
 template <typename Proj>
-struct __cppsh_sort_stage {
+struct __cppsh_sort_stage
+    : std::ranges::__range_adaptor_closure<__cppsh_sort_stage<Proj>> {
   Proj proj;
+  constexpr explicit __cppsh_sort_stage(Proj p) : proj(std::move(p)) {}
+
   template <std::ranges::input_range Rng>
-  friend auto operator|(Rng &&rng, const __cppsh_sort_stage &s) {
+  auto operator()(Rng &&rng) const {
     using ElemT = std::ranges::range_value_t<Rng>;
     std::vector<ElemT> out;
     for (auto &&item : rng)
       out.push_back(item);
-    std::ranges::sort(out, {}, s.proj);
+    std::ranges::sort(out, {}, proj);
     return out;
   }
 };
 
-template <typename Proj>
-constexpr auto sort_by(Proj p) {
-  return __cppsh_sort_stage<Proj>{p};
-}
+struct __cppsh_sort_by_fn {
+  template <std::ranges::input_range Rng, typename Proj>
+  auto operator()(Rng &&rng, Proj p) const {
+    return __cppsh_sort_stage<std::decay_t<Proj>>(std::move(p))(
+        std::forward<Rng>(rng));
+  }
 
-struct __cppsh_show_stage {
+  template <typename Proj>
+  constexpr auto operator()(Proj p) const {
+    return __cppsh_sort_stage<std::decay_t<Proj>>(std::move(p));
+  }
+};
+inline constexpr __cppsh_sort_by_fn sort_by{};
+
+struct __cppsh_show_stage
+    : std::ranges::__range_adaptor_closure<__cppsh_show_stage> {
   template <std::ranges::input_range Rng>
-  friend void operator|(Rng &&rng, const __cppsh_show_stage &) {
+  void operator()(Rng &&rng) const {
     for (auto &&item : rng) {
       if constexpr (requires { item.dump(); })
         item.dump();
