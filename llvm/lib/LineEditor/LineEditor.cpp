@@ -19,7 +19,9 @@
 #include <clocale>
 #include <csignal>
 #include <cstdio>
+#include <cwchar>
 #if !defined(_WIN32)
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #endif
@@ -129,6 +131,7 @@ struct LineEditor::InternalData {
   // The hint as libedit's right prompt shows it, dim.
   std::string RPrompt;
 
+  FILE *In;
   FILE *Out;
 };
 
@@ -249,6 +252,61 @@ unsigned char ElHintLeftFn(EditLine *EL, int) { return hintMove(EL, -1, 0); }
 unsigned char ElHintRightFn(EditLine *EL, int) { return hintMove(EL, 1, 0); }
 unsigned char ElHintWordLeftFn(EditLine *EL, int) { return hintMove(EL, 0, -1); }
 unsigned char ElHintWordRightFn(EditLine *EL, int) { return hintMove(EL, 0, 1); }
+
+// A hint come in the background: shown -- the key the read function gives
+// libedit for it is bound here, and the line drawn again.
+unsigned char ElHintReadyFn(EditLine *, int) { return CC_REFRESH; }
+
+// Keys read for libedit (EL_GETCFN), waiting for the background hint too:
+// the terminal and the hint's descriptor polled together, so that typing is
+// never held up by a hint being worked out, and a hint that comes is shown
+// at once -- as a private key (\036) bound to ElHintReadyFn. A key is read
+// whole: a UTF-8 sequence made one wide character.
+int ElGetCharFn(EditLine *EL, wchar_t *Got) {
+  LineEditor::InternalData *Data;
+  if (el_get(EL, EL_CLIENTDATA, &Data) != 0)
+    return -1;
+  int InFd = fileno(Data->In);
+  for (;;) {
+    int HintFd = Data->LE->hintFd();
+    struct pollfd Fds[2] = {{InFd, POLLIN, 0}, {HintFd, POLLIN, 0}};
+    int Ready = ::poll(Fds, HintFd >= 0 ? 2 : 1, -1);
+    if (Ready < 0)
+      return -1; // EINTR: Ctrl+C, as libedit's own read says it
+    if (HintFd >= 0 && (Fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+      Data->LE->collectHint();
+      refreshHint(EL, Data);
+      *Got = L'\036';
+      return 1;
+    }
+    if (!(Fds[0].revents & (POLLIN | POLLHUP | POLLERR)))
+      continue;
+    unsigned char Bytes[4];
+    ssize_t N = ::read(InFd, Bytes, 1);
+    if (N == 0)
+      return 0;
+    if (N < 0)
+      return -1;
+    int Len = Bytes[0] < 0x80 ? 1
+              : (Bytes[0] >> 5) == 6 ? 2
+              : (Bytes[0] >> 4) == 14 ? 3
+              : (Bytes[0] >> 3) == 30 ? 4
+                                      : 1;
+    for (int I = 1; I < Len; ++I)
+      if (::read(InFd, Bytes + I, 1) != 1) {
+        Len = I;
+        break;
+      }
+    std::mbstate_t State{};
+    wchar_t Wide = 0;
+    size_t Conv = std::mbrtowc(&Wide, reinterpret_cast<const char *>(Bytes),
+                               static_cast<size_t>(Len), &State);
+    *Got = (Conv == static_cast<size_t>(-1) || Conv == static_cast<size_t>(-2))
+               ? static_cast<wchar_t>(Bytes[0])
+               : Wide;
+    return 1;
+  }
+}
 
 // Enter: the hint taken off the line, then libedit's own newline. The line
 // is drawn again without the hint (CC_REFRESH), and ed-newline -- bound to
@@ -411,6 +469,7 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
     this->HistoryPath = getDefaultHistoryPath(ProgName);
 
   Data->LE = this;
+  Data->In = In;
   Data->Out = Out;
 
   if (!std::setlocale(LC_ALL, ""))
@@ -450,6 +509,10 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
   ::el_set(Data->EL, EL_BIND, "^M", "hint_enter", NULL);
   ::el_set(Data->EL, EL_BIND, "^J", "hint_enter", NULL);
   ::el_set(Data->EL, EL_BIND, "^X^J", "ed-newline", NULL);
+  // Hints that come while no key is pressed (setHintWatch).
+  ::el_set(Data->EL, EL_ADDFN, "hint_ready", "Show a hint that came", ElHintReadyFn);
+  ::el_set(Data->EL, EL_BIND, "\\036", "hint_ready", NULL);
+  ::el_set(Data->EL, EL_GETCFN, ElGetCharFn);
   // The arrows, and Ctrl+Left, Ctrl+Right -- a word back, a word on, as
   // xterm and rxvt send them -- moving the cursor and the hint with it.
   ::el_set(Data->EL, EL_ADDFN, "hint_left", "Left, then hint", ElHintLeftFn);

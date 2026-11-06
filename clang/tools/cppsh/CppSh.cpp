@@ -242,20 +242,11 @@ static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Cod
   return llvm::Error::success();
 }
 
-// The type of the expression being typed, for the line editor's hint: Sema's
-// own, the value specialization's included (`ls {.files_only = true}`:
-// ls_view<file_entry>). Nothing where it does not parse yet, where a
-// statement was just ended, or for the shell's own commands.
-//
-// Worked out in a fork of the shell, never in the session itself: parsing
-// changes Sema beyond what an undo takes back -- a class template
-// instantiated, the friends it defines (`define<tag, 42>()` typed, then
-// erased, left adl_function(declare<tag>{}) defined), the value
-// specialization's functions. The child, a copy of the whole session, parses
-// `using __cppsh_hint_t = decltype(<it>);`, writes the type to a pipe and
-// ends; the session is as it was. A child slower than kHintMillis is ended,
-// and no hint shown.
-static constexpr int kHintMillis = 150;
+// The type of the expression at the cursor, for the line editor's hint:
+// Sema's own, the value specialization's included (`ls {.files_only =
+// true}`: ls_view<file_entry>). Nothing where it does not parse yet, where a
+// statement was just ended, or for the shell's own commands. Worked out in a
+// fork, in the background (typeHint, below).
 
 // The expression at the cursor: from the cursor -- to the end of the word
 // under it -- back to the nearest unmatched '(', '[' or '{', or a ',', ';' or
@@ -305,23 +296,92 @@ static llvm::StringRef expressionAt(llvm::StringRef Buffer, size_t Pos) {
   return Buffer.substr(Start, End - Start).trim();
 }
 
+// The child working out a hint, the text it is for and its pipe; and the
+// last hint come, for its text.
+namespace {
+struct HintJob {
+  pid_t Child = -1;
+  int Fd = -1;
+  std::string Text;
+};
+HintJob PendingHint;
+std::string LastHintText, LastHintValue;
+} // namespace
+
+// A child for text no longer typed: ended.
+static void cancelHint() {
+#if !defined(_WIN32)
+  if (PendingHint.Child > 0) {
+    ::kill(PendingHint.Child, SIGKILL);
+    if (PendingHint.Fd >= 0)
+      ::close(PendingHint.Fd);
+    while (::waitpid(PendingHint.Child, nullptr, 0) < 0 && errno == EINTR) {
+    }
+  }
+#endif
+  PendingHint = {};
+}
+
+static int hintFd() { return PendingHint.Fd; }
+
+// The child's answer taken in: what it wrote, as the shell's user writes
+// names (without std::sh::, std::), none for a symbol.
+static void collectHint() {
+#if !defined(_WIN32)
+  if (PendingHint.Child <= 0)
+    return;
+  std::string Hint;
+  char Buf[512];
+  for (;;) {
+    ssize_t N = ::read(PendingHint.Fd, Buf, sizeof Buf);
+    if (N < 0 && errno == EINTR)
+      continue;
+    if (N <= 0)
+      break;
+    Hint.append(Buf, static_cast<size_t>(N));
+  }
+  ::close(PendingHint.Fd);
+  while (::waitpid(PendingHint.Child, nullptr, 0) < 0 && errno == EINTR) {
+  }
+  llvm::StringRef H(Hint);
+  if (H.starts_with("sym<") || H.starts_with("std::sh::sym<") || H.starts_with("const sym<"))
+    Hint.clear();
+  for (llvm::StringRef Scope : {"std::sh::", "std::ranges::", "std::"})
+    for (size_t At; (At = Hint.find(Scope.str())) != std::string::npos;)
+      Hint.erase(At, Scope.size());
+  LastHintText = PendingHint.Text;
+  LastHintValue = Hint;
+#endif
+  PendingHint = {};
+}
+
 static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
                             size_t Pos) {
   llvm::StringRef Expr = expressionAt(Buffer, Pos);
   if (Expr.empty() || Expr.ends_with(";") || Expr == "exit" || Expr == "quit" ||
       Expr == "clear" || Expr == "cd" || Expr.starts_with("cd ") ||
-      Expr.starts_with("%") || Expr.starts_with("#"))
+      Expr.starts_with("%") || Expr.starts_with("#")) {
+    cancelHint();
     return {};
-  // The same text, the same hint: a cursor moved forks nothing.
-  static std::string LastText, LastHint;
-  if (Expr == LastText)
-    return LastHint;
-  LastText = Expr.str();
-  LastHint.clear();
+  }
+  // Known: shown. Being worked out: nothing yet -- it is shown as it comes.
+  if (Expr == LastHintText)
+    return LastHintValue;
+  if (PendingHint.Child > 0 && Expr == PendingHint.Text)
+    return {};
+  cancelHint();
 #if defined(_WIN32)
   (void)Interp;
   return {};
 #else
+  // Worked out in a fork of the shell, never in the session itself: parsing
+  // changes Sema beyond what an undo takes back -- a class template
+  // instantiated, the friends it defines (`define<tag, 42>()` typed, then
+  // erased, left adl_function(declare<tag>{}) defined), the value
+  // specialization's functions. The child, a copy of the whole session,
+  // parses `using __cppsh_hint_t = decltype(<it>);`, writes the type down the
+  // pipe and ends; the session is as it was. The shell does not wait for it
+  // (the line editor polls the pipe with the keys).
   int Fds[2];
   if (::pipe(Fds) != 0)
     return {};
@@ -332,8 +392,6 @@ static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
     return {};
   }
   if (Child == 0) {
-    // The copy: its diagnostics nowhere, its result down the pipe, its end
-    // without running anything the session's exit would (_exit).
     ::close(Fds[0]);
     clang::DiagnosticsEngine &Diags = Interp.getCompilerInstance()->getDiagnostics();
     Diags.setClient(new clang::IgnoringDiagConsumer(), /*ShouldOwnClient=*/true);
@@ -346,9 +404,7 @@ static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
             clang::PrintingPolicy PP(Alias->getASTContext().getLangOpts());
             PP.SuppressScope = true;
             // What decltype(...) and a deduced auto stand for, not their
-            // spelling: the alias's type is decltype(obj) itself, which
-            // printed as just that. Typedef names under them kept
-            // (std::string, not basic_string<char, ...>).
+            // spelling; typedef names under them kept.
             clang::QualType T = Alias->getUnderlyingType();
             for (;;) {
               if (const auto *DT = T->getAs<clang::DecltypeType>()) {
@@ -376,47 +432,8 @@ static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
     ::_exit(0);
   }
   ::close(Fds[1]);
-  std::string Hint;
-  bool TimedOut = false;
-  for (;;) {
-    struct pollfd P = {Fds[0], POLLIN, 0};
-    int Ready = ::poll(&P, 1, kHintMillis);
-    if (Ready == 0) {
-      TimedOut = true;
-      break;
-    }
-    if (Ready < 0) {
-      if (errno == EINTR)
-        continue;
-      break;
-    }
-    char Buf[512];
-    ssize_t N = ::read(Fds[0], Buf, sizeof Buf);
-    if (N < 0 && errno == EINTR)
-      continue;
-    if (N <= 0)
-      break;
-    Hint.append(Buf, static_cast<size_t>(N));
-  }
-  ::close(Fds[0]);
-  if (TimedOut) {
-    ::kill(Child, SIGKILL);
-    Hint.clear();
-  }
-  while (::waitpid(Child, nullptr, 0) < 0 && errno == EINTR) {
-  }
-  // A symbol -- a word nothing named (`dir` in `ls dir`) -- has no type to
-  // speak of: no hint.
-  if (llvm::StringRef(Hint).starts_with("sym<") || llvm::StringRef(Hint).starts_with("std::sh::sym<") ||
-      llvm::StringRef(Hint).starts_with("const sym<"))
-    Hint.clear();
-  // Names as the shell's user writes them: without std::sh:: and std::.
-  for (llvm::StringRef Scope : {"std::sh::", "std::ranges::", "std::"}) {
-    for (size_t At; (At = Hint.find(Scope.str())) != std::string::npos;)
-      Hint.erase(At, Scope.size());
-  }
-  LastHint = Hint;
-  return Hint;
+  PendingHint = {Child, Fds[0], Expr.str()};
+  return {};
 #endif
 }
 
@@ -1476,9 +1493,12 @@ int main(int argc, const char **argv) {
     LE.setHinter([&Interp](llvm::StringRef Buffer, size_t Pos) {
       return typeHint(*Interp, Buffer, Pos);
     });
+    LE.setHintWatch([] { return hintFd(); }, [] { collectHint(); });
     LE.setPrompt(buildBashPrompt(LastFailed));
 
     while (std::optional<std::string> Line = LE.readLine()) {
+      // The line entered: a hint still being worked out is for nothing now.
+      cancelHint();
       // Ctrl+C (the LineEditor's "\x03"): what was typed, continued lines
       // too, dropped; the prompt's `$` red, as after a failed command.
       if (*Line == "\x03") {

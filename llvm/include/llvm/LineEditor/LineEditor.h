@@ -122,6 +122,21 @@ public:
   }
   void clearHint() const { Hint.clear(); }
 
+  /// Hints worked out in the background: a function giving the descriptor
+  /// that becomes readable once a hint is ready (-1: none being worked out),
+  /// and one taking it in -- after which the hinter gives it. The line
+  /// editor waits for a key and for that descriptor together, and shows the
+  /// hint as it comes, with no key pressed.
+  void setHintWatch(std::function<int()> Fd, std::function<void()> Collect) {
+    HintFd = std::move(Fd);
+    HintCollect = std::move(Collect);
+  }
+  int hintFd() const { return HintFd ? HintFd() : -1; }
+  void collectHint() const {
+    if (HintCollect)
+      HintCollect();
+  }
+
   // Public so callbacks in LineEditor.cpp can use it.
   struct InternalData;
 
@@ -130,6 +145,8 @@ private:
   std::string HistoryPath;
   std::function<std::string(StringRef, size_t)> Hinter;
   mutable std::string Hint;
+  std::function<int()> HintFd;
+  std::function<void()> HintCollect;
   std::unique_ptr<InternalData> Data;
 
   struct LLVM_ABI CompleterConcept {
