@@ -7877,7 +7877,10 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                 if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
                   // A local of the function whose body is being written, its
                   // value only known as it runs: the body is cut here.
+                  // (Not in a lambda's body: no cut is made there, and the
+                  // call would be left a recovery expression, unsaid.)
                   if (VD->hasLocalStorage() && getCurFunctionDecl() &&
+                      !isLambdaCallOperator(getCurFunctionDecl()) &&
                       !getCurFunctionDecl()->isDependentContext() &&
                       !getCurFunctionDecl()->isTemplateInstantiation() &&
                       CodeSynthesisContexts.empty() &&
