@@ -300,7 +300,23 @@ static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
           if (Alias->getIdentifier() && Alias->getName() == "__cppsh_hint_t") {
             clang::PrintingPolicy PP(Alias->getASTContext().getLangOpts());
             PP.SuppressScope = true;
-            Hint = Alias->getUnderlyingType().getAsString(PP);
+            // What decltype(...) and a deduced auto stand for, not their
+            // spelling: the alias's type is decltype(obj) itself, which
+            // printed as just that. Typedef names under them kept
+            // (std::string, not basic_string<char, ...>).
+            clang::QualType T = Alias->getUnderlyingType();
+            for (;;) {
+              if (const auto *DT = T->getAs<clang::DecltypeType>()) {
+                T = DT->getUnderlyingType();
+                continue;
+              }
+              if (const auto *AT = T->getAs<clang::AutoType>(); AT && AT->isDeduced()) {
+                T = AT->getDeducedType();
+                continue;
+              }
+              break;
+            }
+            Hint = T.getAsString(PP);
           }
     } else {
       llvm::consumeError(PTU.takeError());
