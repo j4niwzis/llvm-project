@@ -112,6 +112,9 @@ SourceLocation CppshStageAt;
 bool CppshCutNeeded = false;
 std::set<const FunctionDecl *> CppshCutFunctions;
 std::vector<std::string> CppshCutRemainders;
+// Per cut: where it was made in a loop, the loop run on from its next step,
+// and what follows it (__cppsh_loopK); empty otherwise.
+std::vector<std::string> CppshCutLoopRests;
 std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
 // A call of a staged function among the user's top-level statements: the
 // statement is staged and the call hoisted -- run on its own, its result put
@@ -202,6 +205,7 @@ void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
   }
   unsigned Id = CppshCutRemainders.size();
   CppshCutRemainders.push_back(Rest.str());
+  CppshCutLoopRests.emplace_back();
   CppshCutLocalNames.push_back(std::move(Names));
   CppshCutLocalTypes.push_back(std::move(Types));
   CppshCutFunctions.insert(FD->getCanonicalDecl());

@@ -1406,6 +1406,7 @@ extern std::vector<SourceLocation> CppshTopLevelStarts;
 void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef) = nullptr;
 
 extern std::vector<std::string> CppshCutRemainders;
+extern std::vector<std::string> CppshCutLoopRests;
 extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
 extern SourceLocation CppshHoistBegin, CppshHoistEnd;
 extern bool CppshInHoist;
@@ -1439,8 +1440,26 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
     Params += std::string(Params.empty() ? "" : ", ") + "auto " + Names[I];
     Args += std::string(Args.empty() ? "" : ", ") + Global;
   }
-  Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {\n" + CppshCutRemainders[Id] +
-          "\n}\n";
+  const std::string &LoopRest =
+      Id < CppshCutLoopRests.size() ? CppshCutLoopRests[Id] : std::string();
+  if (LoopRest.empty()) {
+    Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {\n" + CppshCutRemainders[Id] +
+            "\n}\n";
+  } else {
+    // Made in a loop: the iteration finished with the values it has, as
+    // constants; the loop run on (__cppsh_loopK) with them by reference --
+    // never constants, as the next iteration changes them; its need cut again.
+    std::string RefParams, RefArgs;
+    for (unsigned I = 0; I < N && I < Names.size(); ++I) {
+      RefParams += std::string(RefParams.empty() ? "" : ", ") + Types[I] + " &" + Names[I];
+      RefArgs += std::string(RefArgs.empty() ? "" : ", ") + "const_cast<" + Types[I] +
+                 " &>(" + Names[I] + ")";
+    }
+    Code += "auto __cppsh_loop" + Tag + "(" + RefParams + ") {\n" + LoopRest + "\n}\n";
+    Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {\ndo { " +
+            CppshCutRemainders[Id] + "\n} while (false);\nreturn __cppsh_loop" + Tag +
+            "(" + RefArgs + ");\n}\n";
+  }
   Code += "auto __cppsh_res" + Tag +
           " = ::std::sh::__cppsh_value([] { return __cppsh_cont" + Tag + "(" + Args +
           "); });\n";
@@ -1449,7 +1468,20 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Code))
     llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
   CppshInHoist = WasHoist;
-  CppshLastResult = "__cppsh_res" + Tag;
+  // The result: that of this continuation -- unless it was staged on in turn
+  // (a staged{} of its own): then that of the innermost, set as it ran.
+  bool Staged = false;
+  {
+    Sema &S = CppshActiveInterpreter->getCompilerInstance()->getSema();
+    LookupResult R(S, &S.getPreprocessor().getIdentifierTable().get("__cppsh_res" + Tag),
+                   SourceLocation(), Sema::LookupOrdinaryName);
+    S.LookupQualifiedName(R, S.Context.getTranslationUnitDecl());
+    if (auto *VD = R.getAsSingle<VarDecl>())
+      if (auto *RD = VD->getType()->getAsCXXRecordDecl())
+        Staged = RD->getIdentifier() && RD->getName() == "staged";
+  }
+  if (!Staged)
+    CppshLastResult = "__cppsh_res" + Tag;
 }
 
 // Whether an input may need staging: it holds more than one top-level
