@@ -113,7 +113,6 @@ static std::string getDisplayCwd() {
 
 static std::string buildBashPrompt(bool LastFailed) {
   std::string User = getUsername();
-  std::string Host = getShortHostname();
   std::string Path = getDisplayCwd();
   bool IsRoot = false;
 #if !defined(_WIN32)
@@ -128,8 +127,8 @@ static std::string buildBashPrompt(bool LastFailed) {
   const char *Reset = "\001\033[0m\001";
 
   std::string P;
-  P += GreenBold + User + "@" + Host + Reset + ":";
-  P += BlueBold + Path + Reset;
+  P += GreenBold + User + Reset + " ";
+  P += BlueBold + Path + Reset + " ";
   if (LastFailed)
     P += std::string(RedBold) + Dollar + Reset + " ";
   else
