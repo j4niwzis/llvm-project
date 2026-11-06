@@ -125,6 +125,8 @@ struct LineEditor::InternalData {
 
   unsigned PrevCount;
   std::string ContinuationOutput;
+  // The hint as libedit's right prompt shows it, dim.
+  std::string RPrompt;
 
   FILE *Out;
 };
@@ -136,6 +138,74 @@ const char *ElGetPromptFn(EditLine *EL) {
   if (el_get(EL, EL_CLIENTDATA, &Data) == 0)
     return Data->LE->getPrompt().c_str();
   return "> ";
+}
+
+const char *ElGetRPromptFn(EditLine *EL) {
+  LineEditor::InternalData *Data;
+  if (el_get(EL, EL_CLIENTDATA, &Data) == 0)
+    return Data->RPrompt.c_str();
+  return "";
+}
+
+// The hint for the line as it is now, as the right prompt.
+void refreshHint(EditLine *EL, LineEditor::InternalData *Data) {
+  const LineInfo *LI = ::el_line(EL);
+  Data->LE->updateHint(StringRef(LI->buffer, LI->lastchar - LI->buffer),
+                       LI->cursor - LI->buffer);
+  const std::string &Hint = Data->LE->getHint();
+  Data->RPrompt = Hint.empty() ? std::string()
+                               : "\001\033[90m\001 " + Hint + "\001\033[0m\001";
+}
+
+// A character typed: inserted, then the hint made again.
+unsigned char ElHintInsertFn(EditLine *EL, int Ch) {
+  LineEditor::InternalData *Data;
+  if (el_get(EL, EL_CLIENTDATA, &Data) != 0)
+    return CC_ERROR;
+  char Text[2] = {static_cast<char>(Ch), '\0'};
+  if (::el_insertstr(EL, Text) == -1)
+    return CC_ERROR;
+  refreshHint(EL, Data);
+  return CC_REFRESH;
+}
+
+// Backspace: the character before the cursor taken out, then the hint.
+unsigned char ElHintDeleteFn(EditLine *EL, int) {
+  LineEditor::InternalData *Data;
+  if (el_get(EL, EL_CLIENTDATA, &Data) != 0)
+    return CC_ERROR;
+  const LineInfo *LI = ::el_line(EL);
+  if (LI->cursor == LI->buffer)
+    return CC_REFRESH_BEEP;
+  ::el_deletestr(EL, 1);
+  refreshHint(EL, Data);
+  return CC_REFRESH;
+}
+
+// Enter: the hint taken off the line before it is entered -- the line drawn
+// again without it -- so that none stays in what was typed.
+unsigned char ElHintEnterFn(EditLine *EL, int) {
+  LineEditor::InternalData *Data;
+  if (el_get(EL, EL_CLIENTDATA, &Data) != 0)
+    return CC_ERROR;
+  bool Shown = !Data->RPrompt.empty();
+  Data->LE->clearHint();
+  Data->RPrompt.clear();
+  const LineInfo *LI = ::el_line(EL);
+  if (Shown) {
+    std::string Line = "\r";
+    for (char Ch : Data->LE->getPrompt())
+      if (Ch != '\001')
+        Line += Ch;
+    Line.append(LI->buffer, LI->lastchar - LI->buffer);
+    Line += "\033[K";
+    ::fwrite(Line.data(), Line.size(), 1, Data->Out);
+    ::fflush(Data->Out);
+  }
+  // As libedit's own newline: the line ended with '\n' at its end.
+  ::el_cursor(EL, static_cast<int>(LI->lastchar - LI->cursor));
+  ::el_insertstr(EL, "\n");
+  return CC_NEWLINE;
 }
 
 // Handles tab completion.
@@ -304,6 +374,26 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
   ::el_set(Data->EL, EL_ADDFN, "tab_complete", "Tab completion function",
            ElCompletionFn);
   ::el_set(Data->EL, EL_BIND, "\t", "tab_complete", NULL);
+  // The hint (setHinter): at the right of the line, made again as it is
+  // edited -- every printable character typed, Backspace -- and taken off
+  // as it is entered.
+  ::el_set(Data->EL, EL_RPROMPT_ESC, ElGetRPromptFn, '\001');
+  ::el_set(Data->EL, EL_ADDFN, "hint_insert", "Insert, then hint", ElHintInsertFn);
+  ::el_set(Data->EL, EL_ADDFN, "hint_delete", "Delete back, then hint", ElHintDeleteFn);
+  ::el_set(Data->EL, EL_ADDFN, "hint_enter", "Enter without the hint", ElHintEnterFn);
+  for (int Ch = 0x20; Ch < 0x7f; ++Ch) {
+    // libedit reads '^' and '\\' in a key as escapes.
+    char Key[3] = {static_cast<char>(Ch), '\0', '\0'};
+    if (Ch == '^' || Ch == '\\') {
+      Key[0] = '\\';
+      Key[1] = static_cast<char>(Ch);
+    }
+    ::el_set(Data->EL, EL_BIND, Key, "hint_insert", NULL);
+  }
+  ::el_set(Data->EL, EL_BIND, "^?", "hint_delete", NULL);
+  ::el_set(Data->EL, EL_BIND, "^H", "hint_delete", NULL);
+  ::el_set(Data->EL, EL_BIND, "^M", "hint_enter", NULL);
+  ::el_set(Data->EL, EL_BIND, "^J", "hint_enter", NULL);
   ::el_set(Data->EL, EL_BIND, "^r", "em-inc-search-prev",
            NULL); // Cycle through backwards search, entering string
   ::el_set(Data->EL, EL_BIND, "^w", "ed-delete-prev-word",
@@ -349,6 +439,8 @@ std::optional<std::string> LineEditor::readLine() const {
   installSigIntHandler();
   GotSigInt = 0;
   errno = 0;
+  clearHint();
+  Data->RPrompt.clear();
 
   // Call el_gets to prompt the user and read the user's input.
   int LineLen = 0;

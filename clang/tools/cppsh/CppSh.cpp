@@ -239,6 +239,63 @@ static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Cod
   return llvm::Error::success();
 }
 
+// The type of the expression being typed, for the line editor's hint: the
+// statement up to the cursor parsed -- not run -- as `decltype(auto)
+// __cppsh_hint = <it>;`, its diagnostics muted, and undone. The type is
+// Sema's own, the value specialization's included (`ls {.files_only =
+// true}`: ls_view<file_entry>). Nothing where it does not parse yet, where
+// a statement was just ended, or for the shell's own commands.
+static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
+                            size_t Pos) {
+  std::vector<std::string> Stmts = splitStatements(Buffer.substr(0, Pos));
+  if (Stmts.empty())
+    return {};
+  llvm::StringRef Expr = llvm::StringRef(Stmts.back()).trim();
+  if (Expr.empty() || Expr.ends_with(";") || Expr == "exit" || Expr == "quit" ||
+      Expr == "clear" || Expr == "cd" || Expr.starts_with("cd ") ||
+      Expr.starts_with("%") || Expr.starts_with("#"))
+    return {};
+  // The same text, the same hint: a cursor moved re-parses nothing.
+  static std::string LastText, LastHint;
+  if (Expr == LastText)
+    return LastHint;
+
+  clang::DiagnosticsEngine &Diags = Interp.getCompilerInstance()->getDiagnostics();
+  clang::DiagnosticConsumer *Client = Diags.getClient();
+  bool Owns = Diags.ownsClient();
+  std::unique_ptr<clang::DiagnosticConsumer> Owned;
+  if (Owns)
+    Owned = Diags.takeClient();
+  clang::IgnoringDiagConsumer Ignore;
+  Diags.setClient(&Ignore, /*ShouldOwnClient=*/false);
+
+  std::string Hint;
+  std::string Code = "decltype(auto) __cppsh_hint = " + Expr.str() + ";";
+  if (llvm::Expected<clang::PartialTranslationUnit &> PTU = Interp.Parse(Code)) {
+    for (clang::Decl *D : PTU->TUPart->decls())
+      if (auto *VD = llvm::dyn_cast<clang::VarDecl>(D))
+        if (VD->getIdentifier() && VD->getName() == "__cppsh_hint") {
+          clang::PrintingPolicy PP(VD->getASTContext().getLangOpts());
+          PP.SuppressScope = true;
+          Hint = VD->getType().getAsString(PP);
+          if (Hint.size() > 60)
+            Hint = Hint.substr(0, 57) + "...";
+        }
+    if (llvm::Error Err = Interp.Undo())
+      llvm::consumeError(std::move(Err));
+  } else {
+    llvm::consumeError(PTU.takeError());
+  }
+
+  if (Owns)
+    Diags.setClient(Owned.release(), /*ShouldOwnClient=*/true);
+  else
+    Diags.setClient(Client, /*ShouldOwnClient=*/false);
+  LastText = Expr.str();
+  LastHint = Hint;
+  return Hint;
+}
+
 static llvm::Error runFileOrCode(clang::Interpreter &Interp,
                                  llvm::StringRef Input,
                                  bool ForceFile = false) {
@@ -1296,6 +1353,9 @@ int main(int argc, const char **argv) {
     std::string Input;
     bool LastFailed = false;
     LE.setListCompleter(ReplListCompleter(CB, *Interp));
+    LE.setHinter([&Interp](llvm::StringRef Buffer, size_t Pos) {
+      return typeHint(*Interp, Buffer, Pos);
+    });
     LE.setPrompt(buildBashPrompt(LastFailed));
 
     while (std::optional<std::string> Line = LE.readLine()) {

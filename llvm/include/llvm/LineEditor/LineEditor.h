@@ -12,6 +12,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Compiler.h"
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -108,12 +109,27 @@ public:
   const std::string &getPrompt() const { return Prompt; }
   void setPrompt(const std::string &P) { Prompt = P; }
 
+  /// A hinter: a function object taking the line (StringRef) and the cursor
+  /// position in it (size_t), returning a hint shown at the right of the
+  /// line while it is edited -- the type of what is being typed, for one --
+  /// and gone once the line is entered.
+  void setHinter(std::function<std::string(StringRef, size_t)> H) {
+    Hinter = std::move(H);
+  }
+  const std::string &getHint() const { return Hint; }
+  void updateHint(StringRef Buffer, size_t Pos) const {
+    Hint = Hinter ? Hinter(Buffer, Pos) : std::string();
+  }
+  void clearHint() const { Hint.clear(); }
+
   // Public so callbacks in LineEditor.cpp can use it.
   struct InternalData;
 
 private:
   std::string Prompt;
   std::string HistoryPath;
+  std::function<std::string(StringRef, size_t)> Hinter;
+  mutable std::string Hint;
   std::unique_ptr<InternalData> Data;
 
   struct LLVM_ABI CompleterConcept {
