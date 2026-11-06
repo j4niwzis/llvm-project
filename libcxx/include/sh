@@ -407,6 +407,110 @@ inline std::string env(const Name &n) {
   return v ? std::string(v) : std::string{};
 }
 
+template <typename Name, typename Val>
+inline bool setenv(const Name &n, const Val &v, bool overwrite = true) {
+  return ::setenv(__cppsh_cstr(n), __cppsh_cstr(v), overwrite ? 1 : 0) == 0;
+}
+
+template <typename Path>
+inline bool exists(const Path &p) {
+  return file_exists(p);
+}
+
+template <typename Path>
+inline bool mkdir_p(const Path &p) {
+  std::error_code ec;
+  std::filesystem::create_directories(__cppsh_cstr(p), ec);
+  return !ec;
+}
+
+template <typename Path>
+inline bool rm(const Path &p) {
+  std::error_code ec;
+  std::filesystem::remove_all(__cppsh_cstr(p), ec);
+  return !ec;
+}
+
+template <typename Src, typename Dst>
+inline bool cp(const Src &src, const Dst &dst) {
+  std::error_code ec;
+  std::filesystem::copy(
+      __cppsh_cstr(src), __cppsh_cstr(dst),
+      std::filesystem::copy_options::recursive |
+          std::filesystem::copy_options::overwrite_existing,
+      ec);
+  return !ec;
+}
+
+template <typename Src, typename Dst>
+inline bool mv(const Src &src, const Dst &dst) {
+  std::error_code ec;
+  std::filesystem::rename(__cppsh_cstr(src), __cppsh_cstr(dst), ec);
+  return !ec;
+}
+
+template <typename Path>
+inline bool touch(const Path &p) {
+  std::ofstream ofs(__cppsh_cstr(p), std::ios::app);
+  return ofs.good();
+}
+
+template <typename Path>
+inline auto head(const Path &p, std::ptrdiff_t n = 10) {
+  return lines(p) | std::ranges::views::take(n);
+}
+
+template <typename Path>
+inline std::vector<line_entry> tail(const Path &p, std::size_t n = 10) {
+  std::vector<line_entry> all;
+  for (auto &&le : lines(p))
+    all.push_back(std::move(le));
+  if (all.size() > n)
+    all.erase(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(all.size() - n));
+  return all;
+}
+
+template <typename Path>
+inline long long wc_l(const Path &p) {
+  long long cnt = 0;
+  for (auto &&le : lines(p)) {
+    (void)le;
+    ++cnt;
+  }
+  return cnt;
+}
+
+inline ls_view glob(const char *dir = ".", ls_opts opts = {}) {
+  return ls(dir, opts);
+}
+
+struct sh_result {
+  int code = 0;
+  std::string out;
+  constexpr explicit operator bool() const noexcept { return code == 0; }
+  void dump() const { std::printf("%s", out.c_str()); }
+};
+
+template <typename Cmd>
+inline int run(const Cmd &cmd) {
+  return std::system(__cppsh_cstr(cmd));
+}
+
+template <typename Cmd>
+inline sh_result exec(const Cmd &cmd) {
+  sh_result res;
+  FILE *fp = ::popen(__cppsh_cstr(cmd), "r");
+  if (!fp) {
+    res.code = -1;
+    return res;
+  }
+  char buf[1024];
+  while (std::fgets(buf, sizeof(buf), fp))
+    res.out += buf;
+  res.code = ::pclose(fp);
+  return res;
+}
+
 } // namespace sh
 } // namespace std
 
