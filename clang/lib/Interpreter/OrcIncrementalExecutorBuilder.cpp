@@ -72,6 +72,24 @@
 // provides it. Defined if available at configure time
 // (CLANG_HAVE_EMUTLS_GET_ADDRESS). When unavailable, thread_locals instead rely
 // on process-symbol lookup.
+// The 128-bit division helpers JIT'd code calls -- std::format and
+// std::println divide unsigned __int128 to print integers -- defined in
+// Interpreter.cpp. They live in libgcc / compiler-rt's builtins, which the
+// host may link statically and not export: ORC's process-symbol lookup goes
+// through dlsym, which cannot see them, nor what
+// llvm::sys::DynamicLibrary::AddSymbol registers. Defined in the JIT as
+// absolute symbols instead, as __emutls_get_address is below.
+#if defined(__SIZEOF_INT128__)
+extern "C" {
+unsigned __int128 __cppsh_udivmodti4(unsigned __int128, unsigned __int128,
+                                     unsigned __int128 *);
+unsigned __int128 __cppsh_udivti3(unsigned __int128, unsigned __int128);
+unsigned __int128 __cppsh_umodti3(unsigned __int128, unsigned __int128);
+__int128 __cppsh_divti3(__int128, __int128);
+__int128 __cppsh_modti3(__int128, __int128);
+}
+#endif
+
 #if CLANG_HAVE_EMUTLS_GET_ADDRESS
 extern "C" void *__emutls_get_address(void *);
 static void *getEmuTLSGetAddressPtr() {
@@ -446,17 +464,30 @@ OrcIncrementalExecutorBuilder::createExecutor(llvm::orc::ThreadSafeContext &TSC,
     // it: an already-defined symbol shadows the process-symbols generator.
     // In-process execution only -- the host address is meaningless in an
     // out-of-process executor.
-    if (void *EmuTLSGetAddress = getEmuTLSGetAddressPtr())
-      JITBuilder->setNotifyCreatedCallback(
-          [EmuTLSGetAddress](llvm::orc::LLJIT &J) {
-            auto &JD = J.getProcessSymbolsJITDylib()
-                           ? *J.getProcessSymbolsJITDylib()
-                           : J.getMainJITDylib();
-            return JD.define(llvm::orc::absoluteSymbols(
-                {{J.mangleAndIntern("__emutls_get_address"),
-                  {llvm::orc::ExecutorAddr::fromPtr(EmuTLSGetAddress),
-                   llvm::JITSymbolFlags::Exported}}}));
-          });
+    // And the 128-bit division helpers (see __cppsh_udivti3 above), the
+    // same way -- one callback: a builder keeps only the last one set.
+    JITBuilder->setNotifyCreatedCallback([](llvm::orc::LLJIT &J) -> llvm::Error {
+      auto &JD = J.getProcessSymbolsJITDylib() ? *J.getProcessSymbolsJITDylib()
+                                               : J.getMainJITDylib();
+      llvm::orc::SymbolMap Symbols;
+      const auto Add = [&](llvm::StringRef Name, void *Address) {
+        Symbols[J.mangleAndIntern(Name)] = {
+            llvm::orc::ExecutorAddr::fromPtr(Address),
+            llvm::JITSymbolFlags::Exported};
+      };
+      if (void *EmuTLSGetAddress = getEmuTLSGetAddressPtr())
+        Add("__emutls_get_address", EmuTLSGetAddress);
+#if defined(__SIZEOF_INT128__)
+      Add("__udivmodti4", reinterpret_cast<void *>(&__cppsh_udivmodti4));
+      Add("__udivti3", reinterpret_cast<void *>(&__cppsh_udivti3));
+      Add("__umodti3", reinterpret_cast<void *>(&__cppsh_umodti3));
+      Add("__divti3", reinterpret_cast<void *>(&__cppsh_divti3));
+      Add("__modti3", reinterpret_cast<void *>(&__cppsh_modti3));
+#endif
+      if (Symbols.empty())
+        return llvm::Error::success();
+      return JD.define(llvm::orc::absoluteSymbols(std::move(Symbols)));
+    });
   }
 
   llvm::Error Err = llvm::Error::success();
