@@ -114,15 +114,227 @@ struct __cppsh_sort_by_fn {
 };
 inline constexpr __cppsh_sort_by_fn sort_by{};
 
+struct __cppsh_nu_cell {
+  std::string text;
+  std::string color;
+  bool right_align = false;
+};
+
+inline std::size_t __cppsh_utf8_width(std::string_view s) noexcept {
+  std::size_t w = 0;
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    if ((c & 0xC0) != 0x80)
+      ++w;
+  }
+  return w;
+}
+
+inline std::string __cppsh_human_size(long long bytes) {
+  char buf[64];
+  if (bytes < 1024) {
+    std::snprintf(buf, sizeof(buf), "%lld B", bytes);
+  } else if (bytes < 1024LL * 1024LL) {
+    std::snprintf(buf, sizeof(buf), "%.1f KB", static_cast<double>(bytes) / 1024.0);
+  } else if (bytes < 1024LL * 1024LL * 1024LL) {
+    std::snprintf(buf, sizeof(buf), "%.1f MB",
+                  static_cast<double>(bytes) / (1024.0 * 1024.0));
+  } else {
+    std::snprintf(buf, sizeof(buf), "%.2f GB",
+                  static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+  }
+  return buf;
+}
+
+template <typename T>
+__cppsh_nu_cell __cppsh_format_cell(const T &v) {
+  using U = std::remove_cvref_t<T>;
+  if constexpr (std::is_same_v<U, bool>) {
+    return {v ? "true" : "false", v ? "\033[32m" : "\033[31m", false};
+  } else if constexpr (std::is_integral_v<U> || std::is_floating_point_v<U>) {
+    std::ostringstream oss;
+    oss << v;
+    return {oss.str(), "\033[36m", true};
+  } else if constexpr (requires { std::string_view(v); }) {
+    return {std::string(std::string_view(v)), "", false};
+  } else if constexpr (requires { std::cout << v; }) {
+    std::ostringstream oss;
+    oss << v;
+    return {oss.str(), "", false};
+  } else {
+    return {"<obj>", "\033[90m", false};
+  }
+}
+
+inline void __cppsh_render_nu_table(
+    const std::vector<std::string> &headers,
+    const std::vector<std::vector<__cppsh_nu_cell>> &rows) {
+  const char *Dim = "\033[90m";
+  const char *HeadCol = "\033[1;32m";
+  const char *Reset = "\033[0m";
+
+  if (rows.empty()) {
+    std::printf("%s╭───────────╮\n│ %sempty set%s │\n╰───────────╯%s\n",
+                Dim, "\033[33m", Dim, Reset);
+    return;
+  }
+
+  std::size_t ncols = headers.size();
+  std::vector<std::size_t> widths(ncols, 0);
+  for (std::size_t c = 0; c < ncols; ++c)
+    widths[c] = __cppsh_utf8_width(headers[c]);
+  for (const auto &row : rows)
+    for (std::size_t c = 0; c < ncols && c < row.size(); ++c)
+      widths[c] = std::max(widths[c], __cppsh_utf8_width(row[c].text));
+
+  auto draw_hline = [&](const char *left, const char *mid, const char *right) {
+    std::printf("%s%s", Dim, left);
+    for (std::size_t c = 0; c < ncols; ++c) {
+      for (std::size_t k = 0; k < widths[c] + 2; ++k)
+        std::printf("─");
+      std::printf("%s", (c + 1 < ncols) ? mid : right);
+    }
+    std::printf("%s\n", Reset);
+  };
+
+  draw_hline("╭", "┬", "╮");
+
+  // Header row
+  std::printf("%s│%s", Dim, Reset);
+  for (std::size_t c = 0; c < ncols; ++c) {
+    std::size_t w = __cppsh_utf8_width(headers[c]);
+    std::size_t pad = widths[c] > w ? (widths[c] - w) : 0;
+    std::printf(" ");
+    if (c == 0) {
+      for (std::size_t k = 0; k < pad; ++k)
+        std::putchar(' ');
+      std::printf("%s%s%s", HeadCol, headers[c].c_str(), Reset);
+    } else {
+      std::printf("%s%s%s", HeadCol, headers[c].c_str(), Reset);
+      for (std::size_t k = 0; k < pad; ++k)
+        std::putchar(' ');
+    }
+    std::printf(" %s│%s", Dim, Reset);
+  }
+  std::putchar('\n');
+
+  draw_hline("├", "┼", "┤");
+
+  // Data rows
+  for (const auto &row : rows) {
+    std::printf("%s│%s", Dim, Reset);
+    for (std::size_t c = 0; c < ncols; ++c) {
+      const __cppsh_nu_cell &cell = row[c];
+      std::size_t w = __cppsh_utf8_width(cell.text);
+      std::size_t pad = widths[c] > w ? (widths[c] - w) : 0;
+      std::printf(" ");
+      if (cell.right_align) {
+        for (std::size_t k = 0; k < pad; ++k)
+          std::putchar(' ');
+        if (!cell.color.empty())
+          std::printf("%s%s%s", cell.color.c_str(), cell.text.c_str(), Reset);
+        else
+          std::printf("%s", cell.text.c_str());
+      } else {
+        if (!cell.color.empty())
+          std::printf("%s%s%s", cell.color.c_str(), cell.text.c_str(), Reset);
+        else
+          std::printf("%s", cell.text.c_str());
+        for (std::size_t k = 0; k < pad; ++k)
+          std::putchar(' ');
+      }
+      std::printf(" %s│%s", Dim, Reset);
+    }
+    std::putchar('\n');
+  }
+
+  draw_hline("╰", "┴", "╯");
+}
+
 struct __cppsh_show_stage
     : std::ranges::__range_adaptor_closure<__cppsh_show_stage> {
   template <std::ranges::input_range Rng>
   void operator()(Rng &&rng) const {
-    for (auto &&item : rng) {
-      if constexpr (requires { item.dump(); })
-        item.dump();
-      else
-        std::print(item);
+    using ElemT = std::remove_cvref_t<std::ranges::range_value_t<Rng>>;
+    std::vector<std::string> headers;
+    std::vector<std::vector<__cppsh_nu_cell>> rows;
+
+    if constexpr (requires(const ElemT &e) {
+                    e.name;
+                    e.ext;
+                    e.size;
+                    e.is_dir;
+                  }) {
+      headers = {"#", "name", "type", "size"};
+      std::size_t idx = 0;
+      for (auto &&item : rng) {
+        std::vector<__cppsh_nu_cell> row;
+        row.push_back({std::to_string(idx++), "\033[32m", true});
+        row.push_back({item.name, item.is_dir ? "\033[1;34m" : "", false});
+        row.push_back({item.is_dir ? "dir" : "file",
+                       item.is_dir ? "\033[36m" : "\033[90m", false});
+        row.push_back({__cppsh_human_size(item.size), "\033[36m", true});
+        rows.push_back(std::move(row));
+      }
+      __cppsh_render_nu_table(headers, rows);
+    } else if constexpr (requires(const ElemT &e) {
+                           e.num;
+                           e.text;
+                           e.size;
+                         }) {
+      headers = {"#", "line", "size", "text"};
+      std::size_t idx = 0;
+      for (auto &&item : rng) {
+        std::vector<__cppsh_nu_cell> row;
+        row.push_back({std::to_string(idx++), "\033[32m", true});
+        row.push_back({std::to_string(item.num), "\033[36m", true});
+        row.push_back({__cppsh_human_size(item.size), "\033[36m", true});
+        row.push_back({item.text, "", false});
+        rows.push_back(std::move(row));
+      }
+      __cppsh_render_nu_table(headers, rows);
+    } else if constexpr (std::is_class_v<ElemT> &&
+                         !requires { std::string_view(std::declval<ElemT>()); } &&
+                         meta::members_of(^^ElemT).size() > 0) {
+      constexpr meta::info R = ^^ElemT;
+      constexpr unsigned int N = meta::members_of(R).size();
+      headers.push_back("#");
+      [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        (([&] {
+           constexpr meta::info m = meta::members_of(R)[Is];
+           if constexpr (meta::is_nonstatic_data_member(m))
+             headers.push_back(meta::identifier_of(m));
+         }()),
+         ...);
+      }(std::make_index_sequence<N>{});
+
+      std::size_t idx = 0;
+      for (auto &&item : rng) {
+        std::vector<__cppsh_nu_cell> row;
+        row.push_back({std::to_string(idx++), "\033[32m", true});
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+          (([&] {
+             constexpr meta::info m = meta::members_of(R)[Is];
+             if constexpr (meta::is_nonstatic_data_member(m)) {
+               constexpr meta::info field{m.id, 2};
+               row.push_back(__cppsh_format_cell(item.[:field:]));
+             }
+           }()),
+           ...);
+        }(std::make_index_sequence<N>{});
+        rows.push_back(std::move(row));
+      }
+      __cppsh_render_nu_table(headers, rows);
+    } else {
+      headers = {"#", "value"};
+      std::size_t idx = 0;
+      for (auto &&item : rng) {
+        std::vector<__cppsh_nu_cell> row;
+        row.push_back({std::to_string(idx++), "\033[32m", true});
+        row.push_back(__cppsh_format_cell(item));
+        rows.push_back(std::move(row));
+      }
+      __cppsh_render_nu_table(headers, rows);
     }
   }
 };

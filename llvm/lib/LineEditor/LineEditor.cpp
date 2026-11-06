@@ -14,7 +14,12 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
+#include <clocale>
 #include <cstdio>
+#if !defined(_WIN32)
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 #ifdef HAVE_LIBEDIT
 #include <histedit.h>
 constexpr int DefaultHistorySize = 800;
@@ -168,15 +173,71 @@ unsigned char ElCompletionFn(EditLine *EL, int ch) {
         // Move cursor to a blank line.
         OS << "\n";
 
-        // Emit the completions.
-        for (const std::string &Completion : Action.Completions)
-          OS << Completion << "\n";
+        auto visualWidth = [](StringRef S) -> size_t {
+          size_t W = 0;
+          for (size_t I = 0; I < S.size();) {
+            unsigned char C = static_cast<unsigned char>(S[I]);
+            if (C == '\001') {
+              ++I;
+              continue;
+            }
+            if (C == '\033' && I + 1 < S.size() && S[I + 1] == '[') {
+              I += 2;
+              while (I < S.size() &&
+                     (static_cast<unsigned char>(S[I]) < 0x40 ||
+                      static_cast<unsigned char>(S[I]) > 0x7E))
+                ++I;
+              if (I < S.size())
+                ++I;
+              continue;
+            }
+            if ((C & 0xC0) != 0x80)
+              ++W;
+            ++I;
+          }
+          return W;
+        };
+
+        size_t TermWidth = 80;
+#if !defined(_WIN32)
+        struct winsize WS;
+        if (::ioctl(fileno(Data->Out), TIOCGWINSZ, &WS) == 0 && WS.ws_col > 20)
+          TermWidth = WS.ws_col;
+#endif
+        size_t MaxW = 0;
+        std::vector<size_t> Widths;
+        Widths.reserve(Action.Completions.size());
+        for (const std::string &C : Action.Completions) {
+          size_t W = visualWidth(C);
+          Widths.push_back(W);
+          if (W > MaxW)
+            MaxW = W;
+        }
+        size_t ColWidth = MaxW + 3;
+        size_t NumCols = std::max<size_t>(1, TermWidth / std::max<size_t>(1, ColWidth));
+        size_t NumItems = Action.Completions.size();
+        size_t NumRows = (NumItems + NumCols - 1) / NumCols;
+
+        for (size_t R = 0; R < NumRows; ++R) {
+          for (size_t C = 0; C < NumCols; ++C) {
+            size_t Idx = R + C * NumRows;
+            if (Idx >= NumItems)
+              break;
+            OS << Action.Completions[Idx];
+            if (C + 1 < NumCols && Idx + NumRows < NumItems) {
+              size_t Pad = ColWidth > Widths[Idx] ? (ColWidth - Widths[Idx]) : 2;
+              OS.indent(Pad);
+            }
+          }
+          OS << "\n";
+        }
 
         // Fool libedit into thinking nothing has changed. Reprint its prompt
-        // and the user input. Note that the cursor will remain at the end of
-        // the line after this.
-        OS << Data->LE->getPrompt()
-           << StringRef(LI->buffer, LI->lastchar - LI->buffer);
+        // (stripping \001 markers) and the user input.
+        for (char Ch : Data->LE->getPrompt())
+          if (Ch != '\001')
+            OS << Ch;
+        OS << StringRef(LI->buffer, LI->lastchar - LI->buffer);
 
         // This is the number of characters we need to tell libedit to go back:
         // the distance between end of line and the original cursor position.
@@ -200,6 +261,9 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
 
   Data->LE = this;
   Data->Out = Out;
+
+  if (!std::setlocale(LC_ALL, ""))
+    std::setlocale(LC_ALL, "C.UTF-8");
 
   Data->Hist = ::history_init();
   assert(Data->Hist);
