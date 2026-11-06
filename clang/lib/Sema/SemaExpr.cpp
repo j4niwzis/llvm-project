@@ -17290,6 +17290,41 @@ static ExprResult BuildOverloadedBinOp(Sema &S, Scope *Sc, SourceLocation OpLoc,
 ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
                             BinaryOperatorKind Opc, Expr *LHSExpr,
                             Expr *RHSExpr, bool ForFoldExpression) {
+  // cppsh: `std::cin >> o.files_only` as the user typed it -- what is read
+  // asked for first, on a terminal (std::sh::__cppsh_ask), so that a staged
+  // function waiting for it does not look hung.
+  if (Opc == BO_Shr && LHSExpr && RHSExpr && getLangOpts().IncrementalExtensions &&
+      cppshInUserInput(*this, OpLoc))
+    if (auto *DRE = dyn_cast<DeclRefExpr>(LHSExpr->IgnoreParenImpCasts());
+        DRE && DRE->getDecl()->getIdentifier() &&
+        DRE->getDecl()->getName() == "cin" && DRE->getDecl()->isInStdNamespace())
+      if (NamespaceDecl *Std = getStdNamespace()) {
+        LookupResult ShR(*this, &PP.getIdentifierTable().get("sh"), OpLoc,
+                         LookupNamespaceName);
+        LookupQualifiedName(ShR, Std);
+        if (auto *Sh = ShR.getAsSingle<NamespaceDecl>()) {
+          LookupResult AskR(*this, &PP.getIdentifierTable().get("__cppsh_ask"), OpLoc,
+                            LookupOrdinaryName);
+          LookupQualifiedName(AskR, Sh);
+          StringRef What = Lexer::getSourceText(
+              CharSourceRange::getTokenRange(RHSExpr->getSourceRange()),
+              getSourceManager(), getLangOpts());
+          if (!AskR.empty() && !What.empty()) {
+            CXXScopeSpec SS;
+            ExprResult Ask = BuildDeclarationNameExpr(SS, AskR, /*NeedsADL=*/false);
+            Expr *Text = StringLiteral::Create(
+                Context, What, StringLiteralKind::Ordinary, /*Pascal=*/false,
+                Context.getStringLiteralArrayType(Context.CharTy, What.size()), OpLoc);
+            Expr *Args[2] = {LHSExpr, Text};
+            if (Ask.isUsable()) {
+              ExprResult Asked = BuildCallExpr(S, Ask.get(), OpLoc, Args, OpLoc);
+              if (Asked.isUsable())
+                LHSExpr = Asked.get();
+            }
+          }
+        }
+      }
+
   if (Opc == BO_Or && getLangOpts().CPlusPlus && LHSExpr) {
     Expr *CoreLHS = LHSExpr->IgnoreParenImpCasts();
     bool IsZeroArgFn = false;

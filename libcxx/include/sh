@@ -543,6 +543,18 @@ struct link_entry {
 };
 using fs_entry = std::variant<file_entry, dir_entry, link_entry>;
 
+// What `std::cin >> x` reads, asked for when the shell is on a terminal (the
+// compiler wraps the stream the user reads from in it): `x? `.
+inline std::istream &__cppsh_ask(std::istream &in, const char *what) {
+#if !defined(_WIN32)
+  if (&in == &std::cin && ::isatty(0)) {
+    std::fprintf(stderr, "\033[36m%s?\033[0m ", what);
+    std::fflush(stderr);
+  }
+#endif
+  return in;
+}
+
 struct ls_opts {
   bool all = false;
   bool recursive = false;

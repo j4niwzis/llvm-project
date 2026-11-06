@@ -1153,6 +1153,31 @@ static bool CppshNextCompoundIsBody = false;
 static SourceLocation CppshBodyOpen;
 static std::vector<unsigned> CppshOpenCuts;
 
+// Whether a block of code (as text) always returns: a `return` at its top
+// level, as a statement of its own -- after nothing, `;`, `{` or `}` (not the
+// body of an `if`, `else` or a loop). What follows such a block is dead, and
+// appended to it would only take part in the deduction of the type.
+static bool cppshAlwaysReturns(StringRef Code, const LangOptions &LO) {
+  Lexer L(SourceLocation(), LO, Code.begin(), Code.begin(), Code.end());
+  int Depth = 0;
+  tok::TokenKind Prev = tok::semi;
+  Token T;
+  while (!L.LexFromRawLexer(T) || T.isNot(tok::eof)) {
+    if (T.is(tok::eof))
+      break;
+    if (T.isOneOf(tok::l_brace, tok::l_paren, tok::l_square))
+      ++Depth;
+    else if (T.isOneOf(tok::r_brace, tok::r_paren, tok::r_square))
+      --Depth;
+    else if (Depth == 0 && T.is(tok::raw_identifier) &&
+             T.getRawIdentifier() == "return" &&
+             (Prev == tok::semi || Prev == tok::l_brace || Prev == tok::r_brace))
+      return true;
+    Prev = T.getKind();
+  }
+  return false;
+}
+
 // Whether a block parsed in this scope may be cut: in the body of a function
 // (not a lambda), outside any loop or switch, which a continuation could not
 // re-enter.
@@ -1433,7 +1458,8 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
               .str();
       for (size_t I = CppshOpenBefore; I < CppshOpenCuts.size(); ++I) {
         std::string &Inner = CppshCutRemainders[CppshOpenCuts[I]];
-        Inner = "{ " + Inner + " } " + Rest;
+        if (!cppshAlwaysReturns(Inner, getLangOpts()))
+          Inner = "{ " + Inner + " } " + Rest;
       }
       unsigned Id = CppshEmitCut(Rest, After, FD);
       if (CppshBody)
