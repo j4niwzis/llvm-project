@@ -125,10 +125,16 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
   };
   // A word that starts with what a path or a pattern starts with, glued to
   // what follows: `/tmp`, `./a.out`, `~/src`, `*.cpp`.
+  // Or that is one of them on its own: `.`, `/`, `~`, `*` (`ls .`, `cd ~`).
   auto isPathStart = [&]() -> bool {
-    return Tok.isOneOf(tok::slash, tok::period, tok::tilde, tok::star, tok::unknown) &&
-           Tok.hasLeadingSpace() && !NextToken().hasLeadingSpace() &&
-           !NextToken().isOneOf(tok::eof, tok::semi, tok::pipe);
+    if (!Tok.isOneOf(tok::slash, tok::period, tok::tilde, tok::star, tok::unknown) ||
+        !Tok.hasLeadingSpace())
+      return false;
+    const Token &Next = NextToken();
+    bool Alone = Next.hasLeadingSpace() || Next.isAtStartOfLine() ||
+                 Next.isOneOf(tok::eof, tok::semi, tok::pipe, tok::pipepipe,
+                              tok::ampamp, tok::r_paren);
+    return Alone || !Next.isOneOf(tok::eof, tok::semi, tok::pipe);
   };
   auto canStartArg = [&]() -> bool {
     if (Tok.is(tok::l_brace))
@@ -173,7 +179,10 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
       Shell = Shell || shellOnly(GetLookAheadToken(Glued + 1));
       ++Glued;
     }
-    if (!Glued || !Shell)
+    // A word of one token is one only where it is a path's mark alone
+    // (`.`, `/`, `~`, `*`); a name or a number of its own stays C++.
+    if (!Shell || (!Glued && !Tok.isOneOf(tok::period, tok::slash, tok::tilde,
+                                          tok::star, tok::unknown)))
       return ExprEmpty();
     if (Tok.is(tok::identifier)) {
       LookupResult Known(Actions, Tok.getIdentifierInfo(), Tok.getLocation(),
