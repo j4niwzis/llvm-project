@@ -574,7 +574,8 @@ llvm::Expected<Expr *> Interpreter::convertExprToValue(Expr *E) {
       // A command or a pipeline (`git status`): run as the statement ends --
       // its output is the terminal's -- not printed as a value, nor shown
       // as a table of its lines.
-      if ((RName == "command" || RName == "pipeline") && RD->getDeclContext()->isNamespace()) {
+      if ((RName == "basic_command" || RName == "basic_pipeline") &&
+          RD->getDeclContext()->isNamespace()) {
         ExprResult Discarded = S.BuildCStyleCastExpr(
             E->getBeginLoc(), Ctx.getTrivialTypeSourceInfo(Ctx.VoidTy), E->getEndLoc(), E);
         if (Discarded.isUsable())

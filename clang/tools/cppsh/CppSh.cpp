@@ -1373,12 +1373,6 @@ int main(int argc, const char **argv) {
       HasStdFlag = true;
   if (!HasStdFlag)
     ClangArgv.push_back("-std=gnu++23");
-  // Every destructor and constructor variant emitted as a function of its
-  // own: with aliases (the default off Darwin), a complete-object destructor
-  // (D1) is the base one (D2) under another name, replaced within the module
-  // that emitted them -- a later statement referencing D1 found nothing in
-  // the JIT (std::sh::command's, as `git pull;` ended).
-  ClangArgv.push_back("-mno-constructor-aliases");
   ClangArgv.push_back("-Wno-unused-result");
   ClangArgv.push_back("-Wno-unused-value");
 
