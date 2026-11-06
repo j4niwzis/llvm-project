@@ -67,6 +67,7 @@ set(LIBCXX_MODULE_STD_SOURCES
   std/mdspan.inc
   std/memory.inc
   std/memory_resource.inc
+  std/meta.inc
   std/mutex.inc
   std/new.inc
   std/numbers.inc
@@ -83,6 +84,7 @@ set(LIBCXX_MODULE_STD_SOURCES
   std/scoped_allocator.inc
   std/semaphore.inc
   std/set.inc
+  std/sh.inc
   std/shared_mutex.inc
   std/source_location.inc
   std/span.inc
@@ -185,10 +187,17 @@ configure_file(
   @ONLY
 )
 
+configure_file(
+  "std.sh.cppm.in"
+  "${LIBCXX_GENERATED_MODULE_DIR}/std.sh.cppm"
+  @ONLY
+)
+
 set(_all_modules)
 list(APPEND _all_modules "${LIBCXX_GENERATED_MODULE_DIR}/CMakeLists.txt")
 list(APPEND _all_modules "${LIBCXX_GENERATED_MODULE_DIR}/std.cppm")
 list(APPEND _all_modules "${LIBCXX_GENERATED_MODULE_DIR}/std.compat.cppm")
+list(APPEND _all_modules "${LIBCXX_GENERATED_MODULE_DIR}/std.sh.cppm")
 foreach(file ${LIBCXX_MODULE_STD_SOURCES} ${LIBCXX_MODULE_STD_COMPAT_SOURCES})
   set(src "${CMAKE_CURRENT_SOURCE_DIR}/${file}")
   set(dst "${LIBCXX_GENERATED_MODULE_DIR}/${file}")
@@ -245,6 +254,7 @@ if (LIBCXX_INSTALL_MODULES)
   install(FILES
       "${LIBCXX_GENERATED_MODULE_DIR}/std.cppm"
       "${LIBCXX_GENERATED_MODULE_DIR}/std.compat.cppm"
+      "${LIBCXX_GENERATED_MODULE_DIR}/std.sh.cppm"
     DESTINATION "${LIBCXX_INSTALL_MODULES_DIR}"
     COMPONENT cxx-modules
     PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ

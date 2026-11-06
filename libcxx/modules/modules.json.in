@@ -21,6 +21,16 @@
           "@LIBCXX_MODULE_RELATIVE_PATH@"
         ]
       }
+    },
+    {
+      "logical-name": "std.sh",
+      "source-path": "@LIBCXX_MODULE_RELATIVE_PATH@/std.sh.cppm",
+      "is-std-library": true,
+      "local-arguments": {
+        "system-include-directories": [
+          "@LIBCXX_MODULE_RELATIVE_PATH@"
+        ]
+      }
     }
   ]
 }

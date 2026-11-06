@@ -243,32 +243,43 @@ CreateCI(const llvm::opt::ArgStringList &Argv) {
         return false;
       llvm::SmallString<256> Cur(StartPath);
       llvm::sys::fs::make_absolute(Cur);
-      for (int Depth = 0; Depth < 8 && !Cur.empty(); ++Depth) {
-        llvm::SmallString<256> ShDir(Cur);
-        llvm::sys::path::append(ShDir, "libcxx", "include", "__sh");
-        if (llvm::sys::fs::is_directory(ShDir)) {
+      llvm::sys::path::remove_dots(Cur, /*remove_dot_dot=*/true);
+      bool Added = false;
+      for (int Depth = 0; Depth < 10 && !Cur.empty(); ++Depth) {
+        llvm::SmallString<256> BuildCxxDir(Cur);
+        llvm::sys::path::append(BuildCxxDir, "include", "c++", "v1");
+        llvm::SmallString<256> BuildMeta(BuildCxxDir);
+        llvm::sys::path::append(BuildMeta, "meta");
+        if (llvm::sys::fs::exists(BuildMeta)) {
           Clang->getHeaderSearchOpts().AddPath(
-              ShDir, frontend::ExternCSystem, /*IsFramework=*/false,
+              BuildCxxDir, frontend::ExternCSystem, /*IsFramework=*/false,
               /*IgnoreSysRoot=*/true);
-          llvm::SmallString<256> ModDir(Cur);
-          llvm::sys::path::append(ModDir, "libcxx", "modules");
-          if (llvm::sys::fs::is_directory(ModDir))
-            Clang->getHeaderSearchOpts().AddPath(
-                ModDir, frontend::ExternCSystem, /*IsFramework=*/false,
-                /*IgnoreSysRoot=*/true);
-          return true;
+          Added = true;
         }
-        llvm::StringRef Parent = llvm::sys::path::parent_path(Cur);
-        if (Parent == Cur || Parent.empty())
+        llvm::SmallString<256> SrcCxxDir(Cur);
+        llvm::sys::path::append(SrcCxxDir, "libcxx", "include");
+        llvm::SmallString<256> SrcMeta(SrcCxxDir);
+        llvm::sys::path::append(SrcMeta, "meta");
+        if (llvm::sys::fs::exists(SrcMeta)) {
+          Clang->getHeaderSearchOpts().AddPath(
+              SrcCxxDir, frontend::ExternCSystem, /*IsFramework=*/false,
+              /*IgnoreSysRoot=*/true);
+          Added = true;
+        }
+        if (Added)
+          return true;
+        if (!llvm::sys::path::has_parent_path(Cur))
           break;
-        Cur = Parent;
+        llvm::sys::path::remove_filename(Cur);
       }
       return false;
     };
-    if (!tryAddLibcxxDirsFrom(Clang->getHeaderSearchOpts().ResourceDir))
-      if (Argv.empty() || !tryAddLibcxxDirsFrom(Argv[0]))
-        if (!tryAddLibcxxDirsFrom("."))
-          tryAddLibcxxDirsFrom(__FILE__);
+    std::string MainExe = llvm::sys::fs::getMainExecutable(nullptr, nullptr);
+    if (!tryAddLibcxxDirsFrom(MainExe))
+      if (!tryAddLibcxxDirsFrom(Clang->getHeaderSearchOpts().ResourceDir))
+        if (Argv.empty() || !tryAddLibcxxDirsFrom(Argv[0]))
+          if (!tryAddLibcxxDirsFrom("."))
+            tryAddLibcxxDirsFrom(__FILE__);
   }
 
   Clang->createVirtualFileSystem();
@@ -472,8 +483,13 @@ IncrementalCompilerBuilder::CreateCpp() {
   std::string TT = TargetTriple ? *TargetTriple : llvm::sys::getProcessTriple();
 
   std::vector<const char *> Argv;
-  Argv.reserve(5 + 1 + UserArgs.size());
+  Argv.reserve(5 + 2 + UserArgs.size());
   Argv.push_back("-xc++");
+  bool HasStd = llvm::any_of(UserArgs, [](const char *A) {
+    return llvm::StringRef(A).starts_with("-std=");
+  });
+  if (!HasStd)
+    Argv.push_back("-std=gnu++23");
 #ifdef __EMSCRIPTEN__
   Argv.push_back("-target");
   Argv.push_back(TT.c_str());
@@ -769,61 +785,8 @@ size_t Interpreter::getEffectivePTUSize() const {
   return PTUs.size() - InitPTUSize;
 }
 
-static const char *const CppShStdModulePrelude = "#include <meta>\n#include <sh>\n";
-
-static const char *const CppShStdShModulePrelude = "#include <std.sh.cppm>\n";
-
-static std::string expandCppshStdImports(llvm::StringRef Code) {
-  if (!Code.contains("import"))
-    return Code.str();
-  std::string Out;
-  llvm::SmallVector<llvm::StringRef, 16> Lines;
-  Code.split(Lines, '\n');
-  for (size_t I = 0; I < Lines.size(); ++I) {
-    llvm::StringRef L = Lines[I];
-    llvm::StringRef Trimmed = L.trim();
-    if (Trimmed.starts_with("import ") || Trimmed.starts_with("import\t")) {
-      llvm::StringRef Rest = Trimmed.drop_front(6).ltrim();
-      if (Rest == "std;" || Rest == "std" || Rest.starts_with("std;")) {
-        Out += CppShStdModulePrelude;
-        Out += "\n";
-        if (Rest.starts_with("std;"))
-          Out += Rest.drop_front(4).str();
-        Out += "\n";
-        continue;
-      }
-      if (Rest == "std.sh;" || Rest == "std.sh" ||
-          Rest.starts_with("std.sh;")) {
-        Out += CppShStdModulePrelude;
-        Out += "\n";
-        Out += CppShStdShModulePrelude;
-        Out += "\n";
-        if (Rest.starts_with("std.sh;"))
-          Out += Rest.drop_front(7).str();
-        Out += "\n";
-        continue;
-      }
-      if (Rest == "std.compat;" || Rest == "std.compat" ||
-          Rest.starts_with("std.compat;")) {
-        Out += CppShStdModulePrelude;
-        Out += "\nusing namespace std;\n";
-        if (Rest.starts_with("std.compat;"))
-          Out += Rest.drop_front(11).str();
-        Out += "\n";
-        continue;
-      }
-    }
-    Out += L.str();
-    if (I + 1 < Lines.size())
-      Out += "\n";
-  }
-  return Out;
-}
-
 llvm::Expected<PartialTranslationUnit &>
 Interpreter::Parse(llvm::StringRef Code) {
-  std::string ExpandedCode = expandCppshStdImports(Code);
-  Code = ExpandedCode;
   // If we have a device parser, parse it first. The generated code will be
   // included in the host compilation
   if (DeviceParser) {

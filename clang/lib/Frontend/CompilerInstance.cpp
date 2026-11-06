@@ -1954,6 +1954,26 @@ ModuleLoadResult CompilerInstance::findOrCompileModuleAndReadAST(
       selectModuleSource(M, ModuleName, ModuleFilename, BuiltModules, HS);
   SourceLocation ModuleNameLoc = ModuleNameRange.getBegin();
   if (Source == MS_ModuleNotFound) {
+    if (ModuleName == "std") {
+      createModuleFromSource(
+          ImportLoc, "std",
+          "module \"std\" [system] { export * }\n"
+          "#pragma clang module contents\n"
+          "#include <meta>\n"
+          "#include <sh>\n");
+      Source =
+          selectModuleSource(M, ModuleName, ModuleFilename, BuiltModules, HS);
+    } else if (ModuleName == "std.sh") {
+      createModuleFromSource(
+          ImportLoc, "std.sh",
+          "module \"std.sh\" [system] { export * }\n"
+          "#pragma clang module contents\n"
+          "#include <__sh/sh_using.h>\n");
+      Source =
+          selectModuleSource(M, ModuleName, ModuleFilename, BuiltModules, HS);
+    }
+  }
+  if (Source == MS_ModuleNotFound) {
     // We can't find a module, error out here.
     getDiagnostics().Report(ModuleNameLoc, diag::err_module_not_found)
         << ModuleName << ModuleNameRange;
@@ -2330,10 +2350,11 @@ void CompilerInstance::createModuleFromSource(SourceLocation ImportLoc,
   }
   std::string ModuleMapFileName = (CleanModuleName + ".map").str();
 
+  bool IsPreprocessed = !Source.contains("#pragma clang module contents");
   FrontendInputFile Input(
       ModuleMapFileName,
       InputKind(getLanguageFromOptions(Invocation->getLangOpts()),
-                InputKind::ModuleMap, /*Preprocessed*/true));
+                InputKind::ModuleMap, /*Preprocessed*/IsPreprocessed));
 
   std::string NullTerminatedSource(Source.str());
 

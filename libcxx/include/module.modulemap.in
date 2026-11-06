@@ -2313,6 +2313,17 @@ module std {
     export *
   }
 
+  module meta {
+    header "meta"
+    export *
+  }
+
+  module sh {
+    module sh_using { header "__sh/sh_using.h" export * }
+    header "sh"
+    export *
+  }
+
   module vector {
     module fwd                   { header "__fwd/vector.h" }
 

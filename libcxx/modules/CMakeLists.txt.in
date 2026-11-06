@@ -94,3 +94,35 @@ set_target_properties(std.compat
 )
 add_dependencies(std.compat std)
 target_link_libraries(std.compat PUBLIC std c++)
+
+### STD.SH
+
+add_library(std.sh)
+target_sources(std.sh
+  PUBLIC FILE_SET cxx_modules TYPE CXX_MODULES FILES
+    std.sh.cppm
+)
+
+target_include_directories(std.sh SYSTEM PUBLIC @LIBCXX_CONFIGURED_INCLUDE_DIRS@)
+
+if (NOT @LIBCXX_ENABLE_EXCEPTIONS@)
+  target_compile_options(std.sh PUBLIC -fno-exceptions)
+endif()
+
+target_compile_options(std.sh
+  PUBLIC
+    -nostdinc++
+    @LIBCXX_COMPILE_FLAGS@
+)
+target_compile_options(std.sh
+ PRIVATE
+    -Wno-reserved-module-identifier
+    -Wno-reserved-user-defined-literal
+)
+set_target_properties(std.sh
+  PROPERTIES
+    OUTPUT_NAME   "c++std.sh"
+)
+add_dependencies(std.sh std)
+target_link_libraries(std.sh PUBLIC std c++)
+
