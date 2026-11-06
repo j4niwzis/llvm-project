@@ -50,7 +50,10 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <poll.h>
 #include <pwd.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -239,20 +242,21 @@ static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Cod
   return llvm::Error::success();
 }
 
-// The type of the expression being typed, for the line editor's hint: the
-// statement up to the cursor parsed -- not run -- as `using __cppsh_hint_t =
-// decltype(<it>);`, its diagnostics muted, and undone. The type is Sema's
+// The type of the expression being typed, for the line editor's hint: Sema's
 // own, the value specialization's included (`ls {.files_only = true}`:
 // ls_view<file_entry>). Nothing where it does not parse yet, where a
 // statement was just ended, or for the shell's own commands.
 //
-// Unevaluated, so that the parse leaves nothing a later statement needs: what
-// it instantiates -- a function whose return type it deduced, the friends a
-// class template's instantiation defines -- is not odr-used, so nothing of it
-// is emitted into the module the undo drops; a later statement that uses it
-// has it emitted then, into its own. (A variable initialized with the
-// expression emitted it there, and those definitions were gone with the
-// module, while Sema took them as emitted.)
+// Worked out in a fork of the shell, never in the session itself: parsing
+// changes Sema beyond what an undo takes back -- a class template
+// instantiated, the friends it defines (`define<tag, 42>()` typed, then
+// erased, left adl_function(declare<tag>{}) defined), the value
+// specialization's functions. The child, a copy of the whole session, parses
+// `using __cppsh_hint_t = decltype(<it>);`, writes the type to a pipe and
+// ends; the session is as it was. A child slower than kHintMillis is ended,
+// and no hint shown.
+static constexpr int kHintMillis = 150;
+
 static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
                             size_t Pos) {
   std::vector<std::string> Stmts = splitStatements(Buffer.substr(0, Pos));
@@ -263,45 +267,88 @@ static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
       Expr == "clear" || Expr == "cd" || Expr.starts_with("cd ") ||
       Expr.starts_with("%") || Expr.starts_with("#"))
     return {};
-  // The same text, the same hint: a cursor moved re-parses nothing.
+  // The same text, the same hint: a cursor moved forks nothing.
   static std::string LastText, LastHint;
   if (Expr == LastText)
     return LastHint;
-
-  clang::DiagnosticsEngine &Diags = Interp.getCompilerInstance()->getDiagnostics();
-  clang::DiagnosticConsumer *Client = Diags.getClient();
-  bool Owns = Diags.ownsClient();
-  std::unique_ptr<clang::DiagnosticConsumer> Owned;
-  if (Owns)
-    Owned = Diags.takeClient();
-  clang::IgnoringDiagConsumer Ignore;
-  Diags.setClient(&Ignore, /*ShouldOwnClient=*/false);
-
-  std::string Hint;
-  std::string Code = "using __cppsh_hint_t = decltype(" + Expr.str() + ");";
-  if (llvm::Expected<clang::PartialTranslationUnit &> PTU = Interp.Parse(Code)) {
-    for (clang::Decl *D : PTU->TUPart->decls())
-      if (auto *Alias = llvm::dyn_cast<clang::TypeAliasDecl>(D))
-        if (Alias->getIdentifier() && Alias->getName() == "__cppsh_hint_t") {
-          clang::PrintingPolicy PP(Alias->getASTContext().getLangOpts());
-          PP.SuppressScope = true;
-          Hint = Alias->getUnderlyingType().getAsString(PP);
-          if (Hint.size() > 60)
-            Hint = Hint.substr(0, 57) + "...";
-        }
-    if (llvm::Error Err = Interp.Undo())
-      llvm::consumeError(std::move(Err));
-  } else {
-    llvm::consumeError(PTU.takeError());
-  }
-
-  if (Owns)
-    Diags.setClient(Owned.release(), /*ShouldOwnClient=*/true);
-  else
-    Diags.setClient(Client, /*ShouldOwnClient=*/false);
   LastText = Expr.str();
+  LastHint.clear();
+#if defined(_WIN32)
+  (void)Interp;
+  return {};
+#else
+  int Fds[2];
+  if (::pipe(Fds) != 0)
+    return {};
+  pid_t Child = ::fork();
+  if (Child < 0) {
+    ::close(Fds[0]);
+    ::close(Fds[1]);
+    return {};
+  }
+  if (Child == 0) {
+    // The copy: its diagnostics nowhere, its result down the pipe, its end
+    // without running anything the session's exit would (_exit).
+    ::close(Fds[0]);
+    clang::DiagnosticsEngine &Diags = Interp.getCompilerInstance()->getDiagnostics();
+    Diags.setClient(new clang::IgnoringDiagConsumer(), /*ShouldOwnClient=*/true);
+    std::string Hint;
+    std::string Code = "using __cppsh_hint_t = decltype(" + Expr.str() + ");";
+    if (llvm::Expected<clang::PartialTranslationUnit &> PTU = Interp.Parse(Code)) {
+      for (clang::Decl *D : PTU->TUPart->decls())
+        if (auto *Alias = llvm::dyn_cast<clang::TypeAliasDecl>(D))
+          if (Alias->getIdentifier() && Alias->getName() == "__cppsh_hint_t") {
+            clang::PrintingPolicy PP(Alias->getASTContext().getLangOpts());
+            PP.SuppressScope = true;
+            Hint = Alias->getUnderlyingType().getAsString(PP);
+          }
+    } else {
+      llvm::consumeError(PTU.takeError());
+    }
+    size_t Off = 0;
+    while (Off < Hint.size()) {
+      ssize_t N = ::write(Fds[1], Hint.data() + Off, Hint.size() - Off);
+      if (N <= 0)
+        break;
+      Off += static_cast<size_t>(N);
+    }
+    ::_exit(0);
+  }
+  ::close(Fds[1]);
+  std::string Hint;
+  bool TimedOut = false;
+  for (;;) {
+    struct pollfd P = {Fds[0], POLLIN, 0};
+    int Ready = ::poll(&P, 1, kHintMillis);
+    if (Ready == 0) {
+      TimedOut = true;
+      break;
+    }
+    if (Ready < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+    char Buf[512];
+    ssize_t N = ::read(Fds[0], Buf, sizeof Buf);
+    if (N < 0 && errno == EINTR)
+      continue;
+    if (N <= 0)
+      break;
+    Hint.append(Buf, static_cast<size_t>(N));
+  }
+  ::close(Fds[0]);
+  if (TimedOut) {
+    ::kill(Child, SIGKILL);
+    Hint.clear();
+  }
+  while (::waitpid(Child, nullptr, 0) < 0 && errno == EINTR) {
+  }
+  if (Hint.size() > 60)
+    Hint = Hint.substr(0, 57) + "...";
   LastHint = Hint;
   return Hint;
+#endif
 }
 
 static llvm::Error runFileOrCode(clang::Interpreter &Interp,
