@@ -96,46 +96,80 @@ static llvm::cl::opt<bool> CppShEnabled(
     llvm::cl::init(false));
 
 static const char *const CppShRuntimePrelude = R"CPPSH(
-#include <iostream>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <filesystem>
-#include <algorithm>
-#include <cstdlib>
-#include <cstdint>
-#include <utility>
-#include <type_traits>
+extern "C" int printf(const char *, ...);
+extern "C" int snprintf(char *, unsigned long, const char *, ...);
+extern "C" int system(const char *);
+extern "C" unsigned long strlen(const char *);
+extern "C" int strcmp(const char *, const char *);
+extern "C" void *malloc(unsigned long);
+extern "C" void *realloc(void *, unsigned long);
+extern "C" void free(void *);
+extern "C" void *memcpy(void *, const void *, unsigned long);
+
+struct cppsh_str {
+  char buf[256];
+  unsigned long len = 0;
+  constexpr cppsh_str() : buf{0}, len(0) {}
+  cppsh_str(const char *s) {
+    len = s ? strlen(s) : 0;
+    if (len > 255) len = 255;
+    if (len) memcpy(buf, s, len);
+    buf[len] = '\0';
+  }
+  constexpr const char *c_str() const noexcept { return buf; }
+  constexpr unsigned long size() const noexcept { return len; }
+  friend bool operator==(const cppsh_str &a, const cppsh_str &b) {
+    return strcmp(a.buf, b.buf) == 0;
+  }
+  friend bool operator==(const cppsh_str &a, const char *b) {
+    return strcmp(a.buf, b ? b : "") == 0;
+  }
+  friend bool operator!=(const cppsh_str &a, const char *b) {
+    return strcmp(a.buf, b ? b : "") != 0;
+  }
+  friend bool operator<(const cppsh_str &a, const cppsh_str &b) {
+    return strcmp(a.buf, b.buf) < 0;
+  }
+  friend bool operator>(const cppsh_str &a, const cppsh_str &b) {
+    return strcmp(a.buf, b.buf) > 0;
+  }
+};
 
 template <char... Cs>
 struct sym {
   static constexpr const char value[sizeof...(Cs) + 1] = {Cs..., '\0'};
-  constexpr operator std::string_view() const noexcept {
-    return {value, sizeof...(Cs)};
-  }
-  operator std::string() const { return std::string(value, sizeof...(Cs)); }
+  constexpr operator const char *() const noexcept { return value; }
+  operator cppsh_str() const { return cppsh_str(value); }
   constexpr const char *c_str() const noexcept { return value; }
+  constexpr unsigned long size() const noexcept { return sizeof...(Cs); }
   template <char... NextCs>
   constexpr auto operator_unresolved() const noexcept {
     return sym<Cs..., '.', NextCs...>{};
   }
   template <typename... Args>
   int operator()(Args &&...args) const {
-    std::string cmd(value, sizeof...(Cs));
+    char cmd[2048];
+    unsigned long pos = 0;
+    auto appendStr = [&](const char *s) {
+      while (s && *s && pos + 1 < sizeof(cmd))
+        cmd[pos++] = *s++;
+      cmd[pos] = '\0';
+    };
+    appendStr(value);
     auto appendOne = [&](const auto &a) {
-      cmd += ' ';
-      using T = std::decay_t<decltype(a)>;
-      if constexpr (std::is_convertible_v<T, std::string_view>) {
-        cmd += std::string_view(a);
-      } else if constexpr (std::is_arithmetic_v<T>) {
-        cmd += std::to_string(a);
+      appendStr(" ");
+      if constexpr (requires { static_cast<const char *>(a); }) {
+        appendStr(static_cast<const char *>(a));
+      } else if constexpr (requires { a.c_str(); }) {
+        appendStr(a.c_str());
+      } else {
+        char num[64];
+        snprintf(num, sizeof(num), "%lld", (long long)a);
+        appendStr(num);
       }
     };
     (appendOne(args), ...);
-    return std::system(cmd.c_str());
-  }
-  friend std::ostream &operator<<(std::ostream &os, sym) {
-    return os << std::string_view(value, sizeof...(Cs));
+    return system(cmd);
   }
 };
 
@@ -144,13 +178,13 @@ constexpr auto operator_unresolved() noexcept {
   return sym<Cs...>{};
 }
 
-constexpr std::uintmax_t operator""_KB(unsigned long long v) noexcept {
+constexpr unsigned long long operator""_KB(unsigned long long v) noexcept {
   return v * 1024ULL;
 }
-constexpr std::uintmax_t operator""_MB(unsigned long long v) noexcept {
+constexpr unsigned long long operator""_MB(unsigned long long v) noexcept {
   return v * 1024ULL * 1024ULL;
 }
-constexpr std::uintmax_t operator""_GB(unsigned long long v) noexcept {
+constexpr unsigned long long operator""_GB(unsigned long long v) noexcept {
   return v * 1024ULL * 1024ULL * 1024ULL;
 }
 
@@ -159,21 +193,21 @@ struct cppsh_proj {
   F fn;
   template <typename T>
   constexpr decltype(auto) operator()(T &&x) const {
-    return fn(std::forward<T>(x));
+    return fn(static_cast<T &&>(x));
   }
   template <char... Cs>
   constexpr auto operator_unresolved() const {
     auto next = [prev = fn](auto &&x) -> decltype(auto) {
-      auto &&obj = prev(std::forward<decltype(x)>(x));
+      auto &&obj = prev(static_cast<decltype(x) &&>(x));
       return obj.template __cppsh_member<Cs...>;
     };
     return cppsh_proj<decltype(next)>{next};
   }
 #define CPPSH_BINOP(OP)                                                        \
   template <typename R>                                                        \
-  constexpr auto operator OP(R &&rhs) const {                                  \
-    auto p = [f = fn, r = std::forward<R>(rhs)](auto &&x) {                    \
-      return f(std::forward<decltype(x)>(x)) OP r;                             \
+  constexpr auto operator OP(R rhs) const {                                    \
+    auto p = [f = fn, r = rhs](auto &&x) {                                     \
+      return f(static_cast<decltype(x) &&>(x)) OP r;                           \
     };                                                                         \
     return cppsh_proj<decltype(p)>{p};                                         \
   }
@@ -196,19 +230,56 @@ struct cppsh_proj {
 struct cppsh_placeholder_root {
   template <typename T>
   constexpr T &&operator()(T &&x) const noexcept {
-    return std::forward<T>(x);
+    return static_cast<T &&>(x);
   }
 };
 inline constexpr cppsh_proj<cppsh_placeholder_root> _{cppsh_placeholder_root{}};
 
+template <typename T>
+struct cppsh_vec {
+  T *data_ = nullptr;
+  unsigned long size_ = 0;
+  unsigned long cap_ = 0;
+  cppsh_vec() = default;
+  cppsh_vec(const cppsh_vec &o) {
+    for (unsigned long i = 0; i < o.size_; ++i)
+      push_back(o.data_[i]);
+  }
+  cppsh_vec &operator=(const cppsh_vec &o) {
+    if (this != &o) {
+      free(data_);
+      data_ = nullptr;
+      size_ = cap_ = 0;
+      for (unsigned long i = 0; i < o.size_; ++i)
+        push_back(o.data_[i]);
+    }
+    return *this;
+  }
+  ~cppsh_vec() { free(data_); }
+  void push_back(const T &v) {
+    if (size_ == cap_) {
+      cap_ = cap_ ? cap_ * 2 : 16;
+      data_ = static_cast<T *>(realloc(data_, cap_ * sizeof(T)));
+    }
+    data_[size_++] = v;
+  }
+  T *begin() { return data_; }
+  T *end() { return data_ + size_; }
+  const T *begin() const { return data_; }
+  const T *end() const { return data_ + size_; }
+  unsigned long size() const { return size_; }
+  T &operator[](unsigned long i) { return data_[i]; }
+  const T &operator[](unsigned long i) const { return data_[i]; }
+};
+
 struct file_entry {
-  std::string name;
-  std::string ext;
-  std::uintmax_t size = 0;
+  cppsh_str name;
+  cppsh_str ext;
+  long long size = 0;
   bool is_dir = false;
-  friend std::ostream &operator<<(std::ostream &os, const file_entry &e) {
-    return os << (e.is_dir ? "[dir]  " : "[file] ") << e.name << " (" << e.size
-              << " B)";
+  void dump() const {
+    printf("%s %-28s %10lld B\n", is_dir ? "[dir] " : "[file]", name.c_str(),
+           size);
   }
 };
 
@@ -219,35 +290,54 @@ struct ls_opts {
   bool files_only = false;
 };
 
-inline std::vector<file_entry> ls(std::string_view dir = ".",
-                                  ls_opts opts = {}) {
-  namespace fs = std::filesystem;
-  std::vector<file_entry> out;
-  std::error_code ec;
-  auto pushEntry = [&](const fs::directory_entry &de) {
-    std::string fname = de.path().filename().string();
-    if (!opts.all && !fname.empty() && fname[0] == '.')
-      return;
-    bool isDir = de.is_directory(ec);
-    if (opts.dirs_only && !isDir)
-      return;
-    if (opts.files_only && isDir)
-      return;
-    std::uintmax_t sz = isDir ? 0 : de.file_size(ec);
-    if (ec) {
-      sz = 0;
-      ec.clear();
+extern "C" {
+struct __cppsh_dirent {
+  unsigned long d_ino;
+  long d_off;
+  unsigned short d_reclen;
+  unsigned char d_type;
+  char d_name[256];
+};
+void *opendir(const char *);
+__cppsh_dirent *readdir(void *);
+int closedir(void *);
+int __xstat(int, const char *, void *);
+int stat(const char *, void *);
+}
+
+inline cppsh_vec<file_entry> ls(const char *dir = ".", ls_opts opts = {}) {
+  cppsh_vec<file_entry> out;
+  void *d = opendir(dir);
+  if (!d)
+    return out;
+  while (__cppsh_dirent *de = readdir(d)) {
+    const char *fname = de->d_name;
+    if (strcmp(fname, ".") == 0 || strcmp(fname, "..") == 0)
+      continue;
+    if (!opts.all && fname[0] == '.')
+      continue;
+    bool isDir = (de->d_type == 4);
+    char fullpath[1024];
+    snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, fname);
+    alignas(8) unsigned char stbuf[256] = {0};
+    long long fsize = 0;
+    if (stat(fullpath, stbuf) == 0) {
+      unsigned int mode = *reinterpret_cast<unsigned int *>(stbuf + 24);
+      isDir = ((mode & 0170000) == 0040000);
+      if (!isDir)
+        fsize = *reinterpret_cast<long long *>(stbuf + 48);
     }
-    out.push_back(
-        {std::move(fname), de.path().extension().string(), sz, isDir});
-  };
-  if (opts.recursive) {
-    for (const auto &de : fs::recursive_directory_iterator(dir, ec))
-      pushEntry(de);
-  } else {
-    for (const auto &de : fs::directory_iterator(dir, ec))
-      pushEntry(de);
+    if (opts.dirs_only && !isDir)
+      continue;
+    if (opts.files_only && isDir)
+      continue;
+    const char *dot = nullptr;
+    for (const char *p = fname; *p; ++p)
+      if (*p == '.')
+        dot = p;
+    out.push_back({cppsh_str(fname), cppsh_str(dot ? dot : ""), fsize, isDir});
   }
+  closedir(d);
   return out;
 }
 
@@ -255,8 +345,8 @@ template <typename Pred>
 struct cppsh_filter_stage {
   Pred pred;
   template <typename Rng>
-  friend auto operator|(Rng &&rng, const cppsh_filter_stage &s) {
-    std::decay_t<Rng> out;
+  friend auto operator|(Rng rng, const cppsh_filter_stage &s) {
+    Rng out;
     for (auto &&item : rng)
       if (s.pred(item))
         out.push_back(item);
@@ -265,7 +355,7 @@ struct cppsh_filter_stage {
 };
 template <typename Pred>
 constexpr auto filter(Pred p) {
-  return cppsh_filter_stage<Pred>{std::move(p)};
+  return cppsh_filter_stage<Pred>{p};
 }
 
 template <typename Proj>
@@ -273,22 +363,27 @@ struct cppsh_sort_stage {
   Proj proj;
   template <typename Rng>
   friend auto operator|(Rng rng, const cppsh_sort_stage &s) {
-    std::sort(rng.begin(), rng.end(),
-              [&](const auto &a, const auto &b) { return s.proj(a) < s.proj(b); });
+    for (unsigned long i = 0; i < rng.size(); ++i)
+      for (unsigned long j = i + 1; j < rng.size(); ++j)
+        if (s.proj(rng[j]) < s.proj(rng[i])) {
+          auto tmp = rng[i];
+          rng[i] = rng[j];
+          rng[j] = tmp;
+        }
     return rng;
   }
 };
 template <typename Proj>
 constexpr auto sort_by(Proj p) {
-  return cppsh_sort_stage<Proj>{std::move(p)};
+  return cppsh_sort_stage<Proj>{p};
 }
 
 struct cppsh_take_stage {
-  std::size_t n;
+  unsigned long n;
   template <typename Rng>
-  friend auto operator|(Rng &&rng, const cppsh_take_stage &s) {
-    std::decay_t<Rng> out;
-    std::size_t i = 0;
+  friend auto operator|(Rng rng, const cppsh_take_stage &s) {
+    Rng out;
+    unsigned long i = 0;
     for (auto &&item : rng) {
       if (i++ >= s.n)
         break;
@@ -297,16 +392,33 @@ struct cppsh_take_stage {
     return out;
   }
 };
-inline constexpr auto take(std::size_t n) { return cppsh_take_stage{n}; }
+inline constexpr auto take(unsigned long n) { return cppsh_take_stage{n}; }
 
 struct cppsh_print_stage {
   template <typename Rng>
-  friend void operator|(Rng &&rng, const cppsh_print_stage &) {
+  friend void operator|(Rng rng, const cppsh_print_stage &) {
     for (const auto &item : rng)
-      std::cout << item << "\n";
+      item.dump();
   }
 };
 inline constexpr cppsh_print_stage show{};
+
+template <typename A, typename B>
+inline constexpr bool __cppsh_same = false;
+template <typename A>
+inline constexpr bool __cppsh_same<A, A> = true;
+
+template <typename T>
+void print(const T &v) {
+  if constexpr (requires { v.c_str(); })
+    printf("%s\n", v.c_str());
+  else if constexpr (requires { static_cast<const char *>(v); })
+    printf("%s\n", static_cast<const char *>(v));
+  else if constexpr (__cppsh_same<T, double> || __cppsh_same<T, float>)
+    printf("%g\n", (double)v);
+  else
+    printf("%lld\n", (long long)v);
+}
 )CPPSH";
 
 static llvm::Error sanitizeOopArguments(const char *ArgV0) {
