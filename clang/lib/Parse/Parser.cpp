@@ -2557,8 +2557,10 @@ Decl *Parser::ParseModuleImport(SourceLocation AtLoc,
   else
     LexedSemi = !ExpectAndConsumeSemi(diag::err_module_expected_semi);
 
-  if (!LexedSemi)
+  if (!LexedSemi) {
     SkipUntil(tok::semi);
+    return nullptr;
+  }
 
   if (SeenError)
     return nullptr;

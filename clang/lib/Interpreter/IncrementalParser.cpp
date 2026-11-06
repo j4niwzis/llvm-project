@@ -256,9 +256,11 @@ class ASTDeclUnmerger : public DeclVisitor<ASTDeclUnmerger> {
   /// Remove Decls defined in this DC from the lookup table
   /// and restore the redeclaration chain to previous state
   void VisitDeclContext(DeclContext *DC) {
-    llvm::SmallVector<Decl *, 8> Members(DC->decls());
+    llvm::SmallVector<Decl *, 8> Members(DC->noload_decls());
     llvm::SmallVector<NamedDecl *, 8> Survivors;
     for (Decl *M : Members) {
+      if (M->isFromASTFile())
+        continue;
       if (auto *ND = dyn_cast<NamedDecl>(M))
         if (NamedDecl *Prev = findSurvivor(ND))
           Survivors.push_back(Prev);

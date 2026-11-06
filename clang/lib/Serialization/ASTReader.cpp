@@ -3760,7 +3760,7 @@ llvm::Error ASTReader::ReadASTBlock(ModuleFile &F,
       // This usually has no cost, since we very rarely need the lookup map for
       // the translation unit outside C++.
       if (ASTContext *Ctx = ContextObj) {
-        DeclContext *DC = Ctx->getTranslationUnitDecl();
+        DeclContext *DC = Ctx->getTranslationUnitDecl()->getFirstDecl();
         if (DC->hasExternalLexicalStorage() && !Ctx->getLangOpts().CPlusPlus)
           DC->setMustBuildLookupTable();
       }
@@ -3962,7 +3962,7 @@ llvm::Error ASTReader::ReadASTBlock(ModuleFile &F,
     }
 
     case TU_UPDATE_LEXICAL: {
-      DeclContext *TU = ContextObj->getTranslationUnitDecl();
+      DeclContext *TU = ContextObj->getTranslationUnitDecl()->getFirstDecl();
       LexicalContents Contents(
           reinterpret_cast<const unaligned_decl_id_t *>(Blob.data()),
           static_cast<unsigned int>(Blob.size() / sizeof(DeclID)));
@@ -5770,7 +5770,7 @@ void ASTReader::InitializeContext() {
   if (DeserializationListener)
     DeserializationListener->DeclRead(
         GlobalDeclID(PREDEF_DECL_TRANSLATION_UNIT_ID),
-        Context.getTranslationUnitDecl());
+        Context.getTranslationUnitDecl()->getFirstDecl());
 
   // FIXME: Find a better way to deal with collisions between these
   // built-in types. Right now, we just ignore the problem.
@@ -8603,7 +8603,7 @@ Decl *ASTReader::getPredefinedDecl(PredefinedDeclIDs ID) {
     return nullptr;
 
   case PREDEF_DECL_TRANSLATION_UNIT_ID:
-    return Context.getTranslationUnitDecl();
+    return Context.getTranslationUnitDecl()->getFirstDecl();
 
   case PREDEF_DECL_OBJC_ID_ID:
     if (Context.ObjCIdDecl)

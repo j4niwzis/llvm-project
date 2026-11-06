@@ -599,7 +599,8 @@ void ASTDeclReader::VisitDecl(Decl *D) {
     Reader.addPendingDeclContextInfo(D,
                                      SemaDCIDForTemplateParmDecl,
                                      LexicalDCIDForTemplateParmDecl);
-    D->setDeclContext(Reader.getContext().getTranslationUnitDecl());
+    D->setDeclContext(
+        Reader.getContext().getTranslationUnitDecl()->getFirstDecl());
   } else {
     auto *SemaDC = readDeclAs<DeclContext>();
     auto *LexicalDC =
@@ -4382,7 +4383,7 @@ Decl *ASTReader::ReadDeclRecord(GlobalDeclID ID) {
   // Set the DeclContext before doing any deserialization, to make sure internal
   // calls to Decl::getASTContext() by Decl's methods will find the
   // TranslationUnitDecl without crashing.
-  D->setDeclContext(Context.getTranslationUnitDecl());
+  D->setDeclContext(Context.getTranslationUnitDecl()->getFirstDecl());
 
   // Reading some declarations can result in deep recursion.
   runWithSufficientStackSpace(DeclLoc, [&] { Reader.Visit(D); });

@@ -305,7 +305,7 @@ int main(int argc, const char **argv) {
     if (llvm::StringRef(A).starts_with("-std="))
       HasStdFlag = true;
   if (!HasStdFlag)
-    ClangArgv.push_back("-std=gnu++20");
+    ClangArgv.push_back("-std=gnu++23");
   // Initialize all targets (required for device offloading)
   llvm::InitializeAllTargetInfos();
   llvm::InitializeAllTargets();
