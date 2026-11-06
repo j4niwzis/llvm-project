@@ -74,6 +74,7 @@
 #include <limits>
 #include <optional>
 
+#include <set>
 using namespace clang;
 using namespace sema;
 
@@ -97,6 +98,34 @@ extern llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
 // compiling the rest with the variable's value known (Interpreter::
 // ParseAndExecute).
 SourceLocation CppshStageAt;
+
+// Staged functions (cppsh): a function body is cut where the value
+// specialization needs the value of a local of it -- or a call of it calls a
+// staged function -- which only running it gives. The parser cuts the body's
+// outermost block at the statement that needed it (CppshCutNeeded, set here
+// while that statement is analysed, its diagnostics held off until then:
+// what it gives without the value is not what it will be), keeps the rest as
+// text, and returns from there through std::sh::__cppsh_cut, which compiles
+// and runs the rest with the locals' values known (a continuation). The
+// cuts: the rest of each body, and its live locals' names and types.
+bool CppshCutNeeded = false;
+std::set<const FunctionDecl *> CppshCutFunctions;
+std::vector<std::string> CppshCutRemainders;
+std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
+// A call of a staged function among the user's top-level statements: the
+// statement is staged and the call hoisted -- run on its own, its result put
+// in its place (Interpreter::ParseAndExecute) -- unless it is that hoisted
+// call itself being run.
+SourceLocation CppshHoistBegin, CppshHoistEnd;
+bool CppshInHoist = false;
+
+// Whether a location is in what the user typed (the REPL's input buffers).
+static bool cppshInUserInput(Sema &S, SourceLocation L) {
+  if (!S.getPreprocessor().isIncrementalProcessingEnabled() || L.isInvalid())
+    return false;
+  SourceManager &SM = S.getSourceManager();
+  return SM.getBufferName(SM.getFileLoc(L)).starts_with("input_line_");
+}
 } // namespace clang
 
 bool Sema::CanUseDecl(NamedDecl *D, bool TreatUnavailableAsInvalid) {
@@ -7067,6 +7096,20 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
   if (LangOpts.OpenMP)
     Call = OpenMP().ActOnOpenMPCall(Call, Scope, LParenLoc, ArgExprs, RParenLoc,
                                     ExecConfig);
+  // A call of a staged function (cppsh): its result only known as it runs.
+  if (const auto *CE = dyn_cast<CallExpr>(Call.get()))
+    if (const FunctionDecl *Callee = CE->getDirectCallee();
+        Callee && CppshCutFunctions.count(Callee->getCanonicalDecl()) &&
+        cppshInUserInput(*this, CE->getBeginLoc())) {
+      if (FunctionDecl *Cur = getCurFunctionDecl();
+          Cur && !Cur->isDependentContext()) {
+        CppshCutNeeded = true; // its caller's body cut here too
+      } else if (!CppshInHoist && !CppshStageAt.isValid()) {
+        CppshStageAt = CE->getBeginLoc(); // a top-level statement: hoisted
+        CppshHoistBegin = CE->getBeginLoc();
+        CppshHoistEnd = CE->getEndLoc();
+      }
+    }
   if (LangOpts.CPlusPlus) {
     if (const auto *CE = dyn_cast<CallExpr>(Call.get()))
       DiagnosedUnqualifiedCallsToStdFunctions(*this, CE);
@@ -7784,8 +7827,12 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             continue;
           const FunctionDecl *BodyFD = nullptr;
           Stmt *PatBody = PatFD->getBody(BodyFD);
+          // A continuation (cppsh: the rest of a staged function) is
+          // specialized on its locals' values whatever its body holds.
+          bool Continuation = PatFD->getIdentifier() &&
+                              PatFD->getName().starts_with("__cppsh_cont");
           if (!PatBody || !PatFD->getReturnType()->getContainedAutoType() ||
-              !stmtHasIf(PatBody, stmtHasIf))
+              (!Continuation && !stmtHasIf(PatBody, stmtHasIf)))
             continue;
           for (unsigned I = 0;
                I < PatFD->getNumParams() && I < ArgExprs.size(); ++I) {
@@ -7825,6 +7872,19 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             if (!Ok) {
               if (auto *DRE = dyn_cast<DeclRefExpr>(ArgE->IgnoreParenImpCasts())) {
                 if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+                  // A local of the function whose body is being written, its
+                  // value only known as it runs: the body is cut here.
+                  if (VD->hasLocalStorage() && getCurFunctionDecl() &&
+                      !getCurFunctionDecl()->isDependentContext() &&
+                      !getCurFunctionDecl()->isTemplateInstantiation() &&
+                      CodeSynthesisContexts.empty() &&
+                      VD->getParentFunctionOrMethod() == getCurFunctionDecl() &&
+                      !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)) &&
+                      cppshInUserInput(*this, getCurFunctionDecl()->getLocation())) {
+                    CppshCutNeeded = true;
+                    getDiagnostics().setSuppressAllDiagnostics(true);
+                    continue;
+                  }
                   // Defined by this same input, not run yet: its value is not
                   // known now, nor its initializer's to be trusted (a read
                   // from std::cin may come between) -- the input is staged

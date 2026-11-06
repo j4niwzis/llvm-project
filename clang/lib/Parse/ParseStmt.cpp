@@ -18,6 +18,10 @@
 #include "clang/Basic/TokenKinds.h"
 #include "clang/Parse/LoopHint.h"
 #include "clang/Parse/Parser.h"
+#include <set>
+#include "clang/Sema/ScopeInfo.h"
+#include "clang/Sema/Lookup.h"
+#include "clang/AST/QualTypeNames.h"
 #include "clang/Parse/RAIIObjectsForParser.h"
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
@@ -1133,6 +1137,38 @@ StmtResult Parser::handleExprStmt(ExprResult E, ParsedStmtContext StmtCtx) {
   return Actions.ActOnExprStmt(E, /*DiscardedValue=*/!IsStmtExprResult);
 }
 
+namespace clang {
+extern bool CppshCutNeeded;
+extern std::set<const FunctionDecl *> CppshCutFunctions;
+extern std::vector<std::string> CppshCutRemainders;
+extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
+} // namespace clang
+
+// The next compound statement parsed is a function's body (cppsh: the block a
+// cut is made in).
+static bool CppshNextCompoundIsBody = false;
+
+// std::sh's function of that name, looked up from the parser.
+static ExprResult cppshShFunction(Sema &Actions, Preprocessor &PP, StringRef Name,
+                                  SourceLocation Loc) {
+  NamespaceDecl *Std = Actions.getStdNamespace();
+  if (!Std)
+    return ExprError();
+  LookupResult ShR(Actions, &PP.getIdentifierTable().get("sh"), Loc,
+                   Sema::LookupNamespaceName);
+  Actions.LookupQualifiedName(ShR, Std);
+  auto *Sh = ShR.getAsSingle<NamespaceDecl>();
+  if (!Sh)
+    return ExprError();
+  LookupResult R(Actions, &PP.getIdentifierTable().get(Name), Loc,
+                 Sema::LookupOrdinaryName);
+  Actions.LookupQualifiedName(R, Sh);
+  if (R.empty())
+    return ExprError();
+  CXXScopeSpec SS;
+  return Actions.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
+}
+
 StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
   PrettyStackTraceLoc CrashInfo(PP.getSourceManager(),
                                 Tok.getLocation(),
@@ -1154,6 +1190,8 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
   Actions.ActOnAfterCompoundStatementLeadingPragmas();
 
   StmtVector Stmts;
+  // A function's body, where cppsh cuts (CppshCutNeeded).
+  const bool CppshBody = std::exchange(CppshNextCompoundIsBody, false);
 
   // "__label__ X, Y, Z;" is the GNU "Local Label" extension.  These are
   // only allowed at the start of a compound stmt regardless of the language.
@@ -1201,6 +1239,9 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
       continue;
 
     StmtResult R;
+    SourceLocation CppshStmtBegin = Tok.getLocation();
+    if (CppshBody)
+      CppshCutNeeded = false;
     if (Tok.isNot(tok::kw___extension__)) {
       R = ParseStatementOrDeclaration(Stmts, SubStmtCtx);
     } else {
@@ -1241,6 +1282,95 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
         R = handleExprStmt(Res, SubStmtCtx);
         if (R.isUsable())
           R = Actions.ActOnAttributedStmt(attrs, R.get());
+      }
+    }
+
+    // cppsh: this statement needed what only running the function gives --
+    // a local's value, a staged function's result. The body is cut here:
+    // this statement and the rest kept as text, the locals before it handed
+    // over, and the function returns through std::sh::__cppsh_cut, which
+    // compiles and runs the rest with their values known.
+    if (CppshBody && CppshCutNeeded) {
+      CppshCutNeeded = false;
+      Actions.getDiagnostics().setSuppressAllDiagnostics(false);
+      FunctionDecl *FD = Actions.getCurFunctionDecl();
+      bool Progress = FD && !(Stmts.empty() && FD->getIdentifier() &&
+                              FD->getName().starts_with("__cppsh_cont"));
+      bool EarlyReturn = llvm::any_of(Stmts, [](Stmt *S) { return isa<ReturnStmt>(S); });
+      if (!Progress || EarlyReturn) {
+        // No way on: the need sits in a nested block a continuation would
+        // start with again, or a return comes before it.
+        unsigned ID = Actions.getDiagnostics().getCustomDiagID(
+            DiagnosticsEngine::Error, "%0");
+        Diag(CppshStmtBegin, ID)
+            << (EarlyReturn
+                    ? "a 'return' comes before a value only running this function "
+                      "gives: not staged yet"
+                    : "this needs a value only running the function gives, inside "
+                      "a nested block: not staged yet -- needed at the top of the "
+                      "function's body");
+      } else {
+        SkipUntil(tok::r_brace, StopBeforeMatch);
+        SourceManager &SM = PP.getSourceManager();
+        StringRef Rest = Lexer::getSourceText(
+            CharSourceRange::getCharRange(CppshStmtBegin, Tok.getLocation()), SM,
+            getLangOpts());
+        // The live locals: the parameters, and what the statements before
+        // declared -- by name and by type as written in full.
+        SmallVector<VarDecl *, 8> Live;
+        for (ParmVarDecl *P : FD->parameters())
+          if (P->getIdentifier())
+            Live.push_back(P);
+        for (Stmt *S : Stmts)
+          if (auto *DS = dyn_cast<DeclStmt>(S))
+            for (Decl *D : DS->decls())
+              if (auto *VD = dyn_cast<VarDecl>(D);
+                  VD && VD->hasLocalStorage() && VD->getIdentifier())
+                Live.push_back(VD);
+        std::vector<std::string> Names, Types;
+        PrintingPolicy Policy(Actions.Context.getLangOpts());
+        for (VarDecl *VD : Live) {
+          Names.push_back(VD->getName().str());
+          Types.push_back(TypeName::getFullyQualifiedName(
+              VD->getType().getNonReferenceType().getUnqualifiedType(),
+              Actions.Context, Policy, /*WithGlobalNsPrefix=*/true));
+        }
+        unsigned Id = CppshCutRemainders.size();
+        CppshCutRemainders.push_back(Rest.str());
+        CppshCutLocalNames.push_back(std::move(Names));
+        CppshCutLocalTypes.push_back(std::move(Types));
+        CppshCutFunctions.insert(FD->getCanonicalDecl());
+        // return std::sh::__cppsh_cut(Id, std::sh::__cppsh_frame(locals...));
+        SourceLocation Loc = CppshStmtBegin;
+        ExprResult Frame = cppshShFunction(Actions, PP, "__cppsh_frame", Loc);
+        ExprResult Cut = cppshShFunction(Actions, PP, "__cppsh_cut", Loc);
+        if (Frame.isUsable() && Cut.isUsable()) {
+          SmallVector<Expr *, 8> Refs;
+          for (VarDecl *VD : Live)
+            Refs.push_back(Actions.BuildDeclRefExpr(
+                VD, VD->getType().getNonReferenceType(), VK_LValue, Loc));
+          ExprResult FrameCall = Actions.ActOnCallExpr(getCurScope(), Frame.get(),
+                                                       Loc, Refs, Loc);
+          Expr *IdLit = IntegerLiteral::Create(Actions.Context,
+                                               llvm::APInt(32, Id),
+                                               Actions.Context.UnsignedIntTy, Loc);
+          if (FrameCall.isUsable()) {
+            Expr *CutArgs[2] = {IdLit, FrameCall.get()};
+            ExprResult CutCall =
+                Actions.ActOnCallExpr(getCurScope(), Cut.get(), Loc, CutArgs, Loc);
+            if (CutCall.isUsable()) {
+              StmtResult Ret = Actions.ActOnReturnStmt(Loc, CutCall.get(), getCurScope());
+              if (Ret.isUsable())
+                Stmts.push_back(Ret.get());
+            }
+          }
+        }
+        // What the cut statement's analysis without the value raised is
+        // not the function's: its error state let go.
+        if (sema::FunctionScopeInfo *FSI = Actions.getCurFunction())
+          FSI->ErrorTrap.reset();
+        LastIsError = false;
+        continue;
       }
     }
 
@@ -2614,6 +2744,7 @@ Decl *Parser::ParseFunctionStatementBody(Decl *Decl, ParseScope &BodyScope) {
   // Do not enter a scope for the brace, as the arguments are in the same scope
   // (the function body) as the body itself.  Instead, just read the statement
   // list and put it into a CompoundStmt for safe keeping.
+  CppshNextCompoundIsBody = true;
   StmtResult FnBody(ParseCompoundStatementBody());
 
   // If the function body could not be parsed, make a bogus compoundstmt.

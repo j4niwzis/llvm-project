@@ -89,6 +89,8 @@ __int128 __cppsh_divti3(__int128, __int128);
 __int128 __cppsh_modti3(__int128, __int128);
 }
 #endif
+// A staged function's continuation, compiled and run (Interpreter.cpp).
+extern "C" void __cppsh_cut_run(unsigned, void *const *, unsigned);
 
 #if CLANG_HAVE_EMUTLS_GET_ADDRESS
 extern "C" void *__emutls_get_address(void *);
@@ -477,6 +479,7 @@ OrcIncrementalExecutorBuilder::createExecutor(llvm::orc::ThreadSafeContext &TSC,
       };
       if (void *EmuTLSGetAddress = getEmuTLSGetAddressPtr())
         Add("__emutls_get_address", EmuTLSGetAddress);
+      Add("__cppsh_cut_run", reinterpret_cast<void *>(&__cppsh_cut_run));
 #if defined(__SIZEOF_INT128__)
       Add("__udivmodti4", reinterpret_cast<void *>(&__cppsh_udivmodti4));
       Add("__udivti3", reinterpret_cast<void *>(&__cppsh_udivti3));

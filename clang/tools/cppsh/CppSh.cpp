@@ -179,8 +179,8 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
       continue;
     auto *VD = R.getAsSingle<clang::VarDecl>();
     if (!VD || !VD->hasGlobalStorage() || VD->isInvalidDecl() ||
-        VD->getType()->isDependentType() || VD->getType()->isReferenceType() ||
-        VD->getType().isTriviallyCopyableType(Ctx))
+        VD->getType()->isDependentType() ||
+        VD->getType().getNonReferenceType().isTriviallyCopyableType(Ctx))
       continue;
     if (llvm::Error Err =
             Interp.ParseAndExecute("std::sh::__cppsh_snapshot(" + Name + ");"))

@@ -1572,6 +1572,52 @@ void __cppsh_snapshot(const T &v) {
   __cppsh_snapshots()[static_cast<const void *>(std::addressof(v))] = std::move(s);
 }
 
+
+// ---- Staged functions (cppsh) ----------------------------------------------
+//
+// A function whose body needs a value only running it gives -- a local read
+// from std::cin, given to ls -- is cut there by the compiler: it returns
+// __cppsh_cut(id, __cppsh_frame(its live locals...)), and the interpreter
+// compiles the rest as a continuation, its locals' values known, runs it,
+// and keeps its result (__cppsh_value) for the caller, which is compiled
+// once it is there. What a staged function returns as it is compiled: staged.
+struct staged {
+  friend constexpr bool operator==(staged, staged) noexcept { return true; }
+};
+
+template <typename... T>
+std::array<void *, sizeof...(T)> __cppsh_frame(T &...locals) noexcept {
+  return {const_cast<void *>(static_cast<const void *>(std::addressof(locals)))...};
+}
+
+} // namespace sh
+} // namespace std
+
+// The interpreter's: the continuation of cut `id` compiled and run, the live
+// locals at `frame` (an absolute symbol of the JIT).
+extern "C" void __cppsh_cut_run(unsigned id, void *const *frame, unsigned n);
+
+namespace std {
+namespace sh {
+
+template <std::size_t N>
+staged __cppsh_cut(unsigned id, std::array<void *, N> frame) {
+  ::__cppsh_cut_run(id, frame.data(), static_cast<unsigned>(N));
+  return {};
+}
+
+// A continuation's result, kept: what it returns, or staged where it
+// returns nothing.
+template <typename F>
+auto __cppsh_value(F f) {
+  if constexpr (std::is_void_v<decltype(f())>) {
+    f();
+    return staged{};
+  } else {
+    return f();
+  }
+}
+
 } // namespace sh
 
 template <>

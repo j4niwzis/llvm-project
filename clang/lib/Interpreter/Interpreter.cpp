@@ -67,6 +67,7 @@
 #include "llvm/Transforms/Utils/Cloning.h" // for CloneModule
 #include "clang/AST/APValue.h"
 #include "clang/AST/RecordLayout.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Frontend/TextDiagnosticBuffer.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Sema.h"
@@ -382,7 +383,10 @@ static Expr *cppshRuntimeRebuildOf(Sema &S, const VarDecl *VD) {
   }
   using ReaderFn = const char *(*)(const void *, unsigned long long *);
   unsigned long long Size = 0;
-  const char *Data = Reader->toPtr<ReaderFn>()(Var->toPtr<const void *>(), &Size);
+  const void *Object = Var->toPtr<const void *>();
+  if (VD->getType()->isReferenceType())
+    Object = *static_cast<const void *const *>(Object);
+  const char *Data = Reader->toPtr<ReaderFn>()(Object, &Size);
   if (!Data)
     return nullptr;
   CppshSnapshot R{reinterpret_cast<const unsigned char *>(Data),
@@ -394,11 +398,13 @@ static Expr *cppshRuntimeRebuildOf(Sema &S, const VarDecl *VD) {
 // already run defined; the current one's are not in the JIT yet, and are
 // not found -- and read from memory.
 static std::optional<APValue> cppshRuntimeValueOf(const VarDecl *VD) {
-  if (!CppshActiveInterpreter || !VD || VD->isInvalidDecl() ||
-      !VD->hasGlobalStorage() || VD->getType()->isReferenceType())
+  if (!CppshActiveInterpreter || !VD || VD->isInvalidDecl() || !VD->hasGlobalStorage())
     return std::nullopt;
   ASTContext &Ctx = VD->getASTContext();
-  QualType T = VD->getType();
+  // A reference (a continuation's local, as the cut handed it over): what it
+  // refers to.
+  const bool Ref = VD->getType()->isReferenceType();
+  QualType T = VD->getType().getNonReferenceType();
   if (T->isDependentType() || T->isIncompleteType() ||
       !T.isTriviallyCopyableType(Ctx))
     return std::nullopt;
@@ -410,7 +416,12 @@ static std::optional<APValue> cppshRuntimeValueOf(const VarDecl *VD) {
   }
   if (!*Addr)
     return std::nullopt;
-  return cppshValueAt(Ctx, T, Addr->toPtr<const unsigned char *>());
+  const unsigned char *Object = Addr->toPtr<const unsigned char *>();
+  if (Ref)
+    Object = *reinterpret_cast<const unsigned char *const *>(Object);
+  if (!Object)
+    return std::nullopt;
+  return cppshValueAt(Ctx, T, Object);
 }
 // FIXME: Figure out how to unify with namespace init_convenience from
 //        tools/clang-import-test/clang-import-test.cpp
@@ -1365,6 +1376,59 @@ extern std::vector<SourceLocation> CppshTopLevelStarts;
 void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef) = nullptr;
 } // namespace clang
 
+namespace clang {
+extern std::vector<std::string> CppshCutRemainders;
+extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
+extern SourceLocation CppshHoistBegin, CppshHoistEnd;
+extern bool CppshInHoist;
+} // namespace clang
+
+// The global holding the last continuation's result: what a hoisted call is
+// replaced by.
+static std::string CppshLastResult;
+static unsigned CppshContinuations = 0;
+
+// A staged function's rest, as its cut left it: compiled and run as an input
+// of its own --
+//   auto &__cppsh_fK_x = *static_cast<T *>((void *)ADDR);   each live local
+//   auto __cppsh_contK(auto x, ...) { <the rest of the body> }
+//   auto __cppsh_resK = std::sh::__cppsh_value([] { return __cppsh_contK(
+//       __cppsh_fK_x, ...); });
+// -- the continuation specialized on the locals' values, read through the
+// references (staged as an input is, where they are needed); its result in
+// __cppsh_resK for whoever waits for it.
+extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
+  if (!CppshActiveInterpreter || Id >= CppshCutRemainders.size())
+    return;
+  unsigned K = CppshContinuations++;
+  std::string Tag = std::to_string(K);
+  const std::vector<std::string> &Names = CppshCutLocalNames[Id];
+  const std::vector<std::string> &Types = CppshCutLocalTypes[Id];
+  std::string Code, Params, Args;
+  for (unsigned I = 0; I < N && I < Names.size(); ++I) {
+    std::string Global = "__cppsh_f" + Tag + "_" + Names[I];
+    Code += "auto &" + Global + " = *static_cast<" + Types[I] + " *>((void *)" +
+            std::to_string(reinterpret_cast<uintptr_t>(Frame[I])) + "ULL);
+";
+    Params += std::string(Params.empty() ? "" : ", ") + "auto " + Names[I];
+    Args += std::string(Args.empty() ? "" : ", ") + Global;
+  }
+  Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {
+" + CppshCutRemainders[Id] +
+          "
+}
+";
+  Code += "auto __cppsh_res" + Tag + " = ::std::sh::__cppsh_value([] { return __cppsh_cont" +
+          Tag + "(" + Args + "); });
+";
+  bool WasHoist = CppshInHoist;
+  CppshInHoist = false;
+  if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Code))
+    llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
+  CppshInHoist = WasHoist;
+  CppshLastResult = "__cppsh_res" + Tag;
+}
+
 // Staged: an input is compiled whole, its diagnostics held back. Where the
 // value specialization needed the value of a variable this same input
 // defines (CppshStageAt), that PTU is dropped -- nothing of it ran -- and the
@@ -1374,6 +1438,8 @@ void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef) = nullptr;
 // a script, alike. Where nothing needed it, the input runs as it was
 // compiled, its diagnostics given as they came.
 llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
+  // The input as staging rewrites it: a hoisted call replaced by its result.
+  std::string Rewritten;
   for (;;) {
     if (CppshBeforeChunk)
       CppshBeforeChunk(*this, Code);
@@ -1388,7 +1454,9 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
     Diags.setClient(&Held, /*ShouldOwnClient=*/false);
 
     CppshStageAt = SourceLocation();
+    CppshHoistBegin = CppshHoistEnd = SourceLocation();
     auto PTU = Parse(Code);
+    SourceLocation HoistBegin = CppshHoistBegin, HoistEnd = CppshHoistEnd;
 
     // Where to stage: the start of the top-level declaration holding the
     // need, in this input; none where the need is in its first one.
@@ -1444,7 +1512,30 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
     Diags.Reset(/*soft=*/true);
     if (llvm::Error Err = ParseAndExecute(Code.substr(0, Split), nullptr))
       return Err;
-    Code = Code.substr(Split);
+
+    // A call of a staged function the need was: run on its own, its result
+    // -- the continuation's global -- in its place for the rest.
+    std::string Rest = Code.substr(Split).str();
+    if (HoistBegin.isValid() && HoistEnd.isValid()) {
+      SourceManager &SM = getCompilerInstance()->getSourceManager();
+      SourceLocation B = SM.getFileLoc(HoistBegin), E = SM.getFileLoc(HoistEnd);
+      unsigned BOff = SM.getFileOffset(B);
+      unsigned EOff = SM.getFileOffset(E) +
+                      Lexer::MeasureTokenLength(E, SM, getCompilerInstance()->getLangOpts());
+      if (BOff >= Split && EOff <= Code.size() && BOff < EOff) {
+        std::string Call = Code.substr(BOff, EOff - BOff).str();
+        CppshLastResult.clear();
+        CppshInHoist = true;
+        llvm::Error Err = ParseAndExecute(Call + ";", nullptr);
+        CppshInHoist = false;
+        if (Err)
+          return Err;
+        if (!CppshLastResult.empty())
+          Rest = Rest.substr(0, BOff - Split) + CppshLastResult + Rest.substr(EOff - Split);
+      }
+    }
+    Rewritten = std::move(Rest);
+    Code = Rewritten;
   }
 }
 
