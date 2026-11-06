@@ -1518,7 +1518,8 @@ static bool cppshCutsIn(Sema &S, Scope *Sc) {
   FunctionDecl *FD = S.getCurFunctionDecl();
   if (!FD || S.getCurFunctionDecl(/*AllowLambda=*/true) != FD || CppshBodyOpen.isInvalid())
     return false;
-  for (; Sc && !(Sc->getFlags() & Scope::FnScope); Sc = Sc->getParent())
+  while (Sc && !(Sc->getFlags() & Scope::FnScope))
+    Sc = Sc->getParent();
   return Sc != nullptr;
 }
 
