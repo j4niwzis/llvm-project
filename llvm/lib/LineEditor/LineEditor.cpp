@@ -411,6 +411,12 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
   ::el_set(Data->EL, EL_BIND, "^M", "hint_enter", NULL);
   ::el_set(Data->EL, EL_BIND, "^J", "hint_enter", NULL);
   ::el_set(Data->EL, EL_BIND, "^X^J", "ed-newline", NULL);
+  // Ctrl+Left, Ctrl+Right: a word back, a word on -- as xterm and rxvt send
+  // them.
+  for (const char *Key : {"\\e[1;5D", "\\e[5D", "\\eOd", "\\e\\e[D"})
+    ::el_set(Data->EL, EL_BIND, Key, "ed-prev-word", NULL);
+  for (const char *Key : {"\\e[1;5C", "\\e[5C", "\\eOc", "\\e\\e[C"})
+    ::el_set(Data->EL, EL_BIND, Key, "em-next-word", NULL);
   ::el_set(Data->EL, EL_BIND, "^r", "em-inc-search-prev",
            NULL); // Cycle through backwards search, entering string
   ::el_set(Data->EL, EL_BIND, "^w", "ed-delete-prev-word",

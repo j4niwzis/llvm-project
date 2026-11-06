@@ -257,12 +257,57 @@ static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Cod
 // and no hint shown.
 static constexpr int kHintMillis = 150;
 
+// The expression at the cursor: from the cursor -- to the end of the word
+// under it -- back to the nearest unmatched '(', '[' or '{', or a ',', ';' or
+// assignment '=' at that depth: in `obj = ls {.all = true}`, the cursor after
+// '}', `ls {.all = true}`; in `f(x, y.size())`, after `size()`, `y.size()`.
+static llvm::StringRef expressionAt(llvm::StringRef Buffer, size_t Pos) {
+  auto identChar = [](char C) {
+    unsigned char U = static_cast<unsigned char>(C);
+    return std::isalnum(U) || C == '_' || U >= 0x80;
+  };
+  size_t End = std::min(Pos, Buffer.size());
+  while (End < Buffer.size() && identChar(Buffer[End]))
+    ++End;
+  int Depth = 0;
+  size_t Start = 0;
+  for (size_t I = End; I > 0; --I) {
+    char C = Buffer[I - 1];
+    if (C == '"' || C == '\'') {
+      // A literal: skipped whole, back to its opening quote.
+      size_t J = I - 1;
+      while (J > 0 && !(Buffer[J - 1] == C && (J < 2 || Buffer[J - 2] != '\\')))
+        --J;
+      I = J > 0 ? J : 1;
+      continue;
+    }
+    if (C == ')' || C == ']' || C == '}') {
+      ++Depth;
+    } else if (C == '(' || C == '[' || C == '{') {
+      if (Depth == 0) {
+        Start = I;
+        break;
+      }
+      --Depth;
+    } else if (Depth == 0 && (C == ',' || C == ';')) {
+      Start = I;
+      break;
+    } else if (Depth == 0 && C == '=') {
+      char Before = I >= 2 ? Buffer[I - 2] : ' ';
+      char After = I < Buffer.size() ? Buffer[I] : ' ';
+      if (After != '=' && Before != '=' && Before != '!' && Before != '<' &&
+          Before != '>') {
+        Start = I;
+        break;
+      }
+    }
+  }
+  return Buffer.substr(Start, End - Start).trim();
+}
+
 static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
                             size_t Pos) {
-  std::vector<std::string> Stmts = splitStatements(Buffer.substr(0, Pos));
-  if (Stmts.empty())
-    return {};
-  llvm::StringRef Expr = llvm::StringRef(Stmts.back()).trim();
+  llvm::StringRef Expr = expressionAt(Buffer, Pos);
   if (Expr.empty() || Expr.ends_with(";") || Expr == "exit" || Expr == "quit" ||
       Expr == "clear" || Expr == "cd" || Expr.starts_with("cd ") ||
       Expr.starts_with("%") || Expr.starts_with("#"))
@@ -360,6 +405,11 @@ static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
   }
   while (::waitpid(Child, nullptr, 0) < 0 && errno == EINTR) {
   }
+  // A symbol -- a word nothing named (`dir` in `ls dir`) -- has no type to
+  // speak of: no hint.
+  if (llvm::StringRef(Hint).starts_with("sym<") || llvm::StringRef(Hint).starts_with("std::sh::sym<") ||
+      llvm::StringRef(Hint).starts_with("const sym<"))
+    Hint.clear();
   // Names as the shell's user writes them: without std::sh:: and std::.
   for (llvm::StringRef Scope : {"std::sh::", "std::ranges::", "std::"}) {
     for (size_t At; (At = Hint.find(Scope.str())) != std::string::npos;)
@@ -1082,81 +1132,77 @@ struct ReplListCompleter {
     llvm::StringRef Prefix = Before.substr(IdentStart);
     llvm::StringRef Prior = Before.substr(0, IdentStart);
 
-    // 1. Designated initializer completion: `ls {.` or `ls({.all = true, .`
+    // 1. Designated initializer completion -- `ls {.`, `ls dir {.all =
+    //    true, .`, `f(x, {.` -- what the list's designators may name: the
+    //    parameters of the function it is an argument of, by name, and the
+    //    fields of its record parameters. The function: the name before an
+    //    open '(' the list is inside, else the head of the juxtaposition call
+    //    (the statement's first word) -- not the word just before the brace
+    //    (`dir`, an argument).
     if (Prior.ends_with(".")) {
       llvm::StringRef BeforeDot = Prior.drop_back(1).rtrim();
       if (BeforeDot.ends_with("{") || BeforeDot.ends_with(",")) {
-        // Walk back to the opening '{' and find the preceding function name
-        int BraceDepth = 0;
-        size_t I = Prior.size();
-        while (I > 0) {
-          --I;
-          if (Prior[I] == '}')
-            ++BraceDepth;
-          else if (Prior[I] == '{') {
-            if (BraceDepth == 0)
-              break;
-            --BraceDepth;
-          }
-        }
-        // Keep walking back past any earlier `{...}` blocks or `(`
-        while (I > 0) {
-          llvm::StringRef Sub = Prior.substr(0, I).rtrim();
-          if (Sub.ends_with("}")) {
-            int D = 0;
-            size_t J = Sub.size();
-            while (J > 0) {
-              --J;
-              if (Sub[J] == '}')
-                ++D;
-              else if (Sub[J] == '{') {
-                if (--D == 0)
-                  break;
-              }
+        // The '{' this list opened with, and an unmatched '(' before it.
+        size_t Open = llvm::StringRef::npos, Paren = llvm::StringRef::npos;
+        int Depth = 0;
+        for (size_t I = BeforeDot.size(); I > 0; --I) {
+          char C = BeforeDot[I - 1];
+          if (C == '}' || C == ')' || C == ']') {
+            ++Depth;
+          } else if (C == '{' || C == '(' || C == '[') {
+            if (Depth > 0) {
+              --Depth;
+              continue;
             }
-            I = J;
-          } else if (Sub.ends_with("(")) {
-            I = Sub.size() - 1;
-          } else {
+            if (C == '{' && Open == llvm::StringRef::npos) {
+              Open = I - 1;
+              continue;
+            }
+            if (C == '(' && Open != llvm::StringRef::npos)
+              Paren = I - 1;
+            break;
+          } else if (C == ';' && Depth == 0) {
             break;
           }
         }
-        llvm::StringRef FnSearch = Prior.substr(0, I).rtrim();
-        // Skip string literal args like `ls "." {.`
-        while (!FnSearch.empty() &&
-               (FnSearch.back() == '"' || FnSearch.back() == '\'')) {
-          char Q = FnSearch.back();
-          FnSearch = FnSearch.drop_back(1);
-          size_t PosQ = FnSearch.rfind(Q);
-          if (PosQ == llvm::StringRef::npos)
-            break;
-          FnSearch = FnSearch.substr(0, PosQ).rtrim();
+        std::string FnName;
+        if (Open != llvm::StringRef::npos) {
+          if (Paren != llvm::StringRef::npos) {
+            std::vector<ChainPart> Callee = chainBackward(BeforeDot.substr(0, Paren));
+            if (!Callee.empty())
+              FnName = Callee.back().Name;
+          } else {
+            std::vector<ChainPart> Head =
+                chainForward(currentStatement(BeforeDot.substr(0, Open)));
+            if (!Head.empty())
+              FnName = Head.front().Name;
+          }
         }
-        size_t FnEnd = FnSearch.size();
-        size_t FnStart = FnEnd;
-        while (FnStart > 0 && isIdentChar(FnSearch[FnStart - 1]))
-          --FnStart;
-        llvm::StringRef FnName = FnSearch.substr(FnStart, FnEnd - FnStart);
         if (!FnName.empty()) {
           llvm::SmallVector<clang::NamedDecl *, 8> Decls;
           lookupDeclsByName(S, FnName, Decls);
+          std::set<std::string> Seen;
           for (clang::NamedDecl *ND : Decls) {
-            const clang::FunctionDecl *FD =
-                llvm::dyn_cast<clang::FunctionDecl>(ND);
+            const clang::FunctionDecl *FD = llvm::dyn_cast<clang::FunctionDecl>(ND);
             if (auto *FTD = llvm::dyn_cast<clang::FunctionTemplateDecl>(ND))
               FD = FTD->getTemplatedDecl();
             if (!FD)
               continue;
             for (const clang::ParmVarDecl *PVD : FD->parameters()) {
-              clang::QualType PT = PVD->getType().getNonReferenceType();
-              if (const clang::CXXRecordDecl *RD = PT->getAsCXXRecordDecl()) {
-                llvm::StringRef RName =
-                    RD->getIdentifier() ? RD->getIdentifier()->getName() : "";
-                if (RName != "basic_string" && RName != "basic_string_view" &&
-                    RName != "sym") {
-                  completeRecordMembers(RD, Prefix, /*OnlyFields=*/true, Out);
-                }
+              // The parameter itself, by its name (`ls {.dir = "/tmp"}`).
+              if (PVD->getIdentifier()) {
+                llvm::StringRef PName = PVD->getName();
+                if (PName.starts_with(Prefix) && !PName.starts_with("__") &&
+                    Seen.insert(PName.str()).second)
+                  Out.emplace_back(PName.substr(Prefix.size()).str() + " = ",
+                                   "\033[1;35m." + PName.str() + "\033[0m \033[90m(" +
+                                       shortTypeName(PVD->getType(), Ctx) + ")\033[0m");
               }
+              // And the fields of a record parameter (`ls {.files_only = true}`).
+              clang::QualType PT = PVD->getType().getNonReferenceType();
+              if (const clang::CXXRecordDecl *RD = PT->getAsCXXRecordDecl())
+                if (!isStringRecord(RD))
+                  completeRecordMembers(RD, Prefix, /*OnlyFields=*/true, Out);
             }
           }
           if (!Out.empty())
