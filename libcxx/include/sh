@@ -344,6 +344,21 @@ struct __cppsh_show_stage
       // order first seen -- `name` first, then the kind, then the rest.
       std::vector<std::string> fields;
       std::vector<std::pair<std::string, std::vector<std::pair<std::string, __cppsh_nu_cell>>>> got;
+      // The fields of every alternative, by its type -- not only of the rows
+      // there are: the same columns, whichever kinds a listing happens to hold.
+      [&]<std::size_t... K>(std::index_sequence<K...>) {
+        (([&] {
+           using A = std::variant_alternative_t<K, ElemT>;
+           if constexpr (std::is_default_constructible_v<A>) {
+             std::vector<std::pair<std::string, __cppsh_nu_cell>> cs;
+             __cppsh_record_cells(A{}, cs);
+             for (const auto &c : cs)
+               if (std::find(fields.begin(), fields.end(), c.first) == fields.end())
+                 fields.push_back(c.first);
+           }
+         }()),
+         ...);
+      }(std::make_index_sequence<std::variant_size_v<ElemT>>{});
       for (auto &&item : rng) {
         std::vector<std::pair<std::string, __cppsh_nu_cell>> cells;
         std::string kind = std::visit(
