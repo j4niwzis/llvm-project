@@ -79,21 +79,6 @@ static std::string getUsername() {
   return "user";
 }
 
-static std::string getShortHostname() {
-#if !defined(_WIN32)
-  char Buf[256] = {};
-  if (::gethostname(Buf, sizeof(Buf) - 1) == 0 && Buf[0]) {
-    llvm::StringRef H(Buf);
-    size_t Dot = H.find('.');
-    return H.substr(0, Dot).str();
-  }
-#endif
-  if (const char *H = std::getenv("HOSTNAME"))
-    if (*H)
-      return H;
-  return "localhost";
-}
-
 static std::string getDisplayCwd() {
   llvm::SmallString<256> Cwd;
   if (llvm::sys::fs::current_path(Cwd))

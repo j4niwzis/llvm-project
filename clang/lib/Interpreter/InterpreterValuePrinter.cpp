@@ -534,6 +534,63 @@ llvm::Expected<Expr *> Interpreter::convertExprToValue(Expr *E) {
   if (EWC)
     E = EWC->getSubExpr();
 
+  if (Ctx.getLangOpts().CPlusPlus && E) {
+    Expr *CoreE = E->IgnoreParenImpCasts();
+    bool IsZeroArgFn = false;
+    if (auto *DRE = llvm::dyn_cast<DeclRefExpr>(CoreE)) {
+      if (auto *FD = llvm::dyn_cast<FunctionDecl>(DRE->getDecl()))
+        if (FD->getMinRequiredArguments() == 0)
+          IsZeroArgFn = true;
+    } else if (auto *ULE = llvm::dyn_cast<UnresolvedLookupExpr>(CoreE)) {
+      for (NamedDecl *ND : ULE->decls()) {
+        if (auto *FD = llvm::dyn_cast<FunctionDecl>(ND->getUnderlyingDecl())) {
+          if (FD->getMinRequiredArguments() == 0) {
+            IsZeroArgFn = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!IsZeroArgFn) {
+      if (CXXRecordDecl *RD = E->getType()->getAsCXXRecordDecl()) {
+        if (RD->getIdentifier() && RD->getIdentifier()->isStr("sym"))
+          IsZeroArgFn = true;
+      }
+    }
+    if (IsZeroArgFn) {
+      ExprResult CallRes = S.ActOnCallExpr(
+          S.getCurScope(), E, E->getBeginLoc(), {}, E->getEndLoc());
+      if (CallRes.isUsable()) {
+        E = CallRes.get();
+        if (E->getType()->isVoidType())
+          return S.MaybeCreateExprWithCleanups(E);
+      }
+    }
+
+    if (CXXRecordDecl *RD = E->getType().getNonReferenceType()->getAsCXXRecordDecl()) {
+      llvm::StringRef RName = RD->getIdentifier() ? RD->getIdentifier()->getName() : "";
+      if (RName != "basic_string" && RName != "basic_string_view" &&
+          RName != "sym" && !RD->lookup(&Ctx.Idents.get("begin")).empty()) {
+        LookupResult ShowR(S, &Ctx.Idents.get("show"), E->getBeginLoc(),
+                           Sema::LookupOrdinaryName);
+        if (S.getCurScope())
+          S.LookupName(ShowR, S.getCurScope());
+        if (ShowR.empty())
+          S.LookupQualifiedName(ShowR, Ctx.getTranslationUnitDecl());
+        if (!ShowR.empty()) {
+          CXXScopeSpec CSS;
+          ExprResult ShowFn = S.BuildDeclarationNameExpr(CSS, ShowR, /*ADL=*/false);
+          if (ShowFn.isUsable()) {
+            ExprResult ShowCall = S.ActOnCallExpr(
+                S.getCurScope(), ShowFn.get(), E->getBeginLoc(), {E}, E->getEndLoc());
+            if (ShowCall.isUsable())
+              return S.MaybeCreateExprWithCleanups(ShowCall.get());
+          }
+        }
+      }
+    }
+  }
+
   QualType Ty = E->IgnoreImpCasts()->getType();
   QualType DesugaredTy = Ty.getDesugaredType(Ctx);
 

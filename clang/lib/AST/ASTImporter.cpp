@@ -10465,6 +10465,8 @@ Expected<FileID> ASTImporter::Import(FileID FromID, bool IsBuiltin) {
 
   SourceManager &FromSM = FromContext.getSourceManager();
   SourceManager &ToSM = ToContext.getSourceManager();
+  // Insert main FileID placeholder first to break cyclic module include chains.
+  ImportedFileIDs[FromID] = ToSM.getMainFileID();
   const SrcMgr::SLocEntry &FromSLoc = FromSM.getSLocEntry(FromID);
 
   // Map the FromID to the "to" source manager.

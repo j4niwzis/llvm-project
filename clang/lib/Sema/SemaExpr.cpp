@@ -16978,6 +16978,30 @@ static ExprResult BuildOverloadedBinOp(Sema &S, Scope *Sc, SourceLocation OpLoc,
 ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
                             BinaryOperatorKind Opc, Expr *LHSExpr,
                             Expr *RHSExpr, bool ForFoldExpression) {
+  if (Opc == BO_Or && getLangOpts().CPlusPlus && LHSExpr) {
+    Expr *CoreLHS = LHSExpr->IgnoreParenImpCasts();
+    bool IsZeroArgFn = false;
+    if (auto *DRE = dyn_cast<DeclRefExpr>(CoreLHS)) {
+      if (auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl()))
+        if (FD->getMinRequiredArguments() == 0)
+          IsZeroArgFn = true;
+    } else if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(CoreLHS)) {
+      for (NamedDecl *ND : ULE->decls()) {
+        if (auto *FD = dyn_cast<FunctionDecl>(ND->getUnderlyingDecl())) {
+          if (FD->getMinRequiredArguments() == 0) {
+            IsZeroArgFn = true;
+            break;
+          }
+        }
+      }
+    }
+    if (IsZeroArgFn) {
+      ExprResult CallLHS = ActOnCallExpr(
+          S, LHSExpr, LHSExpr->getBeginLoc(), {}, LHSExpr->getEndLoc());
+      if (CallLHS.isUsable())
+        LHSExpr = CallLHS.get();
+    }
+  }
   if (!LHSExpr || !RHSExpr)
     return ExprError();
 
