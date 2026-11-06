@@ -2290,6 +2290,12 @@ Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
     }
     case tok::arrow:
     case tok::period: {
+      // The shell's: a '.' after a space starts a word -- `ls .`, `ls
+      // .gitignore`, `cd ./src` -- not a member access, which is written
+      // without one (`obj.size`). Left to the juxtaposition call's words.
+      if (Tok.is(tok::period) && Tok.hasLeadingSpace() &&
+          PP.isIncrementalProcessingEnabled())
+        return LHS;
       // postfix-expression: p-e '->' template[opt] id-expression
       // postfix-expression: p-e '.' template[opt] id-expression
       tok::TokenKind OpKind = Tok.getKind();
