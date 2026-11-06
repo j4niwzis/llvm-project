@@ -2658,6 +2658,19 @@ Decl *Parser::ParseDeclarationAfterDeclaratorAndAttributes(
       PreferredType.enterVariableInit(Tok.getLocation(), ThisDecl);
       ExprResult Init = ParseInitializer(ThisDecl);
       if (Init.isUsable() && D.getDeclSpec().getTypeSpecType() == TST_auto) {
+        // A std::sh function template that needs no argument (`obj = ls;`).
+        if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(Init.get()->IgnoreImplicit())) {
+          bool ZeroArgSh = llvm::any_of(ULE->decls(), [](NamedDecl *ND) {
+            auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
+            if (!FTD || FTD->getTemplatedDecl()->getMinRequiredArguments() != 0)
+              return false;
+            auto *NS = dyn_cast<NamespaceDecl>(FTD->getDeclContext());
+            return NS && NS->getName() == "sh";
+          });
+          if (ZeroArgSh)
+            Init = Actions.BuildCallExpr(getCurScope(), Init.get(), ULE->getBeginLoc(), {},
+                                         ULE->getEndLoc());
+        }
         if (auto *DRE = dyn_cast<DeclRefExpr>(Init.get()->IgnoreImplicit())) {
           if (auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
             if (FD->getMinRequiredArguments() == 0 &&

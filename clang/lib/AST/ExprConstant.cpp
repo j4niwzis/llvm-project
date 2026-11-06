@@ -87,6 +87,10 @@ namespace clang {
 // value, evaluated where the parameter is read -- into a temporary of that
 // evaluation, so what it allocates is freed as the evaluation ends.
 llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
+// And those whose argument is a value: that value. Kept here rather than in
+// the parameter's Init, which holds its default argument -- uninstantiated,
+// on a specialization, until a call needs it.
+llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
 } // namespace clang
 using llvm::APFixedPoint;
 using llvm::APInt;
@@ -3547,6 +3551,11 @@ static bool evaluateVarDeclInit(EvalInfo &Info, const Expr *E,
   // Used to be C++20 [expr.const]p5.12.2:
   // ... its lifetime began within the evaluation of E;
   if (isa<ParmVarDecl>(VD)) {
+    if (auto Known = CppshParamValue.find(cast<ParmVarDecl>(VD));
+        Known != CppshParamValue.end()) {
+      Result = &Known->second;
+      return true;
+    }
     if (const Expr *Rebuild = CppshParamRebuild.lookup(cast<ParmVarDecl>(VD))) {
       LValue Where;
       APValue &Slot = Info.CurrentCall->createTemporary(

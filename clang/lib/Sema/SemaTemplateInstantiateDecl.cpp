@@ -40,6 +40,7 @@ using namespace clang;
 
 namespace clang {
 extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
+extern llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
 } // namespace clang
 
 static bool isDeclWithinFunction(const Decl *D) {
@@ -3018,7 +3019,8 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
 
   bool HasCppshConstParam = false;
   for (const ParmVarDecl *P : D->parameters()) {
-    if (P && (P->hasConstantInitialization() || CppshParamRebuild.count(P))) {
+    if (P && (P->hasConstantInitialization() || CppshParamRebuild.count(P) ||
+              CppshParamValue.count(P))) {
       HasCppshConstParam = true;
       break;
     }
@@ -3170,6 +3172,10 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
         const ParmVarDecl *OrigP = D->getParamDecl(P);
         if (const Expr *Rebuild = CppshParamRebuild.lookup(OrigP))
           CppshParamRebuild[Params[P]] = Rebuild;
+        if (auto Known = CppshParamValue.find(OrigP); Known != CppshParamValue.end()) {
+          APValue Value = Known->second;
+          CppshParamValue[Params[P]] = std::move(Value);
+        }
         if (OrigP && OrigP->hasConstantInitialization()) {
           if (const APValue *Val = OrigP->getEvaluatedValue()) {
             EvaluatedStmt *ES = Params[P]->ensureEvaluatedStmt();

@@ -542,12 +542,14 @@ llvm::Expected<Expr *> Interpreter::convertExprToValue(Expr *E) {
         if (FD->getMinRequiredArguments() == 0)
           IsZeroArgFn = true;
     } else if (auto *ULE = llvm::dyn_cast<UnresolvedLookupExpr>(CoreE)) {
+      // A function or a function template (`ls`) that needs no argument.
       for (NamedDecl *ND : ULE->decls()) {
-        if (auto *FD = llvm::dyn_cast<FunctionDecl>(ND->getUnderlyingDecl())) {
-          if (FD->getMinRequiredArguments() == 0) {
-            IsZeroArgFn = true;
-            break;
-          }
+        FunctionDecl *FD = llvm::dyn_cast<FunctionDecl>(ND->getUnderlyingDecl());
+        if (auto *FTD = llvm::dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl()))
+          FD = FTD->getTemplatedDecl();
+        if (FD && FD->getMinRequiredArguments() == 0) {
+          IsZeroArgFn = true;
+          break;
         }
       }
     }

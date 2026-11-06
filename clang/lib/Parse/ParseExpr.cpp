@@ -164,6 +164,30 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
     }
     if (Arg.isInvalid() || !Arg.isUsable())
       return ExprError();
+    // Designated lists one after another (`ls {.files_only = true} {.all =
+    // true}`): one list, as if written so -- Sema sends each designator to
+    // the parameter or the field it names.
+    auto designatedOnly = [](Expr *E) -> InitListExpr * {
+      auto *L = dyn_cast<InitListExpr>(E);
+      if (!L || L->getNumInits() == 0)
+        return nullptr;
+      for (Expr *Init : L->inits())
+        if (!isa<DesignatedInitExpr>(Init))
+          return nullptr;
+      return L;
+    };
+    InitListExpr *Prev = ArgExprs.empty() ? nullptr : designatedOnly(ArgExprs.back());
+    InitListExpr *Next = designatedOnly(Arg.get());
+    if (Prev && Next) {
+      SmallVector<Expr *, 8> Inits(Prev->inits().begin(), Prev->inits().end());
+      Inits.append(Next->inits().begin(), Next->inits().end());
+      ExprResult Merged =
+          Actions.ActOnInitList(Prev->getLBraceLoc(), Inits, Next->getRBraceLoc());
+      if (Merged.isInvalid())
+        return ExprError();
+      ArgExprs.back() = Merged.get();
+      continue;
+    }
     ArgExprs.push_back(Arg.get());
   }
 

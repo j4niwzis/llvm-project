@@ -1993,6 +1993,16 @@ void Parser::ParseForRangeInitializerAfterColon(ForRangeInit &FRI,
                 getCurScope(), FRI.RangeExpr.get(), RE->getBeginLoc(), {},
                 RE->getEndLoc());
         }
+      } else if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(RE)) {
+        // A function template that needs no argument (`for (x : ls)`).
+        bool ZeroArg = llvm::any_of(ULE->decls(), [](NamedDecl *ND) {
+          auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
+          return FTD && FTD->getTemplatedDecl()->getMinRequiredArguments() == 0;
+        });
+        if (ZeroArg)
+          FRI.RangeExpr = Actions.BuildCallExpr(
+              getCurScope(), FRI.RangeExpr.get(), RE->getBeginLoc(), {},
+              RE->getEndLoc());
       }
     }
   }

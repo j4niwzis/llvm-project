@@ -90,6 +90,7 @@ std::optional<APValue> (*CppshRuntimeValueOf)(const VarDecl *) = nullptr;
 // before compiling this statement; none where it cannot be rebuilt.
 Expr *(*CppshRuntimeRebuildOf)(Sema &, const VarDecl *) = nullptr;
 extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
+extern llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
 } // namespace clang
 
 bool Sema::CanUseDecl(NamedDecl *D, bool TreatUnavailableAsInvalid) {
@@ -7657,74 +7658,88 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                                 VK_PRValue, RParenLoc, CurFPFeatureOverrides());
       OverloadExpr *ovl = find.Expression;
       if (UnresolvedLookupExpr *ULE = dyn_cast<UnresolvedLookupExpr>(ovl)) {
-        // An options list given where an earlier parameter stands (`ls
-        // {.files_only = true}` for `ls(Dir dir = ".", ls_opts opts = {})`):
-        // moved to the first later parameter of a record type that has
-        // every field it names, the parameters between taking their default
-        // arguments -- where the name finds one function or template.
+        // A designated list (`ls {.dir = "/tmp", .files_only = true}`,
+        // `f {.x = 1, .y = 2}`), where the name finds one function or
+        // template: each designator sent where it names -- a parameter by
+        // its name, that argument; a field of a record parameter, into that
+        // parameter's list -- and the parameters from the list's place on
+        // that get nothing taking their default arguments. Arguments before
+        // the list stay where they are.
         SmallVector<Expr *, 8> Rearranged;
         if (ULE->getNumDecls() == 1) {
           NamedDecl *OnlyD = (*ULE->decls_begin())->getUnderlyingDecl();
           FunctionDecl *OnlyFD = dyn_cast<FunctionDecl>(OnlyD);
           if (auto *FTD = dyn_cast<FunctionTemplateDecl>(OnlyD))
             OnlyFD = FTD->getTemplatedDecl();
-          for (unsigned I = 0; OnlyFD && I < ArgExprs.size() &&
-                               I < OnlyFD->getNumParams();
-               ++I) {
-            auto *ILE = dyn_cast_or_null<InitListExpr>(
-                ArgExprs[I] ? ArgExprs[I]->IgnoreParens() : nullptr);
-            if (!ILE || ILE->getNumInits() == 0)
-              continue;
-            SmallVector<const IdentifierInfo *, 4> Names;
-            bool AllNamed = true;
-            for (Expr *Init : ILE->inits()) {
-              auto *DIE = dyn_cast<DesignatedInitExpr>(Init);
-              if (!DIE || DIE->size() != 1 ||
-                  !DIE->getDesignator(0)->isFieldDesignator()) {
-                AllNamed = false;
+          // The one designated list, last among the arguments.
+          InitListExpr *ILE = nullptr;
+          if (OnlyFD && !ArgExprs.empty() && ArgExprs.back())
+            ILE = dyn_cast<InitListExpr>(ArgExprs.back()->IgnoreParens());
+          const unsigned At = ArgExprs.size() - 1;
+          bool AllNamed = ILE && ILE->getNumInits() > 0 && At < OnlyFD->getNumParams();
+          for (unsigned K = 0; AllNamed && K < ILE->getNumInits(); ++K) {
+            auto *DIE = dyn_cast<DesignatedInitExpr>(ILE->getInit(K));
+            AllNamed = DIE && DIE->size() == 1 &&
+                       DIE->getDesignator(0)->isFieldDesignator();
+          }
+          auto hasField = [](QualType T, const IdentifierInfo *N) {
+            if (T->isDependentType())
+              return false;
+            const CXXRecordDecl *RD = T->getAsCXXRecordDecl();
+            if (!RD || !RD->hasDefinition())
+              return false;
+            return llvm::any_of(RD->getDefinition()->fields(),
+                                [&](const FieldDecl *F) { return F->getIdentifier() == N; });
+          };
+          // Where each goes: a parameter's own value, or a field of one.
+          const unsigned NumParams = AllNamed ? OnlyFD->getNumParams() : 0;
+          SmallVector<Expr *, 8> Own(NumParams, nullptr);
+          SmallVector<SmallVector<Expr *, 4>, 8> Fields(NumParams);
+          bool Placed = AllNamed;
+          for (unsigned K = 0; Placed && K < ILE->getNumInits(); ++K) {
+            auto *DIE = cast<DesignatedInitExpr>(ILE->getInit(K));
+            const IdentifierInfo *N = DIE->getDesignator(0)->getFieldName();
+            Placed = false;
+            for (unsigned J = At; J < NumParams && !Placed; ++J)
+              if (OnlyFD->getParamDecl(J)->getIdentifier() == N && !Own[J]) {
+                Own[J] = DIE->getInit();
+                Placed = true;
+              }
+            for (unsigned J = At; J < NumParams && !Placed; ++J)
+              if (hasField(OnlyFD->getParamDecl(J)->getType().getNonReferenceType(), N)) {
+                Fields[J].push_back(DIE);
+                Placed = true;
+              }
+          }
+          // A list that is already one record parameter's, where it stands:
+          // left as it is.
+          bool AsIs = Placed && !Own[At] && Fields[At].size() == ILE->getNumInits();
+          if (Placed && !AsIs) {
+            unsigned Last = At;
+            for (unsigned J = At; J < NumParams; ++J)
+              if (Own[J] || !Fields[J].empty())
+                Last = J;
+            Rearranged.assign(ArgExprs.begin(), ArgExprs.begin() + At);
+            for (unsigned J = At; J <= Last; ++J) {
+              ParmVarDecl *PJ = OnlyFD->getParamDecl(J);
+              if (Own[J]) {
+                Rearranged.push_back(Own[J]);
+              } else if (!Fields[J].empty()) {
+                Rearranged.push_back(new (Context) InitListExpr(
+                    Context, ILE->getLBraceLoc(), Fields[J], ILE->getRBraceLoc(),
+                    /*isExplicit=*/false));
+              } else if (PJ->hasDefaultArg() && !PJ->hasUninstantiatedDefaultArg() &&
+                         !PJ->hasUnparsedDefaultArg() && PJ->getDefaultArg() &&
+                         !PJ->getDefaultArg()->isValueDependent() &&
+                         !PJ->getDefaultArg()->isTypeDependent()) {
+                Rearranged.push_back(PJ->getDefaultArg());
+              } else {
+                // A parameter before the last one named, with no value and
+                // no default: not a call this can be made into.
+                Rearranged.clear();
                 break;
               }
-              Names.push_back(DIE->getDesignator(0)->getFieldName());
             }
-            if (!AllNamed)
-              continue;
-            auto fits = [&](QualType T) {
-              if (T->isDependentType())
-                return false;
-              const CXXRecordDecl *RD = T->getAsCXXRecordDecl();
-              if (!RD || !RD->hasDefinition())
-                return false;
-              RD = RD->getDefinition();
-              return llvm::all_of(Names, [&](const IdentifierInfo *N) {
-                return llvm::any_of(RD->fields(), [&](const FieldDecl *F) {
-                  return F->getIdentifier() == N;
-                });
-              });
-            };
-            if (fits(OnlyFD->getParamDecl(I)->getType().getNonReferenceType()))
-              continue;
-            for (unsigned J = I + 1; J < OnlyFD->getNumParams(); ++J) {
-              if (!fits(OnlyFD->getParamDecl(J)->getType().getNonReferenceType()))
-                continue;
-              SmallVector<Expr *, 4> Defaults;
-              for (unsigned K = I; K < J; ++K) {
-                ParmVarDecl *PK = OnlyFD->getParamDecl(K);
-                if (!PK->hasDefaultArg() || PK->hasUninstantiatedDefaultArg() ||
-                    PK->hasUnparsedDefaultArg())
-                  break;
-                Expr *DA = PK->getDefaultArg();
-                if (!DA || DA->isValueDependent() || DA->isTypeDependent())
-                  break;
-                Defaults.push_back(DA);
-              }
-              if (Defaults.size() == J - I) {
-                Rearranged.assign(ArgExprs.begin(), ArgExprs.begin() + I);
-                Rearranged.append(Defaults.begin(), Defaults.end());
-                Rearranged.append(ArgExprs.begin() + I, ArgExprs.end());
-              }
-              break;
-            }
-            break;
           }
         }
         if (!Rearranged.empty())
@@ -7739,13 +7754,16 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
               return true;
           return false;
         };
-        struct SavedParamConst {
-          ParmVarDecl *P;
-          bool WasEval;
-          bool HasConstInit;
-          APValue Val;
+        // What each parameter had before this call set its value: put back
+        // once the call is built.
+        SmallVector<std::pair<ParmVarDecl *, std::optional<APValue>>, 4> SavedValues;
+        auto setValue = [&](ParmVarDecl *P, APValue V) {
+          auto Known = CppshParamValue.find(P);
+          SavedValues.push_back(
+              {P, Known == CppshParamValue.end() ? std::nullopt
+                                                  : std::optional<APValue>(Known->second)});
+          CppshParamValue[P] = std::move(V);
         };
-        SmallVector<SavedParamConst, 4> SavedParams;
         SmallVector<std::pair<ParmVarDecl *, const Expr *>, 4> SavedRebuilds;
         for (NamedDecl *ND : ULE->decls()) {
           auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
@@ -7820,15 +7838,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                 }
               }
             }
-            if (Ok && EV.Val.hasValue()) {
-              ParmVarDecl *P = PatFD->getParamDecl(I);
-              EvaluatedStmt *ES = P->ensureEvaluatedStmt();
-              SavedParams.push_back(
-                  {P, ES->WasEvaluated, ES->HasConstantInitialization, ES->Evaluated});
-              ES->WasEvaluated = true;
-              ES->HasConstantInitialization = true;
-              ES->Evaluated = EV.Val;
-            }
+            if (Ok && EV.Val.hasValue())
+              setValue(PatFD->getParamDecl(I), EV.Val);
           }
           // The parameters no argument is given for: their default
           // arguments, values too -- every argument of a call is known as it
@@ -7844,12 +7855,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             Expr::EvalResult EV;
             if (!DA->EvaluateAsRValue(EV, Context) || !EV.Val.hasValue())
               continue;
-            EvaluatedStmt *ES = P->ensureEvaluatedStmt();
-            SavedParams.push_back(
-                {P, ES->WasEvaluated, ES->HasConstantInitialization, ES->Evaluated});
-            ES->WasEvaluated = true;
-            ES->HasConstantInitialization = true;
-            ES->Evaluated = EV.Val;
+            setValue(P, EV.Val);
           }
         }
         ExprResult OvRes = BuildOverloadedCallExpr(
@@ -7861,12 +7867,11 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
           else
             CppshParamRebuild.erase(P);
         }
-        for (auto &SP : llvm::reverse(SavedParams)) {
-          if (EvaluatedStmt *ES = SP.P->getEvaluatedStmt()) {
-            ES->WasEvaluated = SP.WasEval;
-            ES->HasConstantInitialization = SP.HasConstInit;
-            ES->Evaluated = SP.Val;
-          }
+        for (auto &[P, Was] : llvm::reverse(SavedValues)) {
+          if (Was)
+            CppshParamValue[P] = std::move(*Was);
+          else
+            CppshParamValue.erase(P);
         }
         return OvRes;
       }
@@ -17146,11 +17151,12 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
           IsZeroArgFn = true;
     } else if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(CoreLHS)) {
       for (NamedDecl *ND : ULE->decls()) {
-        if (auto *FD = dyn_cast<FunctionDecl>(ND->getUnderlyingDecl())) {
-          if (FD->getMinRequiredArguments() == 0) {
-            IsZeroArgFn = true;
-            break;
-          }
+        FunctionDecl *FD = dyn_cast<FunctionDecl>(ND->getUnderlyingDecl());
+        if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl()))
+          FD = FTD->getTemplatedDecl();
+        if (FD && FD->getMinRequiredArguments() == 0) {
+          IsZeroArgFn = true;
+          break;
         }
       }
     }
