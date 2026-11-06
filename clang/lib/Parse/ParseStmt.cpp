@@ -1565,8 +1565,12 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
       CppshRangeBase = CppshSavedRangeBase;
     }
   });
+  // Not where a need is pending as the block opens -- raised in the header
+  // of the statement it is the body of (`for (e : ls o) {`): that one is cut
+  // at the whole statement, by the block around it.
   const bool CppshCuts =
-      CppshBody || (!isStmtExpr && cppshCutsIn(Actions, getCurScope()));
+      !CppshCutNeeded &&
+      (CppshBody || (!isStmtExpr && cppshCutsIn(Actions, getCurScope())));
   // The cut: the function returns through std::sh::__cppsh_cut, its rest
   // (Rest) compiled and run with the values of its live locals -- each in
   // scope at Loc, the innermost of a name -- handed over.
