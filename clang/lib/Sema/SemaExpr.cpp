@@ -197,7 +197,7 @@ ExprResult cppshVariantMember(Sema &S, Expr *Base, const DeclarationNameInfo &Na
     Expr *Lit = new (S.Context)
         CharacterLiteral(static_cast<unsigned char>(C), CharacterLiteralKind::Ascii,
                          S.Context.CharTy, Loc);
-    Args.addArgument(TemplateArgumentLoc(TemplateArgument(Lit), Lit));
+    Args.addArgument(TemplateArgumentLoc(TemplateArgument(Lit, /*IsCanonical=*/false), Lit));
   }
   CXXScopeSpec SS;
   ExprResult Fn = S.BuildTemplateIdExpr(SS, SourceLocation(), R, /*RequiresADL=*/false, &Args);
