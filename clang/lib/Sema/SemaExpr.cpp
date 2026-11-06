@@ -7697,7 +7697,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                 if (!PT->isDependentType() && !PT->isReferenceType()) {
                   SFINAETrap Trap(*this);
                   auto *Copy = new (Context) InitListExpr(
-                      Context, ILE->getLBraceLoc(), ILE->inits(), ILE->getRBraceLoc());
+                      Context, ILE->getLBraceLoc(), ILE->inits(), ILE->getRBraceLoc(),
+                      /*isExplicit=*/false);
                   InitializedEntity Entity = InitializedEntity::InitializeTemporary(PT);
                   InitializationKind Kind = InitializationKind::CreateCopy(
                       Copy->getBeginLoc(), SourceLocation());
