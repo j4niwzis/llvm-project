@@ -2020,6 +2020,13 @@ bool ASTReader::ReadSLocEntry(int ID) {
       // This is the module's main file.
       IncludeLoc = getImportLocation(F);
     }
+    if (IncludeLoc.isValid() &&
+        IncludeLoc.getRawEncoding() >= BaseOffset + Record[0] &&
+        IncludeLoc.getRawEncoding() < BaseOffset + Record[0] + 4096) {
+      // Prevent self-inclusion cycle when #pragma clang module contents
+      // points back into the module map buffer itself.
+      IncludeLoc = getImportLocation(F);
+    }
     SrcMgr::CharacteristicKind
       FileCharacter = (SrcMgr::CharacteristicKind)Record[2];
     FileID FID = SourceMgr.createFileID(*File, IncludeLoc, FileCharacter, ID,

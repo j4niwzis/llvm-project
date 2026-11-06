@@ -1969,7 +1969,7 @@ bool SourceManager::isInTheSameTranslationUnitImpl(
 static bool MoveUpTranslationUnitIncludeHierarchy(FileIDAndOffset &Loc,
                                                   const SourceManager &SM) {
   FileIDAndOffset UpperLoc = SM.getDecomposedIncludedLoc(Loc.first);
-  if (UpperLoc.first.isInvalid() ||
+  if (UpperLoc.first.isInvalid() || UpperLoc.first == Loc.first ||
       !SM.isInTheSameTranslationUnitImpl(UpperLoc, Loc))
     return true; // We reached the top.
 
@@ -2066,7 +2066,8 @@ SourceManager::isInTheSameTranslationUnit(FileIDAndOffset &LOffs,
 
   FileID LChild;
   do {
-    LChain.try_emplace(LOffs.first, Entry{LOffs, LChild});
+    if (!LChain.try_emplace(LOffs.first, Entry{LOffs, LChild}).second)
+      break;
     // We catch the case where LOffs is in a file included by ROffs and
     // quit early. The other way round unfortunately remains suboptimal.
     if (LOffs.first == ROffs.first)
@@ -2075,7 +2076,10 @@ SourceManager::isInTheSameTranslationUnit(FileIDAndOffset &LOffs,
   } while (!MoveUpTranslationUnitIncludeHierarchy(LOffs, *this));
 
   FileID RChild;
+  llvm::SmallDenseSet<FileID, 16> RSeen;
   do {
+    if (!RSeen.insert(ROffs.first).second)
+      break;
     auto LIt = LChain.find(ROffs.first);
     if (LIt != LChain.end()) {
       // Compare the locations within the common file and cache them.
