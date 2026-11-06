@@ -23,6 +23,7 @@ add_clang_subdirectory(clang-sycl-linker)
 add_clang_subdirectory(clang-installapi)
 if(HAVE_CLANG_REPL_SUPPORT)
   add_clang_subdirectory(clang-repl)
+  add_clang_subdirectory(cppsh)
 endif()
 
 if(CLANG_INCLUDE_TESTS)

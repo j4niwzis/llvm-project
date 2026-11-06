@@ -207,7 +207,7 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
   Data->EL = ::el_init(ProgName.str().c_str(), In, Out, Err);
   assert(Data->EL);
 
-  ::el_set(Data->EL, EL_PROMPT, ElGetPromptFn);
+  ::el_set(Data->EL, EL_PROMPT_ESC, ElGetPromptFn, '\001');
   ::el_set(Data->EL, EL_EDITOR, "emacs");
   ::el_set(Data->EL, EL_SIGNAL, 1);
   ::el_set(Data->EL, EL_HIST, history, Data->Hist);
@@ -301,7 +301,12 @@ void LineEditor::loadHistory() {}
 void LineEditor::setHistorySize(int size) {}
 
 std::optional<std::string> LineEditor::readLine() const {
-  ::fprintf(Data->Out, "%s", Prompt.c_str());
+  std::string CleanPrompt;
+  CleanPrompt.reserve(Prompt.size());
+  for (char C : Prompt)
+    if (C != '\001')
+      CleanPrompt.push_back(C);
+  ::fprintf(Data->Out, "%s", CleanPrompt.c_str());
 
   std::string Line;
   do {
