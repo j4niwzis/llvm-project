@@ -14,6 +14,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cerrno>
 #include <clocale>
 #include <csignal>
@@ -210,6 +211,44 @@ unsigned char ElHintDeleteFn(EditLine *EL, int) {
   refreshHint(EL, Data);
   return CC_REFRESH;
 }
+
+// The cursor moved by Steps characters, or by words (Words: -1 back, +1 on),
+// then the hint made again -- it is of the expression at the cursor.
+static bool isWordChar(char Ch) {
+  unsigned char U = static_cast<unsigned char>(Ch);
+  return std::isalnum(U) || Ch == '_' || U >= 0x80;
+}
+static unsigned char hintMove(EditLine *EL, int Steps, int Words) {
+  LineEditor::InternalData *Data;
+  if (el_get(EL, EL_CLIENTDATA, &Data) != 0)
+    return CC_ERROR;
+  const LineInfo *LI = ::el_line(EL);
+  const char *At = LI->cursor;
+  if (Words < 0) {
+    while (At > LI->buffer && !isWordChar(At[-1]))
+      --At;
+    while (At > LI->buffer && isWordChar(At[-1]))
+      --At;
+  } else if (Words > 0) {
+    while (At < LI->lastchar && !isWordChar(*At))
+      ++At;
+    while (At < LI->lastchar && isWordChar(*At))
+      ++At;
+  } else {
+    At += Steps;
+    if (At < LI->buffer)
+      At = LI->buffer;
+    if (At > LI->lastchar)
+      At = LI->lastchar;
+  }
+  ::el_cursor(EL, static_cast<int>(At - LI->cursor));
+  refreshHint(EL, Data);
+  return CC_REFRESH;
+}
+unsigned char ElHintLeftFn(EditLine *EL, int) { return hintMove(EL, -1, 0); }
+unsigned char ElHintRightFn(EditLine *EL, int) { return hintMove(EL, 1, 0); }
+unsigned char ElHintWordLeftFn(EditLine *EL, int) { return hintMove(EL, 0, -1); }
+unsigned char ElHintWordRightFn(EditLine *EL, int) { return hintMove(EL, 0, 1); }
 
 // Enter: the hint taken off the line, then libedit's own newline. The line
 // is drawn again without the hint (CC_REFRESH), and ed-newline -- bound to
@@ -411,12 +450,20 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
   ::el_set(Data->EL, EL_BIND, "^M", "hint_enter", NULL);
   ::el_set(Data->EL, EL_BIND, "^J", "hint_enter", NULL);
   ::el_set(Data->EL, EL_BIND, "^X^J", "ed-newline", NULL);
-  // Ctrl+Left, Ctrl+Right: a word back, a word on -- as xterm and rxvt send
-  // them.
+  // The arrows, and Ctrl+Left, Ctrl+Right -- a word back, a word on, as
+  // xterm and rxvt send them -- moving the cursor and the hint with it.
+  ::el_set(Data->EL, EL_ADDFN, "hint_left", "Left, then hint", ElHintLeftFn);
+  ::el_set(Data->EL, EL_ADDFN, "hint_right", "Right, then hint", ElHintRightFn);
+  ::el_set(Data->EL, EL_ADDFN, "hint_word_left", "A word back, then hint", ElHintWordLeftFn);
+  ::el_set(Data->EL, EL_ADDFN, "hint_word_right", "A word on, then hint", ElHintWordRightFn);
+  for (const char *Key : {"\\e[D", "\\eOD"})
+    ::el_set(Data->EL, EL_BIND, Key, "hint_left", NULL);
+  for (const char *Key : {"\\e[C", "\\eOC"})
+    ::el_set(Data->EL, EL_BIND, Key, "hint_right", NULL);
   for (const char *Key : {"\\e[1;5D", "\\e[5D", "\\eOd", "\\e\\e[D"})
-    ::el_set(Data->EL, EL_BIND, Key, "ed-prev-word", NULL);
+    ::el_set(Data->EL, EL_BIND, Key, "hint_word_left", NULL);
   for (const char *Key : {"\\e[1;5C", "\\e[5C", "\\eOc", "\\e\\e[C"})
-    ::el_set(Data->EL, EL_BIND, Key, "em-next-word", NULL);
+    ::el_set(Data->EL, EL_BIND, Key, "hint_word_right", NULL);
   ::el_set(Data->EL, EL_BIND, "^r", "em-inc-search-prev",
            NULL); // Cycle through backwards search, entering string
   ::el_set(Data->EL, EL_BIND, "^w", "ed-delete-prev-word",
