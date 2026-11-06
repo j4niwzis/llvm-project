@@ -545,7 +545,10 @@ llvm::Expected<Expr *> Interpreter::convertExprToValue(Expr *E) {
     if (EWC)
       return ExprWithCleanups::Create(Ctx, R, EWC->cleanupsHaveSideEffects(),
                                       EWC->getObjects());
-    return S.MaybeCreateExprWithCleanups(R);
+    // None before, but the rewrite may have made temporaries of its own (a
+    // command called on its own, `git`): a scope for them all the same --
+    // one without temporaries costs nothing.
+    return ExprWithCleanups::Create(Ctx, R, /*CleanupsHaveSideEffects=*/true, {});
   };
 
   if (Ctx.getLangOpts().CPlusPlus && E) {
