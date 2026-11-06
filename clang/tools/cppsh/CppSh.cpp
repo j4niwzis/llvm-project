@@ -441,7 +441,7 @@ struct ReplListCompleter {
       if (Slash != llvm::StringRef::npos) {
         DirPrefix = PathTok.substr(0, Slash + 1).str();
         FilePrefix = PathTok.substr(Slash + 1);
-        if (DirPrefix.starts_with("~/")) {
+        if (llvm::StringRef(DirPrefix).starts_with("~/")) {
           if (const char *H = std::getenv("HOME"))
             DirToScan = std::string(H) + DirPrefix.substr(1);
           else
