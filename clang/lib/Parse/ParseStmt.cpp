@@ -2724,7 +2724,8 @@ StmtResult Parser::ParseForStatement(SourceLocation *TrailingElseLoc,
     if (!ForRangeInfo.ExpansionStmt)
       ForRangeInfo.LoopVar =
           Actions.ActOnCXXForRangeIdentifier(getCurScope(), Loc, Name, attrs);
-  } else if (isForInitDeclaration()) {  // for (int X = 4;
+  } else if (isImplicitAutoDeclaration() ||
+             isForInitDeclaration()) { // for (int X = 4; -- cppsh: for (i = 0;
     ParenBraceBracketBalancer BalancerRAIIObj(*this);
     ExpansionStmtContextRAII EnterParentContext{
         Actions, ForRangeInfo, Actions.CurContext->getParent()};

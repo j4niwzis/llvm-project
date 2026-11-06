@@ -47,6 +47,7 @@ using namespace clang;
 
 namespace clang {
 extern bool CppshCutNeeded;
+extern const FunctionDecl *CppshCutNeedFunction;
 } // namespace clang
 using namespace sema;
 
@@ -3947,7 +3948,9 @@ bool Sema::DeduceFunctionTypeFromReturnExpr(FunctionDecl *FD,
   // parser drops it for the cut's own return: the function's type is not
   // deduced from it (deduced from an expression of no type, it stayed
   // dependent, and code generation of the function crashed).
-  if (CppshCutNeeded)
+  // Only that function: what is instantiated while the rest of the statement
+  // is checked (`ls o | take 2`: take) is deduced as ever.
+  if (CppshCutNeeded && FD == CppshCutNeedFunction)
     return false;
 
   if (isa_and_nonnull<InitListExpr>(RetExpr)) {

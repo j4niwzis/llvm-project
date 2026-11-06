@@ -112,6 +112,9 @@ SourceLocation CppshStageAt;
 bool CppshCutNeeded = false;
 // The local whose value the need is for; none for a staged call.
 const VarDecl *CppshCutNeedVar = nullptr;
+// The function the need arose in: the one whose type is not deduced from
+// the return the cut replaces (SemaStmt).
+const FunctionDecl *CppshCutNeedFunction = nullptr;
 std::set<const FunctionDecl *> CppshCutFunctions;
 std::vector<std::string> CppshCutRemainders;
 // Per cut: where it was made in a loop, the loop run on from its next step,
@@ -7225,6 +7228,7 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
           Cur && !Cur->isDependentContext()) {
         CppshCutNeeded = true; // its caller's body cut here too
         CppshCutNeedVar = nullptr;
+        CppshCutNeedFunction = Cur;
       } else if (!CppshInHoist && !CppshStageAt.isValid()) {
         CppshStageAt = CE->getBeginLoc(); // a top-level statement: hoisted
         CppshHoistBegin = CE->getBeginLoc();
@@ -8014,6 +8018,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                       cppshInUserInput(*this, getCurFunctionDecl()->getLocation())) {
                     CppshCutNeeded = true;
                     CppshCutNeedVar = VD;
+                    CppshCutNeedFunction = getCurFunctionDecl();
                     CppshCutHere = true;
                     continue;
                   }
