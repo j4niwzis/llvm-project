@@ -1748,7 +1748,7 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
                           /*IsReinject=*/true);
       ConsumeAnyToken(/*ConsumeCodeCompletionTok=*/true);
       return ParseCastExpression(ParseKind, isAddressOfOperand, NotCastExpr,
-                                 isTypeCast, isVectorLiteral,
+                                 CorrectionBehavior, isVectorLiteral,
                                  NotPrimaryExpression);
     }
     Res = ParseBlockLiteralExpression();
@@ -1829,7 +1829,7 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
                             /*IsReinject=*/true);
         ConsumeAnyToken(/*ConsumeCodeCompletionTok=*/true);
         return ParseCastExpression(ParseKind, isAddressOfOperand, NotCastExpr,
-                                   isTypeCast, isVectorLiteral,
+                                   CorrectionBehavior, isVectorLiteral,
                                    NotPrimaryExpression);
       }
       if (getLangOpts().ObjC) {

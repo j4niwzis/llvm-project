@@ -790,6 +790,7 @@ void free(void *);
 void *memcpy(void *, const void *, unsigned long);
 void *fopen(const char *, const char *);
 int fclose(void *);
+char *fgets(char *, int, void *);
 unsigned long fread(void *, unsigned long, unsigned long, void *);
 unsigned long fwrite(const void *, unsigned long, unsigned long, void *);
 char *getenv(const char *);
@@ -1360,18 +1361,55 @@ void print(const T &v) {
 namespace ranges {
 namespace views {
 
+struct __cppsh_sentinel {};
+
+template <typename Rng, typename Pred>
+struct filter_view {
+  Rng rng;
+  Pred pred;
+
+  template <typename It, typename EndIt>
+  struct iterator {
+    It cur;
+    EndIt end;
+    const Pred *pred;
+    void skip() {
+      while (cur != end && !(*pred)(*cur))
+        ++cur;
+    }
+    decltype(auto) operator*() const { return *cur; }
+    iterator &operator++() {
+      ++cur;
+      skip();
+      return *this;
+    }
+    bool operator!=(__cppsh_sentinel) const { return cur != end; }
+    bool operator==(__cppsh_sentinel) const { return !(cur != end); }
+  };
+
+  auto begin() {
+    auto b = rng.begin();
+    auto e = rng.end();
+    iterator<decltype(b), decltype(e)> it{b, e, &pred};
+    it.skip();
+    return it;
+  }
+  auto begin() const {
+    auto b = rng.begin();
+    auto e = rng.end();
+    iterator<decltype(b), decltype(e)> it{b, e, &pred};
+    it.skip();
+    return it;
+  }
+  constexpr __cppsh_sentinel end() const noexcept { return {}; }
+};
+
 template <typename Pred>
 struct cppsh_filter_stage {
   Pred pred;
   template <typename Rng>
-  friend auto operator|(Rng &&rng, const cppsh_filter_stage &s) {
-    using RawElem = decltype(*rng.begin());
-    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
-    cppsh_vec<ElemT> out;
-    for (auto &&item : rng)
-      if (s.pred(item))
-        out.push_back(item);
-    return out;
+  friend constexpr auto operator|(Rng &&rng, const cppsh_filter_stage &s) {
+    return filter_view<Rng, Pred>{static_cast<Rng &&>(rng), s.pred};
   }
 };
 template <typename Pred>
@@ -1379,53 +1417,133 @@ constexpr auto filter(Pred p) {
   return cppsh_filter_stage<Pred>{p};
 }
 
+template <typename Rng>
+struct take_view {
+  Rng rng;
+  unsigned long n;
+
+  template <typename It, typename EndIt>
+  struct iterator {
+    It cur;
+    EndIt end;
+    unsigned long rem;
+    decltype(auto) operator*() const { return *cur; }
+    iterator &operator++() {
+      if (rem > 0) {
+        --rem;
+        if (rem > 0)
+          ++cur;
+      }
+      return *this;
+    }
+    bool operator!=(__cppsh_sentinel) const { return rem > 0 && cur != end; }
+    bool operator==(__cppsh_sentinel) const { return !(*this != __cppsh_sentinel{}); }
+  };
+
+  auto begin() {
+    auto b = rng.begin();
+    auto e = rng.end();
+    return iterator<decltype(b), decltype(e)>{b, e, n};
+  }
+  auto begin() const {
+    auto b = rng.begin();
+    auto e = rng.end();
+    return iterator<decltype(b), decltype(e)>{b, e, n};
+  }
+  constexpr __cppsh_sentinel end() const noexcept { return {}; }
+};
+
 struct cppsh_take_stage {
   unsigned long n;
   template <typename Rng>
-  friend auto operator|(Rng &&rng, const cppsh_take_stage &s) {
-    using RawElem = decltype(*rng.begin());
-    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
-    cppsh_vec<ElemT> out;
-    unsigned long i = 0;
-    for (auto &&item : rng) {
-      if (i++ >= s.n)
-        break;
-      out.push_back(item);
-    }
-    return out;
+  friend constexpr auto operator|(Rng &&rng, const cppsh_take_stage &s) {
+    return take_view<Rng>{static_cast<Rng &&>(rng), s.n};
   }
 };
 inline constexpr auto take(unsigned long n) { return cppsh_take_stage{n}; }
 
+template <typename Rng>
+struct drop_view {
+  Rng rng;
+  unsigned long n;
+
+  template <typename It, typename EndIt>
+  struct iterator {
+    It cur;
+    EndIt end;
+    decltype(auto) operator*() const { return *cur; }
+    iterator &operator++() {
+      ++cur;
+      return *this;
+    }
+    bool operator!=(__cppsh_sentinel) const { return cur != end; }
+    bool operator==(__cppsh_sentinel) const { return !(cur != end); }
+  };
+
+  auto begin() {
+    auto b = rng.begin();
+    auto e = rng.end();
+    for (unsigned long i = 0; i < n && b != e; ++i)
+      ++b;
+    return iterator<decltype(b), decltype(e)>{b, e};
+  }
+  auto begin() const {
+    auto b = rng.begin();
+    auto e = rng.end();
+    for (unsigned long i = 0; i < n && b != e; ++i)
+      ++b;
+    return iterator<decltype(b), decltype(e)>{b, e};
+  }
+  constexpr __cppsh_sentinel end() const noexcept { return {}; }
+};
+
 struct cppsh_drop_stage {
   unsigned long n;
   template <typename Rng>
-  friend auto operator|(Rng &&rng, const cppsh_drop_stage &s) {
-    using RawElem = decltype(*rng.begin());
-    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
-    cppsh_vec<ElemT> out;
-    unsigned long i = 0;
-    for (auto &&item : rng) {
-      if (i++ < s.n)
-        continue;
-      out.push_back(item);
-    }
-    return out;
+  friend constexpr auto operator|(Rng &&rng, const cppsh_drop_stage &s) {
+    return drop_view<Rng>{static_cast<Rng &&>(rng), s.n};
   }
 };
 inline constexpr auto drop(unsigned long n) { return cppsh_drop_stage{n}; }
+
+template <typename Rng, typename Fn>
+struct transform_view {
+  Rng rng;
+  Fn fn;
+
+  template <typename It, typename EndIt>
+  struct iterator {
+    It cur;
+    EndIt end;
+    const Fn *fn;
+    decltype(auto) operator*() const { return (*fn)(*cur); }
+    iterator &operator++() {
+      ++cur;
+      return *this;
+    }
+    bool operator!=(__cppsh_sentinel) const { return cur != end; }
+    bool operator==(__cppsh_sentinel) const { return !(cur != end); }
+  };
+
+  auto begin() {
+    auto b = rng.begin();
+    auto e = rng.end();
+    return iterator<decltype(b), decltype(e)>{b, e, &fn};
+  }
+  auto begin() const {
+    auto b = rng.begin();
+    auto e = rng.end();
+    return iterator<decltype(b), decltype(e)>{b, e, &fn};
+  }
+  constexpr __cppsh_sentinel end() const noexcept { return {}; }
+};
 
 template <typename Fn>
 struct cppsh_transform_stage {
   Fn fn;
   template <typename Rng>
-  friend auto operator|(Rng &&rng, const cppsh_transform_stage &s) {
-    using RawElem = decltype(s.fn(*rng.begin()));
-    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
-    cppsh_vec<ElemT> out;
-    for (auto &&item : rng)
-      out.push_back(s.fn(item));
-    return out;
+  friend constexpr auto operator|(Rng &&rng, const cppsh_transform_stage &s) {
+    return transform_view<Rng, Fn>{static_cast<Rng &&>(rng), s.fn};
   }
 };
 template <typename Fn>
@@ -1458,37 +1576,39 @@ constexpr auto sort_by(Proj p) {
   return cppsh_sort_stage<Proj>{p};
 }
 
+struct __cppsh_grep_pred {
+  cppsh_str pat;
+  template <typename Item>
+  bool operator()(const Item &item) const {
+    const char *p = pat.c_str();
+    if constexpr (requires { item.text; })
+      return item.text.contains(p);
+    else if constexpr (requires { item.name; })
+      return item.name.contains(p);
+    else if constexpr (requires { item.c_str(); })
+      return strstr(item.c_str(), p) != nullptr;
+    else
+      return false;
+  }
+};
+
 struct cppsh_grep_stage {
-  const char *pat;
+  cppsh_str pat;
   template <typename Rng>
-  friend auto operator|(Rng &&rng, const cppsh_grep_stage &g) {
-    using RawElem = decltype(*rng.begin());
-    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
-    cppsh_vec<ElemT> out;
-    for (auto &&item : rng) {
-      if constexpr (requires { item.text; }) {
-        if (item.text.contains(g.pat))
-          out.push_back(item);
-      } else if constexpr (requires { item.name; }) {
-        if (item.name.contains(g.pat))
-          out.push_back(item);
-      } else if constexpr (requires { item.c_str(); }) {
-        if (strstr(item.c_str(), g.pat) != nullptr)
-          out.push_back(item);
-      }
-    }
-    return out;
+  friend constexpr auto operator|(Rng &&rng, const cppsh_grep_stage &g) {
+    return filter_view<Rng, __cppsh_grep_pred>{static_cast<Rng &&>(rng),
+                                               __cppsh_grep_pred{g.pat}};
   }
 };
 template <typename Pat>
-constexpr auto grep(const Pat &p) {
-  return cppsh_grep_stage{__cppsh_cstr(p)};
+inline auto grep(const Pat &p) {
+  return cppsh_grep_stage{cppsh_str(__cppsh_cstr(p))};
 }
 
 struct cppsh_print_stage {
   template <typename Rng>
   friend void operator|(Rng &&rng, const cppsh_print_stage &) {
-    for (const auto &item : rng) {
+    for (auto &&item : rng) {
       if constexpr (requires { item.dump(); })
         item.dump();
       else
@@ -1601,34 +1721,93 @@ inline cppsh_str read_file(const Path &p) {
   return out;
 }
 
-template <typename Path>
-inline cppsh_vec<line_entry> read_lines(const Path &p) {
-  cppsh_vec<line_entry> out;
-  cppsh_str content = read_file(p);
-  if (content.empty())
-    return out;
-  const char *s = content.c_str();
-  unsigned long len = static_cast<unsigned long>(content.size());
-  unsigned long start = 0;
-  long long line_no = 1;
-  for (unsigned long i = 0; i <= len; ++i) {
-    if (i == len || s[i] == '\n') {
-      if (i == len && start == len)
-        break;
-      unsigned long end = i;
-      if (end > start && s[end - 1] == '\r')
-        --end;
-      unsigned long lsize = end - start;
-      out.push_back({line_no++, cppsh_str(s + start, lsize),
-                     static_cast<long long>(lsize)});
-      start = i + 1;
+struct lines_view {
+  cppsh_str path;
+
+  struct iterator {
+    mutable void *fp = nullptr;
+    long long line_no = 0;
+    line_entry cur{};
+    bool at_end = true;
+
+    iterator() = default;
+    explicit iterator(const char *p) {
+      fp = p ? fopen(p, "rb") : nullptr;
+      if (fp) {
+        at_end = false;
+        next();
+      }
     }
-  }
-  return out;
+    iterator(const iterator &o)
+        : fp(o.fp), line_no(o.line_no), cur(o.cur), at_end(o.at_end) {
+      o.fp = nullptr;
+    }
+    iterator(iterator &&o) noexcept
+        : fp(o.fp), line_no(o.line_no),
+          cur(static_cast<line_entry &&>(o.cur)), at_end(o.at_end) {
+      o.fp = nullptr;
+      o.at_end = true;
+    }
+    ~iterator() {
+      if (fp)
+        fclose(static_cast<FILE *>(fp));
+    }
+
+    void next() {
+      if (!fp) {
+        at_end = true;
+        return;
+      }
+      cppsh_str line;
+      char buf[1024];
+      bool got_any = false;
+      while (fgets(buf, sizeof(buf), static_cast<FILE *>(fp))) {
+        got_any = true;
+        unsigned long n = strlen(buf);
+        bool has_nl = (n > 0 && buf[n - 1] == '\n');
+        if (has_nl)
+          --n;
+        if (n > 0 && buf[n - 1] == '\r')
+          --n;
+        line.append(buf, n);
+        if (has_nl)
+          break;
+      }
+      if (!got_any) {
+        fclose(static_cast<FILE *>(fp));
+        fp = nullptr;
+        at_end = true;
+        return;
+      }
+      ++line_no;
+      long long sz = line.size();
+      cur = line_entry{line_no, static_cast<cppsh_str &&>(line), sz};
+    }
+
+    const line_entry &operator*() const noexcept { return cur; }
+    iterator &operator++() {
+      next();
+      return *this;
+    }
+    bool operator!=(ranges::views::__cppsh_sentinel) const noexcept {
+      return !at_end;
+    }
+    bool operator==(ranges::views::__cppsh_sentinel) const noexcept {
+      return at_end;
+    }
+  };
+
+  iterator begin() const { return iterator(path.c_str()); }
+  constexpr ranges::views::__cppsh_sentinel end() const noexcept { return {}; }
+};
+
+template <typename Path>
+inline lines_view read_lines(const Path &p) {
+  return lines_view{cppsh_str(__cppsh_cstr(p))};
 }
 
 template <typename Path>
-inline cppsh_vec<line_entry> lines(const Path &p) {
+inline lines_view lines(const Path &p) {
   return read_lines(p);
 }
 
@@ -1664,46 +1843,106 @@ inline bool file_exists(const Path &p) {
   return stat(__cppsh_cstr(p), stbuf) == 0;
 }
 
-inline cppsh_vec<file_entry> ls(const char *dir = ".", ls_opts opts = {}) {
+struct ls_view {
+  cppsh_str dir;
+  ls_opts opts;
+
+  struct iterator {
+    mutable void *d = nullptr;
+    cppsh_str dir;
+    ls_opts opts;
+    file_entry cur{};
+    bool at_end = true;
+
+    iterator() = default;
+    iterator(const cppsh_str &dir_in, ls_opts opts_in)
+        : dir(dir_in), opts(opts_in) {
+      d = opendir(dir.c_str());
+      if (d) {
+        at_end = false;
+        next();
+      }
+    }
+    iterator(const iterator &o)
+        : d(o.d), dir(o.dir), opts(o.opts), cur(o.cur), at_end(o.at_end) {
+      o.d = nullptr;
+    }
+    iterator(iterator &&o) noexcept
+        : d(o.d), dir(static_cast<cppsh_str &&>(o.dir)), opts(o.opts),
+          cur(static_cast<file_entry &&>(o.cur)), at_end(o.at_end) {
+      o.d = nullptr;
+      o.at_end = true;
+    }
+    ~iterator() {
+      if (d)
+        closedir(d);
+    }
+
+    void next() {
+      while (d) {
+        __cppsh_dirent *de = readdir(d);
+        if (!de) {
+          closedir(d);
+          d = nullptr;
+          at_end = true;
+          return;
+        }
+        const char *fname = de->d_name;
+        if (strcmp(fname, ".") == 0 || strcmp(fname, "..") == 0)
+          continue;
+        if (!opts.all && fname[0] == '.')
+          continue;
+        bool isDir = (de->d_type == 4);
+        char fullpath[1024];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", dir.c_str(), fname);
+        alignas(8) unsigned char stbuf[256] = {0};
+        long long fsize = 0;
+        if (stat(fullpath, stbuf) == 0) {
+          unsigned int mode = *reinterpret_cast<unsigned int *>(stbuf + 24);
+          isDir = ((mode & 0170000) == 0040000);
+          if (!isDir)
+            fsize = *reinterpret_cast<long long *>(stbuf + 48);
+        }
+        if (opts.dirs_only && !isDir)
+          continue;
+        if (opts.files_only && isDir)
+          continue;
+        const char *dot = nullptr;
+        for (const char *p = fname; *p; ++p)
+          if (*p == '.')
+            dot = p;
+        cur = file_entry{cppsh_str(fname), cppsh_str(dot ? dot : ""), fsize,
+                         isDir};
+        return;
+      }
+      at_end = true;
+    }
+
+    const file_entry &operator*() const noexcept { return cur; }
+    iterator &operator++() {
+      next();
+      return *this;
+    }
+    bool operator!=(ranges::views::__cppsh_sentinel) const noexcept {
+      return !at_end;
+    }
+    bool operator==(ranges::views::__cppsh_sentinel) const noexcept {
+      return at_end;
+    }
+  };
+
+  iterator begin() const { return iterator(dir, opts); }
+  constexpr ranges::views::__cppsh_sentinel end() const noexcept { return {}; }
+};
+
+inline ls_view ls(const char *dir = ".", ls_opts opts = {}) {
   if (dir && dir[0] == '-') {
     for (const char *p = dir + 1; *p; ++p)
       if (*p == 'a')
         opts.all = true;
     dir = ".";
   }
-  cppsh_vec<file_entry> out;
-  void *d = opendir(dir);
-  if (!d)
-    return out;
-  while (__cppsh_dirent *de = readdir(d)) {
-    const char *fname = de->d_name;
-    if (strcmp(fname, ".") == 0 || strcmp(fname, "..") == 0)
-      continue;
-    if (!opts.all && fname[0] == '.')
-      continue;
-    bool isDir = (de->d_type == 4);
-    char fullpath[1024];
-    snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, fname);
-    alignas(8) unsigned char stbuf[256] = {0};
-    long long fsize = 0;
-    if (stat(fullpath, stbuf) == 0) {
-      unsigned int mode = *reinterpret_cast<unsigned int *>(stbuf + 24);
-      isDir = ((mode & 0170000) == 0040000);
-      if (!isDir)
-        fsize = *reinterpret_cast<long long *>(stbuf + 48);
-    }
-    if (opts.dirs_only && !isDir)
-      continue;
-    if (opts.files_only && isDir)
-      continue;
-    const char *dot = nullptr;
-    for (const char *p = fname; *p; ++p)
-      if (*p == '.')
-        dot = p;
-    out.push_back({cppsh_str(fname), cppsh_str(dot ? dot : ""), fsize, isDir});
-  }
-  closedir(d);
-  return out;
+  return ls_view{cppsh_str(dir ? dir : "."), opts};
 }
 
 template <typename Path>

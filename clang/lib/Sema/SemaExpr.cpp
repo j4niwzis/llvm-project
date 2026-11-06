@@ -7437,8 +7437,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                   ArrVD->setInitStyle(VarDecl::ListInit);
                   Context.getTranslationUnitDecl()->addDecl(ArrVD);
                   MemPtrExpr =
-                      BuildDeclRefExpr(ArrVD, ArrTy, VK_LValue, LParenLoc)
-                          .get();
+                      BuildDeclRefExpr(ArrVD, ArrTy, VK_LValue, LParenLoc);
                 }
               }
             }
