@@ -933,6 +933,40 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
   // diagnose them.
   bool AllowSuffix = true;
 
+  // cppsh: a path as an expression's first word, in what the user typed --
+  // `./a.out`, `/bin/ls`, `~/bin/tool` -- the symbol of the path as written
+  // (operator_unresolved): run with the words after it as a command is. No
+  // C++ expression starts so (a `.` or a `/`; `~` followed by `/`).
+  if (PP.isIncrementalProcessingEnabled() && !PP.isBacktrackEnabled() &&
+      (Tok.isOneOf(tok::period, tok::slash) ||
+       (Tok.is(tok::tilde) && NextToken().is(tok::slash))) &&
+      !NextToken().hasLeadingSpace() &&
+      PP.getSourceManager()
+          .getBufferName(PP.getSourceManager().getFileLoc(Tok.getLocation()))
+          .starts_with("input_line_")) {
+    unsigned Glued = 0;
+    for (;;) {
+      const Token &Next = GetLookAheadToken(Glued + 1);
+      if (Next.hasLeadingSpace() || Next.isAtStartOfLine() ||
+          Next.isOneOf(tok::eof, tok::semi, tok::pipe, tok::pipepipe, tok::ampamp,
+                       tok::r_paren, tok::r_brace, tok::comma))
+        break;
+      ++Glued;
+    }
+    SourceLocation Begin = Tok.getLocation();
+    SourceLocation Last = GetLookAheadToken(Glued).getLocation();
+    std::string Word =
+        Lexer::getSourceText(CharSourceRange::getTokenRange(Begin, Last),
+                             PP.getSourceManager(), getLangOpts())
+            .str();
+    for (unsigned I = 0; I <= Glued; ++I)
+      ConsumeAnyToken();
+    ExprResult Sym = Actions.BuildOperatorUnresolvedCall(getCurScope(), Begin, Word);
+    if (!Sym.isUsable())
+      return ExprError();
+    return Sym;
+  }
+
   // This handles all of cast-expression, unary-expression, postfix-expression,
   // and primary-expression.  We handle them together like this for efficiency
   // and to simplify handling of an expression starting with a '(' token: which

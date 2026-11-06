@@ -1422,6 +1422,22 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   CppshLastResult = "__cppsh_res" + Tag;
 }
 
+// Diagnostics held back while an input is compiled, kept whole -- location,
+// ranges, fix-its, notes in their order -- and given as they came where the
+// compilation stands (a TextDiagnosticBuffer kept only a location and a
+// message, and the errors came out without where they were).
+namespace {
+class HeldDiagnostics : public DiagnosticConsumer {
+public:
+  std::vector<StoredDiagnostic> All;
+  void HandleDiagnostic(DiagnosticsEngine::Level Level,
+                        const Diagnostic &Info) override {
+    DiagnosticConsumer::HandleDiagnostic(Level, Info);
+    All.emplace_back(Level, Info);
+  }
+};
+} // namespace
+
 // Staged: an input is compiled whole, its diagnostics held back. Where the
 // value specialization needed the value of a variable this same input
 // defines (CppshStageAt), that PTU is dropped -- nothing of it ran -- and the
@@ -1443,7 +1459,7 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
     std::unique_ptr<DiagnosticConsumer> Owned;
     if (Owns)
       Owned = Diags.takeClient();
-    TextDiagnosticBuffer Held;
+    HeldDiagnostics Held;
     Diags.setClient(&Held, /*ShouldOwnClient=*/false);
 
     CppshStageAt = SourceLocation();
@@ -1478,7 +1494,8 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
 
     if (Split == 0) {
       // As it was compiled: its diagnostics, then it runs.
-      Held.FlushDiagnostics(Diags);
+      for (const StoredDiagnostic &D : Held.All)
+        Diags.Report(D);
       Diags.Reset(/*soft=*/true);
       if (!PTU)
         return PTU.takeError();
