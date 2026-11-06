@@ -152,7 +152,32 @@ void refreshHint(EditLine *EL, LineEditor::InternalData *Data) {
   const LineInfo *LI = ::el_line(EL);
   Data->LE->updateHint(StringRef(LI->buffer, LI->lastchar - LI->buffer),
                        LI->cursor - LI->buffer);
-  const std::string &Hint = Data->LE->getHint();
+  std::string Hint = Data->LE->getHint();
+  // Only what fits beside the line: libedit cuts a right prompt that does
+  // not, its colour's reset with it, and the rest of the line came out dim.
+  // Its width: the terminal's, less the prompt's and the line's, and a gap.
+  size_t Cols = 80;
+#if !defined(_WIN32)
+  struct winsize WS;
+  if (::ioctl(fileno(Data->Out), TIOCGWINSZ, &WS) == 0 && WS.ws_col > 0)
+    Cols = WS.ws_col;
+#endif
+  size_t Used = 0;
+  bool InMark = false;
+  for (char Ch : Data->LE->getPrompt()) {
+    if (Ch == '\001') {
+      InMark = !InMark;
+      continue;
+    }
+    if (!InMark && (static_cast<unsigned char>(Ch) & 0xC0) != 0x80)
+      ++Used;
+  }
+  for (const char *P = LI->buffer; P < LI->lastchar; ++P)
+    if ((static_cast<unsigned char>(*P) & 0xC0) != 0x80)
+      ++Used;
+  size_t Room = Cols > Used + 4 ? Cols - Used - 4 : 0;
+  if (Hint.size() > Room)
+    Hint = Room > 8 ? Hint.substr(0, Room - 3) + "..." : std::string();
   Data->RPrompt = Hint.empty() ? std::string()
                                : "\001\033[90m\001 " + Hint + "\001\033[0m\001";
 }

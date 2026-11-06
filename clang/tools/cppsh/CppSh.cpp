@@ -360,8 +360,11 @@ static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
   }
   while (::waitpid(Child, nullptr, 0) < 0 && errno == EINTR) {
   }
-  if (Hint.size() > 60)
-    Hint = Hint.substr(0, 57) + "...";
+  // Names as the shell's user writes them: without std::sh:: and std::.
+  for (llvm::StringRef Scope : {"std::sh::", "std::ranges::", "std::"}) {
+    for (size_t At; (At = Hint.find(Scope.str())) != std::string::npos;)
+      Hint.erase(At, Scope.size());
+  }
   LastHint = Hint;
   return Hint;
 #endif
