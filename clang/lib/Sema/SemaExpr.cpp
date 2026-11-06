@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/AST/QualTypeNames.h"
 #include "CheckExprLifetime.h"
 #include "TreeTransform.h"
 #include "UsedDeclVisitor.h"
@@ -125,6 +126,93 @@ static bool cppshInUserInput(Sema &S, SourceLocation L) {
     return false;
   SourceManager &SM = S.getSourceManager();
   return SM.getBufferName(SM.getFileLoc(L)).starts_with("input_line_");
+}
+
+// std::sh::<Name>, as an expression to call.
+static ExprResult cppshShCallee(Sema &S, StringRef Name, SourceLocation Loc) {
+  NamespaceDecl *Std = S.getStdNamespace();
+  if (!Std)
+    return ExprError();
+  Preprocessor &PP = S.getPreprocessor();
+  LookupResult ShR(S, &PP.getIdentifierTable().get("sh"), Loc, Sema::LookupNamespaceName);
+  S.LookupQualifiedName(ShR, Std);
+  auto *Sh = ShR.getAsSingle<NamespaceDecl>();
+  if (!Sh)
+    return ExprError();
+  LookupResult R(S, &PP.getIdentifierTable().get(Name), Loc, Sema::LookupOrdinaryName);
+  S.LookupQualifiedName(R, Sh);
+  if (R.empty())
+    return ExprError();
+  CXXScopeSpec SS;
+  return S.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
+}
+
+// Whether a compound statement being instantiated is the body of a function
+// instantiated from what the user typed (`f(auto d) = {...}`): cut, as the
+// parser cuts a body, where a statement needs what only running it gives --
+// the parser has long finished with it (TreeTransform::TransformCompoundStmt).
+bool cppshCutsInstantiatedBody(Sema &S, const CompoundStmt *Body) {
+  FunctionDecl *FD = S.getCurFunctionDecl();
+  if (!FD || !FD->isTemplateInstantiation() || isLambdaCallOperator(FD))
+    return false;
+  const FunctionDecl *Pattern = FD->getTemplateInstantiationPattern();
+  return Pattern && Pattern->getBody() == Body && cppshInUserInput(S, FD->getLocation());
+}
+
+// The cut of an instantiated body at its statement At: the rest as written
+// kept for the continuation; the parameters and the locals instantiated so
+// far handed over, by their instantiated types; the function returning
+// through std::sh::__cppsh_cut.
+void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
+                           SmallVectorImpl<Stmt *> &Statements) {
+  FunctionDecl *FD = S.getCurFunctionDecl();
+  SourceManager &SM = S.getSourceManager();
+  SourceLocation Loc = At->getBeginLoc();
+  StringRef Rest = Lexer::getSourceText(
+      CharSourceRange::getCharRange(Loc, Body->getRBracLoc()), SM, S.getLangOpts());
+  SmallVector<VarDecl *, 8> Live;
+  for (ParmVarDecl *P : FD->parameters())
+    if (P->getIdentifier())
+      Live.push_back(P);
+  for (Stmt *St : Statements)
+    if (auto *DS = dyn_cast<DeclStmt>(St))
+      for (Decl *D : DS->decls())
+        if (auto *VD = dyn_cast<VarDecl>(D);
+            VD && VD->hasLocalStorage() && VD->getIdentifier())
+          Live.push_back(VD);
+  std::vector<std::string> Names, Types;
+  PrintingPolicy Policy(S.Context.getLangOpts());
+  for (VarDecl *VD : Live) {
+    Names.push_back(VD->getName().str());
+    Types.push_back(TypeName::getFullyQualifiedName(
+        VD->getType().getNonReferenceType().getUnqualifiedType(), S.Context, Policy,
+        /*WithGlobalNsPrefix=*/true));
+  }
+  unsigned Id = CppshCutRemainders.size();
+  CppshCutRemainders.push_back(Rest.str());
+  CppshCutLocalNames.push_back(std::move(Names));
+  CppshCutLocalTypes.push_back(std::move(Types));
+  CppshCutFunctions.insert(FD->getCanonicalDecl());
+  ExprResult Frame = cppshShCallee(S, "__cppsh_frame", Loc);
+  ExprResult Cut = cppshShCallee(S, "__cppsh_cut", Loc);
+  if (!Frame.isUsable() || !Cut.isUsable())
+    return;
+  SmallVector<Expr *, 8> Refs;
+  for (VarDecl *VD : Live)
+    Refs.push_back(S.BuildDeclRefExpr(VD, VD->getType().getNonReferenceType(),
+                                      VK_LValue, Loc));
+  ExprResult FrameCall = S.BuildCallExpr(nullptr, Frame.get(), Loc, Refs, Loc);
+  if (!FrameCall.isUsable())
+    return;
+  Expr *IdLit = IntegerLiteral::Create(S.Context, llvm::APInt(32, Id),
+                                       S.Context.UnsignedIntTy, Loc);
+  Expr *CutArgs[2] = {IdLit, FrameCall.get()};
+  ExprResult CutCall = S.BuildCallExpr(nullptr, Cut.get(), Loc, CutArgs, Loc);
+  if (!CutCall.isUsable())
+    return;
+  StmtResult Ret = S.BuildReturnStmt(Loc, CutCall.get());
+  if (Ret.isUsable())
+    Statements.push_back(Ret.get());
 }
 } // namespace clang
 
@@ -7882,8 +7970,12 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                   if (VD->hasLocalStorage() && getCurFunctionDecl() &&
                       !isLambdaCallOperator(getCurFunctionDecl()) &&
                       !getCurFunctionDecl()->isDependentContext() &&
-                      !getCurFunctionDecl()->isTemplateInstantiation() &&
-                      CodeSynthesisContexts.empty() &&
+                      (CodeSynthesisContexts.empty()
+                           ? !getCurFunctionDecl()->isTemplateInstantiation()
+                           : (CodeSynthesisContexts.back().Kind ==
+                                  CodeSynthesisContext::TemplateInstantiation &&
+                              CodeSynthesisContexts.back().Entity ==
+                                  getCurFunctionDecl())) &&
                       VD->getParentFunctionOrMethod() == getCurFunctionDecl() &&
                       !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)) &&
                       cppshInUserInput(*this, getCurFunctionDecl()->getLocation())) {

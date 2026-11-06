@@ -55,6 +55,11 @@
 using namespace llvm::omp;
 
 namespace clang {
+// cppsh: cuts in instantiated bodies (SemaExpr.cpp).
+extern bool CppshCutNeeded;
+bool cppshCutsInstantiatedBody(Sema &S, const CompoundStmt *Body);
+void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
+                           SmallVectorImpl<Stmt *> &Statements);
 using namespace sema;
 
 // This helper class is used to facilitate pack expansion during tree transform.
@@ -8371,10 +8376,24 @@ TreeTransform<Derived>::TransformCompoundStmt(CompoundStmt *S,
   bool SubStmtInvalid = false;
   bool SubStmtChanged = false;
   SmallVector<Stmt*, 8> Statements;
+  // cppsh: the body of a function instantiated from what the user typed is
+  // cut where a statement needs what only running the function gives.
+  const bool CppshBody = !IsStmtExpr && cppshCutsInstantiatedBody(getSema(), S);
+  // The need of what is being parsed around this instantiation (a call of
+  // the function in a body the parser may cut), kept across it.
+  const bool CppshOuterNeed = CppshBody && CppshCutNeeded;
   for (auto *B : S->body()) {
+    if (CppshBody)
+      CppshCutNeeded = false;
     StmtResult Result = getDerived().TransformStmt(
         B, IsStmtExpr && B == S->body_back() ? StmtDiscardKind::StmtExprResult
                                              : StmtDiscardKind::Discarded);
+    if (CppshBody && CppshCutNeeded) {
+      CppshCutNeeded = false;
+      cppshCutInstantiation(getSema(), S, B, Statements);
+      SubStmtChanged = true;
+      break;
+    }
 
     if (Result.isInvalid()) {
       // Immediately fail if this was a DeclStmt, since it's very
@@ -8390,6 +8409,8 @@ TreeTransform<Derived>::TransformCompoundStmt(CompoundStmt *S,
     SubStmtChanged = SubStmtChanged || Result.get() != B;
     Statements.push_back(Result.getAs<Stmt>());
   }
+  if (CppshBody)
+    CppshCutNeeded = CppshOuterNeed;
 
   if (SubStmtInvalid)
     return StmtError();
