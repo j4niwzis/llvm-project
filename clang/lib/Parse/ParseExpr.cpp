@@ -89,7 +89,66 @@ ExprResult Parser::ParseAssignmentExpression(
   ExprResult LHS =
       ParseCastExpression(CastParseKind::AnyCastExpr,
                           /*isAddressOfOperand=*/false, CorrectionBehavior);
+  LHS = MaybeParseUnparenthesizedCallArgs(LHS);
   return ParseRHSOfBinaryExpression(LHS, prec::Assignment);
+}
+
+ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
+  if (!getLangOpts().CPlusPlus || !LHS.isUsable() ||
+      PP.getSourceManager().isInSystemHeader(Tok.getLocation()) ||
+      PP.isBacktrackEnabled())
+    return LHS;
+
+  Expr *Fn = LHS.get()->IgnoreParens();
+  if (isa<ParenExpr>(LHS.get()))
+    return LHS;
+  if (!isa<UnresolvedLookupExpr, DeclRefExpr, MemberExpr, UnresolvedMemberExpr,
+           CallExpr>(Fn))
+    return LHS;
+
+  QualType FnTy = Fn->getType();
+  if (FnTy.isNull())
+    return LHS;
+  bool IsCallable =
+      Fn->isTypeDependent() || FnTy == Actions.Context.OverloadTy ||
+      FnTy == Actions.Context.BoundMemberTy || FnTy->isFunctionType() ||
+      FnTy->isFunctionPointerType() || FnTy->isFunctionReferenceType() ||
+      FnTy->isRecordType();
+  if (!IsCallable)
+    return LHS;
+
+  auto canStartArg = [&]() -> bool {
+    if (Tok.is(tok::l_brace))
+      return NextToken().is(tok::period);
+    return Tok.isOneOf(tok::identifier, tok::numeric_constant,
+                       tok::char_constant, tok::wide_char_constant,
+                       tok::utf8_char_constant, tok::utf16_char_constant,
+                       tok::utf32_char_constant, tok::string_literal,
+                       tok::wide_string_literal, tok::utf8_string_literal,
+                       tok::utf16_string_literal, tok::utf32_string_literal);
+  };
+
+  if (!canStartArg())
+    return LHS;
+
+  ExprVector ArgExprs;
+  SourceLocation StartLoc = Tok.getLocation();
+  while (canStartArg()) {
+    ExprResult Arg;
+    if (Tok.is(tok::l_brace)) {
+      Arg = ParseBraceInitializer();
+    } else {
+      Arg = ParseCastExpression(CastParseKind::AnyCastExpr);
+      if (Arg.isUsable())
+        Arg = ParseRHSOfBinaryExpression(Arg, prec::ExclusiveOr);
+    }
+    if (Arg.isInvalid() || !Arg.isUsable())
+      return ExprError();
+    ArgExprs.push_back(Arg.get());
+  }
+
+  return Actions.ActOnCallExpr(getCurScope(), LHS.get(), StartLoc, ArgExprs,
+                               PrevTokLocation);
 }
 
 ExprResult Parser::ParseConditionalExpression() {
@@ -473,8 +532,11 @@ Parser::ParseRHSOfBinaryExpression(ExprResult LHS, prec::Level MinPrec) {
       RHSIsInitList = true;
     } else if (getLangOpts().CPlusPlus && NextTokPrec <= prec::Conditional)
       RHS = ParseAssignmentExpression();
-    else
+    else {
       RHS = ParseCastExpression(CastParseKind::AnyCastExpr);
+      if (OpToken.is(tok::pipe))
+        RHS = MaybeParseUnparenthesizedCallArgs(RHS);
+    }
 
     // We preserve the LHS only if we hit a clear statement boundary (tok::semi)
     // to avoid additional bogus diagnostics.
@@ -2022,6 +2084,17 @@ Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
       // FIXME: Add support for explicit call of template constructor.
       SourceLocation TemplateKWLoc;
       UnqualifiedId Name;
+      if (getLangOpts().CPlusPlus && OpKind == tok::period &&
+          Tok.is(tok::numeric_constant) && !LHS.isInvalid()) {
+        std::string NumSpell = PP.getSpelling(Tok);
+        SourceLocation NumLoc = ConsumeToken();
+        ExprResult Unres = Actions.BuildOperatorUnresolvedCall(
+            getCurScope(), NumLoc, NumSpell, LHS.get(), OpLoc);
+        if (Unres.isUsable()) {
+          LHS = Unres;
+          break;
+        }
+      }
       if (getLangOpts().ObjC && OpKind == tok::period &&
           Tok.is(tok::kw_class)) {
         // Objective-C++:
@@ -3226,6 +3299,8 @@ bool Parser::ParseExpressionList(SmallVectorImpl<Expr *> &Exprs,
       Exprs.push_back(Expr.get());
     }
 
+    if (Tok.is(tok::l_brace) && NextToken().is(tok::period))
+      continue;
     if (Tok.isNot(tok::comma))
       break;
     // Move to the next argument, remember where the comma was.

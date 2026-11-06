@@ -3087,7 +3087,7 @@ InitListChecker::CheckDesignatedInitializer(const InitializedEntity &Entity,
     // otherwise-valid C++20 program, so is the only case that's required for
     // conformance, but for consistency, we should diagnose all the other
     // cases where a designator takes us backwards too.
-    if (IsFirstDesignator && !VerifyOnly && SemaRef.getLangOpts().CPlusPlus &&
+    if (false && IsFirstDesignator && !VerifyOnly && SemaRef.getLangOpts().CPlusPlus &&
         NextField &&
         (*NextField == RD->field_end() ||
          (*NextField)->getFieldIndex() > Field->getFieldIndex() + 1)) {

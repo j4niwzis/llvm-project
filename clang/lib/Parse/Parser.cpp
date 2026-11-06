@@ -1003,6 +1003,12 @@ Parser::ParseExternalDeclaration(ParsedAttributes &Attrs,
       ConsumeToken();
       return nullptr;
     }
+    MaybeRewriteConciseDeclaration(/*AllowFunctionDef=*/true);
+    if (Tok.is(tok::kw_template)) {
+      SourceLocation DeclEnd;
+      return ParseDeclaration(DeclaratorContext::File, DeclEnd, Attrs,
+                              DeclSpecAttrs);
+    }
     if (getLangOpts().IncrementalExtensions &&
         !isDeclarationStatement(/*DisambiguatingWithExpression=*/true))
       return ParseTopLevelStmtDecl();

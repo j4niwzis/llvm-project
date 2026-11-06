@@ -143,6 +143,7 @@ StmtResult Parser::ParseStatementOrDeclarationAfterAttributes(
   // the token to end in a semicolon (in which case SemiError should be set),
   // or they directly 'return;' if not.
 Retry:
+  MaybeRewriteConciseDeclaration(/*AllowFunctionDef=*/false);
   tok::TokenKind Kind  = Tok.getKind();
   SourceLocation AtLoc;
   switch (Kind) {
@@ -173,7 +174,7 @@ Retry:
 
     // Look up the identifier, and typo-correct it to a keyword if it's not
     // found.
-    if (Next.isNot(tok::coloncolon)) {
+    if (Next.isNot(tok::coloncolon) && !isImplicitAutoDeclaration()) {
       // Try to limit which sets of keywords should be included in typo
       // correction based on what the next token is.
       StatementFilterCCC CCC(Next);
@@ -334,6 +335,7 @@ Retry:
     Res = ParseBreakStatement();
     SemiError = "break";
     break;
+  case tok::caret:
   case tok::kw_return:              // C99 6.8.6.4: return-statement
     Res = ParseReturnStatement();
     SemiError = "return";
@@ -1530,6 +1532,18 @@ StmtResult Parser::ParseIfStatement(SourceLocation *TrailingElseLoc) {
 
     if (IsConstexpr)
       ConstexprCondition = Cond.getKnownValue();
+    else if (getLangOpts().CPlusPlus &&
+             !PP.getSourceManager().isInSystemHeader(IfLoc)) {
+      if (Expr *CondE = Cond.get().second) {
+        if (!CondE->isValueDependent()) {
+          Expr::EvalResult EV;
+          if (CondE->EvaluateAsBooleanCondition(EV, Actions.Context)) {
+            IsConstexpr = true;
+            ConstexprCondition = EV.Val.getInt().getBoolValue();
+          }
+        }
+      }
+    }
   }
 
   bool IsBracedThen = Tok.is(tok::l_brace);
@@ -2084,12 +2098,6 @@ StmtResult Parser::ParseForStatement(SourceLocation *TrailingElseLoc,
     ForRangeInfo.ColonLoc = ConsumeToken();
     ParseForRangeInitializerAfterColon(ForRangeInfo, /*VarDeclSpec=*/nullptr);
 
-    Diag(Loc, diag::err_for_range_identifier)
-        << (ForRangeInfo.ExpansionStmt != nullptr)
-        << ((getLangOpts().CPlusPlus11 && !getLangOpts().CPlusPlus17)
-                ? FixItHint::CreateInsertion(Loc, "auto &&")
-                : FixItHint());
-
     if (!ForRangeInfo.ExpansionStmt)
       ForRangeInfo.LoopVar =
           Actions.ActOnCXXForRangeIdentifier(getCurScope(), Loc, Name, attrs);
@@ -2470,7 +2478,8 @@ StmtResult Parser::ParseBreakStatement() {
 }
 
 StmtResult Parser::ParseReturnStatement() {
-  assert((Tok.is(tok::kw_return) || Tok.is(tok::kw_co_return)) &&
+  assert((Tok.is(tok::kw_return) || Tok.is(tok::kw_co_return) ||
+          Tok.is(tok::caret)) &&
          "Not a return stmt!");
   bool IsCoreturn = Tok.is(tok::kw_co_return);
   SourceLocation ReturnLoc = ConsumeToken();  // eat the 'return'.

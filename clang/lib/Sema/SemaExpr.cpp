@@ -2884,6 +2884,66 @@ recoverFromMSUnqualifiedLookup(Sema &S, ASTContext &Context,
       TemplateArgs);
 }
 
+ExprResult Sema::BuildOperatorUnresolvedCall(Scope *S, SourceLocation Loc,
+                                             StringRef Name, Expr *BaseExpr,
+                                             SourceLocation OpLoc) {
+  if (!getLangOpts().CPlusPlus || Name.empty() ||
+      Name == "operator_unresolved")
+    return ExprEmpty();
+
+  IdentifierInfo *OpII = &PP.getIdentifierTable().get("operator_unresolved");
+  DeclarationName OpName(OpII);
+  DeclarationNameInfo OpNameInfo(OpName, Loc);
+
+  TemplateArgumentListInfo ExplicitArgs(Loc, Loc);
+  for (char C : Name) {
+    Expr *Lit = new (Context)
+        CharacterLiteral(static_cast<unsigned char>(C),
+                         CharacterLiteralKind::Ascii, Context.CharTy, Loc);
+    TemplateArgument Arg(Lit, /*IsCanonical=*/false);
+    TemplateArgumentLocInfo ArgInfo(Lit);
+    ExplicitArgs.addArgument(TemplateArgumentLoc(Arg, ArgInfo));
+  }
+
+  if (BaseExpr) {
+    QualType BaseType = BaseExpr->getType();
+    if (BaseType.isNull() || BaseType->isDependentType())
+      return ExprEmpty();
+    RecordDecl *RD = BaseType->getAsRecordDecl();
+    if (!RD)
+      return ExprEmpty();
+    LookupResult R(*this, OpNameInfo, LookupMemberName);
+    LookupQualifiedName(R, RD);
+    R.suppressDiagnostics();
+    if (R.empty())
+      return ExprEmpty();
+    CXXScopeSpec EmptySS;
+    ExprResult MemExpr = BuildMemberReferenceExpr(
+        BaseExpr, BaseType, OpLoc.isValid() ? OpLoc : Loc, /*IsArrow=*/false,
+        EmptySS, SourceLocation(), /*FirstQualifierInScope=*/nullptr, R,
+        &ExplicitArgs, S);
+    if (MemExpr.isInvalid() || !MemExpr.isUsable())
+      return ExprEmpty();
+    return BuildCallExpr(S, MemExpr.get(), Loc, {}, Loc);
+  }
+
+  LookupResult R(*this, OpNameInfo, LookupOrdinaryName);
+  if (S)
+    LookupName(R, S);
+  else
+    LookupQualifiedName(R, Context.getTranslationUnitDecl());
+  R.suppressDiagnostics();
+  if (R.empty())
+    return ExprEmpty();
+
+  CXXScopeSpec EmptySS;
+  ExprResult TemplateId = BuildTemplateIdExpr(
+      EmptySS, SourceLocation(), R, /*RequiresADL=*/false, &ExplicitArgs);
+  if (TemplateId.isInvalid() || !TemplateId.isUsable())
+    return ExprEmpty();
+  return BuildCallExpr(S, TemplateId.get(), Loc, {}, Loc);
+}
+
 ExprResult Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
                                    SourceLocation TemplateKWLoc,
                                    UnqualifiedId &Id, bool HasTrailingLParen,
@@ -3001,6 +3061,12 @@ ExprResult Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
   bool ADL = UseArgumentDependentLookup(SS, R, HasTrailingLParen);
 
   if (R.empty() && !ADL) {
+    if (SS.isEmpty() && II && !TemplateArgs && !IsInlineAsmIdentifier) {
+      ExprResult Unres = BuildOperatorUnresolvedCall(S, NameLoc, II->getName());
+      if (Unres.isUsable())
+        return Unres;
+    }
+
     if (SS.isEmpty() && getLangOpts().MSVCCompat) {
       if (Expr *E = recoverFromMSUnqualifiedLookup(*this, Context, NameInfo,
                                                    TemplateKWLoc, TemplateArgs))
@@ -3921,6 +3987,13 @@ ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
   StringRef TokSpelling = PP.getSpelling(Tok, SpellingBuffer, &Invalid);
   if (Invalid)
     return ExprError();
+
+  if (getLangOpts().CPlusPlus && TokSpelling.count('.') > 1) {
+    ExprResult Unres = BuildOperatorUnresolvedCall(
+        UDLScope ? UDLScope : getCurScope(), Tok.getLocation(), TokSpelling);
+    if (Unres.isUsable())
+      return Unres;
+  }
 
   NumericLiteralParser Literal(TokSpelling, Tok.getLocation(),
                                PP.getSourceManager(), PP.getLangOpts(),
@@ -7038,6 +7111,143 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
     if (CheckInvalidBuiltinCountedByRef(Arg,
                                         BuiltinCountedByRefKind::FunctionArg))
       return ExprError();
+
+  SmallVector<Expr *, 8> CoalescedArgsStorage;
+  if (getLangOpts().CPlusPlus && !ArgExprs.empty()) {
+    auto getDesigField = [](Expr *E) -> const IdentifierInfo * {
+      auto *IL = dyn_cast_or_null<InitListExpr>(E);
+      if (!IL || IL->getNumInits() == 0)
+        return nullptr;
+      auto *DIE = dyn_cast_or_null<DesignatedInitExpr>(IL->getInit(0));
+      if (!DIE || DIE->size() == 0 ||
+          !DIE->getDesignator(0)->isFieldDesignator())
+        return nullptr;
+      return DIE->getDesignator(0)->getFieldName();
+    };
+
+    int FirstDesigIdx = -1;
+    bool CoalescedAny = false;
+    for (Expr *Arg : ArgExprs) {
+      if (getDesigField(Arg)) {
+        if (FirstDesigIdx == -1) {
+          FirstDesigIdx = CoalescedArgsStorage.size();
+          CoalescedArgsStorage.push_back(Arg);
+        } else {
+          auto *FirstIL = cast<InitListExpr>(CoalescedArgsStorage[FirstDesigIdx]);
+          auto *CurIL = cast<InitListExpr>(Arg);
+          SmallVector<Expr *, 8> Combined(FirstIL->inits().begin(),
+                                          FirstIL->inits().end());
+          Combined.append(CurIL->inits().begin(), CurIL->inits().end());
+          ExprResult Merged = ActOnInitList(FirstIL->getLBraceLoc(), Combined,
+                                            CurIL->getRBraceLoc());
+          if (Merged.isUsable()) {
+            CoalescedArgsStorage[FirstDesigIdx] = Merged.get();
+            CoalescedAny = true;
+          }
+        }
+      } else {
+        CoalescedArgsStorage.push_back(Arg);
+      }
+    }
+
+    if (FirstDesigIdx != -1) {
+      const IdentifierInfo *FieldII =
+          getDesigField(CoalescedArgsStorage[FirstDesigIdx]);
+      auto paramHasField = [&](const ParmVarDecl *PVD) -> bool {
+        QualType PTy = PVD->getType().getNonReferenceType();
+        if (const RecordDecl *RD = PTy->getAsRecordDecl()) {
+          if (const auto *CXXRD = dyn_cast<CXXRecordDecl>(RD))
+            if (!CXXRD->hasDefinition())
+              return false;
+          return tryLookupUnambiguousFieldDecl(const_cast<RecordDecl *>(RD),
+                                               FieldII) != nullptr;
+        }
+        return false;
+      };
+
+      SmallVector<FunctionDecl *, 4> CandFDs;
+      Expr *Naked = Fn->IgnoreParens();
+      if (auto *DRE = dyn_cast<DeclRefExpr>(Naked)) {
+        if (auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl()))
+          CandFDs.push_back(FD);
+      } else if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(Naked)) {
+        for (NamedDecl *ND : ULE->decls()) {
+          if (auto *FD = dyn_cast<FunctionDecl>(ND))
+            CandFDs.push_back(FD);
+          else if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND))
+            CandFDs.push_back(FTD->getTemplatedDecl());
+        }
+      } else if (!Fn->isTypeDependent() && Fn->getType()->isRecordType()) {
+        if (CXXRecordDecl *CRD = Fn->getType()->getAsCXXRecordDecl()) {
+          if (CRD->hasDefinition()) {
+            DeclarationName OpCall =
+                Context.DeclarationNames.getCXXOperatorName(OO_Call);
+            for (NamedDecl *ND : CRD->lookup(OpCall)) {
+              if (auto *FD = dyn_cast<FunctionDecl>(ND))
+                CandFDs.push_back(FD);
+              else if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND))
+                CandFDs.push_back(FTD->getTemplatedDecl());
+            }
+          }
+        }
+      }
+
+      for (FunctionDecl *FD : CandFDs) {
+        if (static_cast<unsigned>(FirstDesigIdx) < FD->getNumParams() &&
+            paramHasField(FD->getParamDecl(FirstDesigIdx)))
+          break;
+        int MatchIdx = -1;
+        for (unsigned I = 0; I < FD->getNumParams(); ++I) {
+          if (paramHasField(FD->getParamDecl(I))) {
+            MatchIdx = I;
+            break;
+          }
+        }
+        if (MatchIdx != -1 && MatchIdx != FirstDesigIdx) {
+          Expr *DesigExpr = CoalescedArgsStorage[FirstDesigIdx];
+          SmallVector<Expr *, 8> PosArgs;
+          for (size_t I = 0; I < CoalescedArgsStorage.size(); ++I)
+            if (static_cast<int>(I) != FirstDesigIdx)
+              PosArgs.push_back(CoalescedArgsStorage[I]);
+          unsigned TotalSlots =
+              std::max<unsigned>(MatchIdx + 1, PosArgs.size() + 1);
+          if (TotalSlots <= FD->getNumParams()) {
+            SmallVector<Expr *, 8> Reordered;
+            size_t PosCur = 0;
+            bool Ok = true;
+            for (unsigned Slot = 0; Slot < TotalSlots; ++Slot) {
+              if (static_cast<int>(Slot) == MatchIdx) {
+                Reordered.push_back(DesigExpr);
+              } else if (PosCur < PosArgs.size()) {
+                Reordered.push_back(PosArgs[PosCur++]);
+              } else if (FD->getParamDecl(Slot)->hasDefaultArg()) {
+                ExprResult Def = BuildCXXDefaultArgExpr(
+                    LParenLoc, FD, FD->getParamDecl(Slot));
+                if (Def.isUsable())
+                  Reordered.push_back(Def.get());
+                else {
+                  Ok = false;
+                  break;
+                }
+              } else {
+                Ok = false;
+                break;
+              }
+            }
+            if (Ok && PosCur == PosArgs.size()) {
+              CoalescedArgsStorage = std::move(Reordered);
+              CoalescedAny = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (CoalescedAny)
+      ArgExprs = MultiExprArg(CoalescedArgsStorage.data(),
+                              CoalescedArgsStorage.size());
+  }
 
   if (getLangOpts().CPlusPlus) {
     // If this is a pseudo-destructor expression, build the call immediately.

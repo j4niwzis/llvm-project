@@ -12,13 +12,387 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/Parse/Parser.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/Parse/RAIIObjectsForParser.h"
+#include "clang/Sema/Lookup.h"
 #include "clang/Sema/ParsedTemplate.h"
 using namespace clang;
+
+bool Parser::isImplicitAutoDeclaration() {
+  if (!getLangOpts().CPlusPlus || !Tok.is(tok::identifier) ||
+      !NextToken().is(tok::equal))
+    return false;
+  if (!getCurScope() || getCurScope()->isClassScope() ||
+      PP.getSourceManager().isInSystemHeader(Tok.getLocation()))
+    return false;
+  IdentifierInfo *II = Tok.getIdentifierInfo();
+  if (!II || II->getName() == "operator_unresolved")
+    return false;
+  if (Actions.getTypeName(*II, Tok.getLocation(), getCurScope()))
+    return false;
+  LookupResult R(Actions, II, Tok.getLocation(), Sema::LookupOrdinaryName);
+  Actions.LookupName(R, getCurScope());
+  R.suppressDiagnostics();
+  if (R.empty())
+    return true;
+  for (NamedDecl *D : R) {
+    if (isa<VarDecl, FieldDecl, IndirectFieldDecl, BindingDecl,
+            NonTypeTemplateParmDecl, EnumConstantDecl>(D))
+      return false;
+    if (Actions.CurContext &&
+        D->getDeclContext()->getRedeclContext()->Equals(
+            Actions.CurContext->getRedeclContext()))
+      return false;
+  }
+  return true;
+}
+
+void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
+  if (!getLangOpts().CPlusPlus || !Tok.is(tok::identifier) ||
+      PP.getSourceManager().isInSystemHeader(Tok.getLocation()) ||
+      PP.isBacktrackEnabled() ||
+      (getCurScope() && getCurScope()->isClassScope()))
+    return;
+
+  auto makeTok = [&](tok::TokenKind K, SourceLocation Loc,
+                     IdentifierInfo *II = nullptr) {
+    Token T;
+    T.startToken();
+    T.setKind(K);
+    T.setLocation(Loc);
+    if (II)
+      T.setIdentifierInfo(II);
+    return T;
+  };
+  auto makeKwTok = [&](tok::TokenKind K, StringRef Spelling,
+                       SourceLocation Loc) {
+    return makeTok(K, Loc, &PP.getIdentifierTable().get(Spelling));
+  };
+  auto reinjectTokens = [&](ArrayRef<Token> Out) {
+    MutableArrayRef<Token> Mem(
+        PP.getPreprocessorAllocator().Allocate<Token>(Out.size()), Out.size());
+    std::copy(Out.begin(), Out.end(), Mem.begin());
+    PP.EnterTokenStream(std::move(Mem), /*DisableMacroExpansion=*/true,
+                        /*IsReinject=*/true);
+    ConsumeAnyToken(/*ConsumeCodeCompletionTok=*/true);
+  };
+
+  // Case 1: `x: Type = expr` or `x: & = expr` or `x: && = expr`
+  if (NextToken().is(tok::colon)) {
+    Token Look2 = GetLookAheadToken(2);
+    bool LooksLikeColonDecl = false;
+    if (Look2.isOneOf(tok::amp, tok::ampamp, tok::kw_auto, tok::kw_const,
+                      tok::kw_constexpr, tok::kw_volatile, tok::kw_int,
+                      tok::kw_long, tok::kw_short, tok::kw_char, tok::kw_bool,
+                      tok::kw_float, tok::kw_double, tok::kw_unsigned,
+                      tok::kw_signed, tok::kw_void, tok::kw_decltype)) {
+      LooksLikeColonDecl = true;
+    } else if (Look2.is(tok::identifier)) {
+      if (GetLookAheadToken(3).is(tok::coloncolon) ||
+          Actions.getTypeName(*Look2.getIdentifierInfo(), Look2.getLocation(),
+                              getCurScope()))
+        LooksLikeColonDecl = true;
+    }
+    if (!LooksLikeColonDecl)
+      return;
+
+    SmallVector<Token, 16> Orig;
+    Token VarTok = Tok;
+    Orig.push_back(Tok);
+    ConsumeToken(); // ident
+    Orig.push_back(Tok);
+    ConsumeToken(); // ':'
+
+    SmallVector<Token, 16> TypeToks;
+    int AngleDepth = 0;
+    while (!Tok.is(tok::eof)) {
+      if (Tok.is(tok::less))
+        ++AngleDepth;
+      else if (Tok.is(tok::greater) && AngleDepth > 0)
+        --AngleDepth;
+      else if (AngleDepth == 0 &&
+               Tok.isOneOf(tok::equal, tok::semi, tok::l_brace))
+        break;
+      Orig.push_back(Tok);
+      TypeToks.push_back(Tok);
+      ConsumeAnyToken();
+    }
+
+    if (!Tok.isOneOf(tok::equal, tok::semi) || TypeToks.empty()) {
+      Orig.push_back(Tok);
+      reinjectTokens(Orig);
+      return;
+    }
+
+    bool HasBaseType = false;
+    for (const Token &T : TypeToks) {
+      if (!T.isOneOf(tok::amp, tok::ampamp, tok::star, tok::kw_const,
+                     tok::kw_volatile)) {
+        HasBaseType = true;
+        break;
+      }
+    }
+
+    SmallVector<Token, 24> Out;
+    if (!HasBaseType) {
+      for (const Token &T : TypeToks)
+        if (T.isOneOf(tok::kw_const, tok::kw_volatile))
+          Out.push_back(T);
+      Out.push_back(makeKwTok(tok::kw_auto, "auto", VarTok.getLocation()));
+      for (const Token &T : TypeToks)
+        if (!T.isOneOf(tok::kw_const, tok::kw_volatile))
+          Out.push_back(T);
+    } else {
+      Out.append(TypeToks.begin(), TypeToks.end());
+    }
+    Out.push_back(VarTok);
+    Out.push_back(Tok); // '=' or ';'
+    reinjectTokens(Out);
+    return;
+  }
+
+  if (!AllowFunctionDef)
+    return;
+
+  // Case 2: Concise function/template definition:
+  //   `foo a: int b: T' ? Concept<T> = expr;`
+  //   `foo(a: int, b: T') ? Concept<T> = expr;`
+  //   `foo() = expr;`
+  bool IsUnparenFunc =
+      NextToken().is(tok::identifier) && GetLookAheadToken(2).is(tok::colon) &&
+      !Actions.getTypeName(*Tok.getIdentifierInfo(), Tok.getLocation(),
+                           getCurScope());
+  bool IsParenFunc =
+      NextToken().is(tok::l_paren) &&
+      ((GetLookAheadToken(2).is(tok::identifier) &&
+        GetLookAheadToken(3).is(tok::colon)) ||
+       (GetLookAheadToken(2).is(tok::r_paren) &&
+        GetLookAheadToken(3).isOneOf(tok::equal, tok::question,
+                                     tok::kw_requires) &&
+        !Actions.getTypeName(*Tok.getIdentifierInfo(), Tok.getLocation(),
+                             getCurScope())));
+  if (!IsUnparenFunc && !IsParenFunc)
+    return;
+
+  Token FuncName = Tok;
+  SourceLocation Loc = FuncName.getLocation();
+  ConsumeToken(); // Eat FuncName
+
+  bool HasParens = Tok.is(tok::l_paren);
+  if (HasParens)
+    ConsumeParen(); // Eat '('
+
+  SmallVector<IdentifierInfo *, 4> TemplateParams;
+  auto normalizePrimeIdent = [&](Token &T) {
+    if (T.is(tok::identifier) && T.getIdentifierInfo()) {
+      StringRef Name = T.getIdentifierInfo()->getName();
+      if (Name.size() > 1 && Name.ends_with("'")) {
+        StringRef Clean = Name.drop_back(1);
+        IdentifierInfo *CleanII = &PP.getIdentifierTable().get(Clean);
+        T.setIdentifierInfo(CleanII);
+        if (!llvm::is_contained(TemplateParams, CleanII))
+          TemplateParams.push_back(CleanII);
+      }
+    }
+  };
+
+  SmallVector<Token, 32> ConvertedParams;
+  bool FirstParam = true;
+  while (!Tok.is(tok::eof)) {
+    if (HasParens && Tok.is(tok::r_paren)) {
+      ConsumeParen();
+      break;
+    }
+    if (!HasParens &&
+        Tok.isOneOf(tok::equal, tok::l_brace, tok::question, tok::kw_requires,
+                    tok::arrow, tok::semi))
+      break;
+
+    if (!FirstParam)
+      ConvertedParams.push_back(makeTok(tok::comma, Tok.getLocation()));
+    FirstParam = false;
+
+    if (Tok.is(tok::identifier) && NextToken().is(tok::colon)) {
+      Token ParamName = Tok;
+      ConsumeToken(); // param name
+      ConsumeToken(); // ':'
+
+      SmallVector<Token, 8> TypeToks;
+      int AngleDepth = 0;
+      while (!Tok.is(tok::eof)) {
+        if (Tok.is(tok::less))
+          ++AngleDepth;
+        else if (Tok.is(tok::greater) && AngleDepth > 0)
+          --AngleDepth;
+        else if (AngleDepth == 0) {
+          if (HasParens && Tok.isOneOf(tok::comma, tok::r_paren, tok::equal))
+            break;
+          if (!HasParens) {
+            if (Tok.isOneOf(tok::comma, tok::equal, tok::l_brace, tok::question,
+                            tok::kw_requires, tok::arrow, tok::semi))
+              break;
+            if (Tok.is(tok::identifier) && NextToken().is(tok::colon))
+              break;
+          }
+        }
+        Token Cur = Tok;
+        normalizePrimeIdent(Cur);
+        TypeToks.push_back(Cur);
+        ConsumeAnyToken();
+      }
+
+      bool HasBaseType = false;
+      for (const Token &T : TypeToks) {
+        if (!T.isOneOf(tok::amp, tok::ampamp, tok::star, tok::kw_const,
+                       tok::kw_volatile)) {
+          HasBaseType = true;
+          break;
+        }
+      }
+      if (!HasBaseType) {
+        for (const Token &T : TypeToks)
+          if (T.isOneOf(tok::kw_const, tok::kw_volatile))
+            ConvertedParams.push_back(T);
+        ConvertedParams.push_back(
+            makeKwTok(tok::kw_auto, "auto", ParamName.getLocation()));
+        for (const Token &T : TypeToks)
+          if (!T.isOneOf(tok::kw_const, tok::kw_volatile))
+            ConvertedParams.push_back(T);
+      } else {
+        ConvertedParams.append(TypeToks.begin(), TypeToks.end());
+      }
+      ConvertedParams.push_back(ParamName);
+
+      if (HasParens && Tok.is(tok::equal)) {
+        ConvertedParams.push_back(Tok);
+        ConsumeToken();
+        int Depth = 0;
+        while (!Tok.is(tok::eof)) {
+          if (Tok.isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
+            ++Depth;
+          else if (Tok.isOneOf(tok::r_paren, tok::r_brace, tok::r_square)) {
+            if (Depth == 0 && Tok.is(tok::r_paren))
+              break;
+            if (Depth > 0)
+              --Depth;
+          } else if (Depth == 0 && Tok.is(tok::comma))
+            break;
+          ConvertedParams.push_back(Tok);
+          ConsumeAnyToken();
+        }
+      }
+      if (Tok.is(tok::comma))
+        ConsumeToken();
+    } else {
+      // Standard parameter inside parens
+      int Depth = 0;
+      while (!Tok.is(tok::eof)) {
+        if (Tok.isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
+          ++Depth;
+        else if (Tok.isOneOf(tok::r_paren, tok::r_brace, tok::r_square)) {
+          if (Depth == 0 && Tok.is(tok::r_paren))
+            break;
+          if (Depth > 0)
+            --Depth;
+        } else if (Depth == 0 && Tok.is(tok::comma)) {
+          ConsumeToken();
+          break;
+        }
+        Token Cur = Tok;
+        normalizePrimeIdent(Cur);
+        ConvertedParams.push_back(Cur);
+        ConsumeAnyToken();
+      }
+    }
+  }
+
+  SmallVector<Token, 8> TrailingRetToks;
+  if (Tok.is(tok::arrow)) {
+    while (!Tok.is(tok::eof) &&
+           !Tok.isOneOf(tok::question, tok::kw_requires, tok::equal,
+                        tok::l_brace, tok::semi)) {
+      Token Cur = Tok;
+      normalizePrimeIdent(Cur);
+      TrailingRetToks.push_back(Cur);
+      ConsumeAnyToken();
+    }
+  }
+
+  SmallVector<Token, 16> RequiresToks;
+  if (Tok.isOneOf(tok::question, tok::kw_requires)) {
+    ConsumeToken();
+    while (!Tok.is(tok::eof) &&
+           !Tok.isOneOf(tok::equal, tok::l_brace, tok::semi)) {
+      Token Cur = Tok;
+      normalizePrimeIdent(Cur);
+      RequiresToks.push_back(Cur);
+      ConsumeAnyToken();
+    }
+  }
+
+  SmallVector<Token, 64> Out;
+  if (!TemplateParams.empty()) {
+    Out.push_back(makeKwTok(tok::kw_template, "template", Loc));
+    Out.push_back(makeTok(tok::less, Loc));
+    for (size_t I = 0; I < TemplateParams.size(); ++I) {
+      if (I > 0)
+        Out.push_back(makeTok(tok::comma, Loc));
+      Out.push_back(makeKwTok(tok::kw_typename, "typename", Loc));
+      Out.push_back(makeTok(tok::identifier, Loc, TemplateParams[I]));
+    }
+    Out.push_back(makeTok(tok::greater, Loc));
+  }
+
+  Out.push_back(makeKwTok(tok::kw_auto, "auto", Loc));
+  Out.push_back(FuncName);
+  Out.push_back(makeTok(tok::l_paren, Loc));
+  Out.append(ConvertedParams.begin(), ConvertedParams.end());
+  Out.push_back(makeTok(tok::r_paren, Loc));
+  Out.append(TrailingRetToks.begin(), TrailingRetToks.end());
+
+  if (!RequiresToks.empty()) {
+    Out.push_back(makeKwTok(tok::kw_requires, "requires", Loc));
+    Out.append(RequiresToks.begin(), RequiresToks.end());
+  }
+
+  if (Tok.is(tok::equal)) {
+    SourceLocation EqLoc = ConsumeToken();
+    SmallVector<Token, 32> BodyToks;
+    int Depth = 0;
+    while (!Tok.is(tok::eof)) {
+      if (Tok.isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
+        ++Depth;
+      else if (Tok.isOneOf(tok::r_paren, tok::r_brace, tok::r_square)) {
+        if (Depth > 0)
+          --Depth;
+      } else if (Depth == 0 && Tok.is(tok::semi)) {
+        ConsumeToken();
+        break;
+      }
+      Token Cur = Tok;
+      normalizePrimeIdent(Cur);
+      BodyToks.push_back(Cur);
+      ConsumeAnyToken();
+    }
+    Out.push_back(makeTok(tok::l_brace, EqLoc));
+    if (!BodyToks.empty() &&
+        !BodyToks.front().isOneOf(tok::kw_return, tok::caret))
+      Out.push_back(makeKwTok(tok::kw_return, "return", EqLoc));
+    Out.append(BodyToks.begin(), BodyToks.end());
+    Out.push_back(makeTok(tok::semi, EqLoc));
+    Out.push_back(makeTok(tok::r_brace, EqLoc));
+  }
+
+  Out.push_back(Tok);
+  reinjectTokens(Out);
+}
 
 bool Parser::isCXXDeclarationStatement(
     bool DisambiguatingWithExpression /*=false*/) {
   assert(getLangOpts().CPlusPlus && "Must be called for C++ only.");
+
+  if (isImplicitAutoDeclaration())
+    return true;
 
   switch (Tok.getKind()) {
     // asm-definition

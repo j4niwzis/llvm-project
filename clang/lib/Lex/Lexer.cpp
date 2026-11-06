@@ -2067,6 +2067,12 @@ bool Lexer::LexIdentifierContinue(Token &Result, const char *CurPtr) {
       continue;
     if (!isASCII(C) && tryConsumeIdentifierUTF8Char(CurPtr, Result))
       continue;
+    if (C == '\'' && LangOpts.CPlusPlus &&
+        !(CurPtr + Size + 1 < BufferEnd &&
+          (*(CurPtr + Size + 1) == '\'' || *(CurPtr + Size) == '\\'))) {
+      CurPtr = ConsumeChar(CurPtr, Size, Result);
+      break;
+    }
     // Neither an expected Unicode codepoint nor a UCN.
     break;
   }

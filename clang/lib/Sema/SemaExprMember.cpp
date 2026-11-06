@@ -704,6 +704,42 @@ ExprResult Sema::BuildMemberReferenceExpr(
     NamedDecl *FirstQualifierInScope, const DeclarationNameInfo &NameInfo,
     const TemplateArgumentListInfo *TemplateArgs, const Scope *S,
     ActOnMemberAccessExtraArgs *ExtraArgs) {
+  if (Base && !BaseType.isNull() && !BaseType->isDependentType() &&
+      TemplateArgs && NameInfo.getName().isIdentifier() &&
+      NameInfo.getName().getAsIdentifierInfo()->getName() ==
+          "__cppsh_member") {
+    SmallString<64> Extracted;
+    auto appendArg = [&](const TemplateArgument &TA, auto &Self) -> void {
+      if (TA.getKind() == TemplateArgument::Integral) {
+        Extracted.push_back(
+            static_cast<char>(TA.getAsIntegral().getZExtValue()));
+      } else if (TA.getKind() == TemplateArgument::Expression) {
+        Expr::EvalResult EV;
+        if (!TA.getAsExpr()->isValueDependent() &&
+            TA.getAsExpr()->EvaluateAsInt(EV, Context))
+          Extracted.push_back(static_cast<char>(EV.Val.getInt().getZExtValue()));
+      } else if (TA.getKind() == TemplateArgument::Pack) {
+        for (const auto &P : TA.pack_elements())
+          Self(P, Self);
+      }
+    };
+    for (const TemplateArgumentLoc &TAL : TemplateArgs->arguments())
+      appendArg(TAL.getArgument(), appendArg);
+    if (!Extracted.empty()) {
+      IdentifierInfo *TargetII = &PP.getIdentifierTable().get(Extracted);
+      DeclarationNameInfo TargetNameInfo(TargetII, NameInfo.getLoc());
+      ExprResult MemRes = BuildMemberReferenceExpr(
+          Base, BaseType, OpLoc, IsArrow, SS, SourceLocation(),
+          FirstQualifierInScope, TargetNameInfo, /*TemplateArgs=*/nullptr, S,
+          ExtraArgs);
+      if (MemRes.isUsable() && MemRes.get()->getType() == Context.BoundMemberTy)
+        return BuildCallToMemberFunction(const_cast<Scope *>(S), MemRes.get(),
+                                         NameInfo.getLoc(), {},
+                                         NameInfo.getLoc());
+      return MemRes;
+    }
+  }
+
   LookupResult R(*this, NameInfo, LookupMemberName);
 
   // Implicit member accesses.
@@ -936,6 +972,15 @@ Sema::BuildMemberReferenceExpr(Expr *BaseExpr, QualType BaseExprType,
         << isa<CXXDestructorDecl>(FD);
 
   if (R.empty()) {
+    if (getLangOpts().CPlusPlus && !IsArrow && SS.isEmpty() && BaseExpr &&
+        !TemplateArgs && MemberName.isIdentifier()) {
+      ExprResult Unres = BuildOperatorUnresolvedCall(
+          const_cast<Scope *>(S), MemberLoc,
+          MemberName.getAsIdentifierInfo()->getName(), BaseExpr, OpLoc);
+      if (Unres.isUsable())
+        return Unres;
+    }
+
     ExprResult RetryExpr = ExprError();
     if (ExtraArgs && !IsArrow && BaseExpr && !BaseExpr->isTypeDependent()) {
       SFINAETrap Trap(*this, true);

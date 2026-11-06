@@ -8646,6 +8646,9 @@ private:
   /// \endverbatim
   ///
   bool isCXXDeclarationStatement(bool DisambiguatingWithExpression = false);
+  bool isImplicitAutoDeclaration();
+  void MaybeRewriteConciseDeclaration(bool AllowFunctionDef = false);
+  ExprResult MaybeParseUnparenthesizedCallArgs(ExprResult LHS);
 
   /// isCXXSimpleDeclaration - C++-specialized function that disambiguates
   /// between a simple-declaration or an expression-statement.

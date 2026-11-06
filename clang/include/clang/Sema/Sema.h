@@ -9145,6 +9145,10 @@ public:
                            const Scope *S, bool SuppressQualifierCheck = false,
                            ActOnMemberAccessExtraArgs *ExtraArgs = nullptr);
 
+  ExprResult BuildOperatorUnresolvedCall(
+      Scope *S, SourceLocation Loc, StringRef Name, Expr *BaseExpr = nullptr,
+      SourceLocation OpLoc = SourceLocation());
+
   ExprResult BuildFieldReferenceExpr(Expr *BaseExpr, bool IsArrow,
                                      SourceLocation OpLoc,
                                      const CXXScopeSpec &SS, FieldDecl *Field,

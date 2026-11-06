@@ -15228,6 +15228,15 @@ ExprResult Sema::BuildOverloadedCallExpr(Scope *S, Expr *Fn,
                              &result))
     return result;
 
+  if (CandidateSet.empty() && !ULE->getQualifier() &&
+      !ULE->hasExplicitTemplateArgs() && ULE->getName().isIdentifier()) {
+    ExprResult Unres = BuildOperatorUnresolvedCall(
+        S, ULE->getNameLoc(), ULE->getName().getAsIdentifierInfo()->getName());
+    if (Unres.isUsable())
+      return BuildCallExpr(S, Unres.get(), LParenLoc, Args, RParenLoc,
+                           ExecConfig);
+  }
+
   // If the user handed us something like `(&Foo)(Bar)`, we need to ensure that
   // functions that aren't addressible are considered unviable.
   if (CalleesAddressIsTaken)

@@ -8570,6 +8570,15 @@ TreeTransform<Derived>::TransformIfStmt(IfStmt *S) {
   std::optional<bool> ConstexprConditionValue;
   if (S->isConstexpr())
     ConstexprConditionValue = Cond.getKnownValue();
+  else if (!getSema().PP.getSourceManager().isInSystemHeader(S->getIfLoc())) {
+    if (Expr *CondE = Cond.get().second) {
+      if (!CondE->isValueDependent()) {
+        Expr::EvalResult EV;
+        if (CondE->EvaluateAsBooleanCondition(EV, getSema().Context))
+          ConstexprConditionValue = EV.Val.getInt().getBoolValue();
+      }
+    }
+  }
 
   // Transform the "then" branch.
   StmtResult Then;

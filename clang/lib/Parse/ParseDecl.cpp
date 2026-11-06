@@ -3423,6 +3423,15 @@ void Parser::ParseDeclarationSpecifiers(
   // We use Sema's policy to get bool macros right.
   PrintingPolicy Policy = Actions.getPrintingPolicy();
   while (true) {
+    if (!DS.hasTypeSpecifier() && isImplicitAutoDeclaration()) {
+      const char *PrevSpec = nullptr;
+      unsigned DiagID = 0;
+      DS.SetTypeSpecType(DeclSpec::TST_auto, Tok.getLocation(), PrevSpec,
+                         DiagID, Policy);
+      DS.SetRangeEnd(Tok.getLocation());
+      DS.Finish(Actions, Policy);
+      return;
+    }
     bool isInvalid = false;
     bool isStorageClass = false;
     const char *PrevSpec = nullptr;
@@ -7743,6 +7752,69 @@ void Parser::ParseParameterDeclarationClause(
 
       // Skip any Microsoft attributes before a param.
       MaybeParseMicrosoftAttributes(ArgDeclSpecAttrs);
+    }
+
+    if (getLangOpts().CPlusPlus && Tok.is(tok::identifier) &&
+        NextToken().is(tok::colon) &&
+        !PP.getSourceManager().isInSystemHeader(Tok.getLocation())) {
+      Token ParamName = Tok;
+      ConsumeToken(); // param name
+      ConsumeToken(); // ':'
+      SmallVector<Token, 8> TypeToks;
+      int AngleDepth = 0;
+      while (!Tok.is(tok::eof)) {
+        if (Tok.is(tok::less))
+          ++AngleDepth;
+        else if (Tok.is(tok::greater) && AngleDepth > 0)
+          --AngleDepth;
+        else if (AngleDepth == 0 &&
+                 Tok.isOneOf(tok::comma, tok::r_paren, tok::equal))
+          break;
+        TypeToks.push_back(Tok);
+        ConsumeAnyToken();
+      }
+      bool HasBaseType = false;
+      for (const Token &T : TypeToks) {
+        if (!T.isOneOf(tok::amp, tok::ampamp, tok::star, tok::kw_const,
+                       tok::kw_volatile)) {
+          HasBaseType = true;
+          break;
+        }
+      }
+      SmallVector<Token, 16> Out;
+      auto makeAutoTok = [&](SourceLocation L) {
+        Token T;
+        T.startToken();
+        T.setKind(tok::kw_auto);
+        T.setLocation(L);
+        T.setIdentifierInfo(&PP.getIdentifierTable().get("auto"));
+        return T;
+      };
+      if (!HasBaseType) {
+        for (const Token &T : TypeToks)
+          if (T.isOneOf(tok::kw_const, tok::kw_volatile))
+            Out.push_back(T);
+        Out.push_back(makeAutoTok(ParamName.getLocation()));
+        for (const Token &T : TypeToks)
+          if (!T.isOneOf(tok::kw_const, tok::kw_volatile))
+            Out.push_back(T);
+      } else {
+        for (Token T : TypeToks) {
+          if (T.is(tok::identifier) && T.getIdentifierInfo() &&
+              T.getIdentifierInfo()->getName().ends_with("'"))
+            T = makeAutoTok(T.getLocation());
+          Out.push_back(T);
+        }
+      }
+      Out.push_back(ParamName);
+      Out.push_back(Tok);
+      MutableArrayRef<Token> Mem(
+          PP.getPreprocessorAllocator().Allocate<Token>(Out.size()),
+          Out.size());
+      std::copy(Out.begin(), Out.end(), Mem.begin());
+      PP.EnterTokenStream(std::move(Mem), /*DisableMacroExpansion=*/true,
+                          /*IsReinject=*/true);
+      ConsumeAnyToken(/*ConsumeCodeCompletionTok=*/true);
     }
 
     SourceLocation DSStart = Tok.getLocation();
