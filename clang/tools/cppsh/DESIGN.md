@@ -73,3 +73,30 @@
 3. **Карточка команды (`ls` + `Tab`):** когда введённое имя — единственное оставшееся дополнение, выводится карточка (`commandCard`): сигнатуры всех перегрузок из AST, опции из record-параметра (`ls_opts`: `.all`, `.recursive`, `.dirs_only`, `.files_only`), поля элементов результата (`yields (file_entry)`: `.name`, `.ext`, `.size`, `.is_dir`) или поля результата (`returns (sh_result)`), и примеры вызова. Таблица команд (`commands()`) общая для списка дополнений и карточек.
 
 Не проверено сборкой: изменения написаны без локальной сборки clang (на машине, где они писались, не было места под llvm-project).
+
+## 4. Run-time values as compile-time values (staging)
+
+Every argument cppsh specializes a call on is a value known as the call is compiled: a literal, a constant, a value read from `std::cin`, a `std::string` or a container. No `__builtin_constant_p`, and no requirement to split the input into REPL lines by hand.
+
+### 4.1. Value specialization
+
+- A call whose arguments evaluate to constants gets a specialization of the callee (`__cppsh_val_N`) whose parameters carry those values (`CppshParamValue`: `ParmVarDecl` → `APValue`; `CppshParamRebuild`: `ParmVarDecl` → `Expr`, for values that are not literal types: strings, containers, variants). Nothing is written into the parameters' default arguments or initializers.
+- In the specialization, a plain `if` on a parameter folds (`TreeTransform`), so `ls {.files_only = true}` returns `ls_view<file_entry>` and `ls` returns the variant range.
+- A variable a statement already run defined is read from JIT memory (`cppshRuntimeValueOf`), or rebuilt from a snapshot (`std::sh::__cppsh_snapshot`, registry `__cppsh_snapshot_of`) into an expression recreating it (`cppshRuntimeRebuildOf`). A C string is rebuilt as a string literal.
+
+### 4.2. Staged input (top level)
+
+An input of several top-level statements is probed in a fork of the shell (`cppshProbe`): the child compiles it with diagnostics off and reports, down a pipe, where a statement needs a value an earlier statement of the same input defines (`CppshStageAt` against `CppshTopLevelStarts`), and any call of a staged function to hoist. The session then compiles each piece exactly once: no undo (undo left the code generator's deferred declarations behind), no held diagnostics.
+
+### 4.3. Staged functions
+
+A function whose body needs a value only running it gives (a local read from `std::cin`, the result of another staged function) is cut there:
+
+- **The cut.** The parser (or, for a function with `auto` parameters, the instantiation of its body: `TreeTransform::TransformCompoundStmt`) keeps the rest of the block as text, and the function returns `std::sh::__cppsh_cut(Id, std::sh::__cppsh_frame(live locals...))`, of type `staged`. The live locals are the variables in scope at the need, innermost of a name, up to the parameters, plus the iterators of the range-fors around it; their types fully qualified, `&&`-marked where they have no copy (moved).
+- **The continuation.** `__cppsh_cut_run` compiles `__cppsh_contK(auto locals...)` with the remainder as its body, against reference globals `__cppsh_fK_x` bound to the frame, and keeps its result in `__cppsh_resK` (`std::sh::__cppsh_value`). The locals are value-specialized: the rest compiles with their values known. The result of a staging is that of the innermost continuation.
+- **Callers.** A call of a staged function cuts its caller in turn; at the top level the call is hoisted, run on its own, and its result put in its place.
+- **Nested blocks.** A need in a nested block is cut there; each block around it appends what follows its statement to the remainder (the inner rest braced; nothing after an inner rest that always returns) and cuts there too, so every way out of the function is staged alike.
+- **Loops.** A need in a loop body is cut there. The continuation finishes the iteration in `do { ... } while (false)` (so `continue` works; an own `break` sets `__cppsh_brkN`), then calls `__cppsh_loopK(T &locals..., bool brk)`, which runs the loop on from its next step (`inc; for (; cond; inc) body`, `while (cond) body`, `++__begin; for (; __begin != __end; ++__begin) { decl = *__begin; body }`) and what follows it. Its locals are references, never constants, since the next iteration changes them; its body is parsed and its need cut again, so each iteration that reaches the need compiles once. When every cut in a loop was made for one local declared before it that the loop does not change (an AST walk), the cut is moved before the loop: one continuation for the whole loop.
+- **switch.** The rest of the case and the cases it falls through to run in `do { ... } while (false)` with their labels dropped.
+- **Refused, with a diagnostic:** a `return` before the need in the same block; a continuation whose first statement needs the value again (it would never progress); a structured binding as a range-for variable; a loop condition declaring a variable; an own `continue` in the rest of a switch.
+- **Prompting.** `std::cin >> x` as typed reads through `std::sh::__cppsh_ask`, which shows `x? ` on stderr when stdin is a terminal.
