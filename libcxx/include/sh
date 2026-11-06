@@ -40,6 +40,16 @@
 #include <variant>
 #include <vector>
 
+#if __has_include(<spawn.h>)
+#  include <fcntl.h>
+#  include <signal.h>
+#  include <spawn.h>
+#  include <sys/wait.h>
+#  include <thread>
+#  include <unistd.h>
+extern "C" char **environ;
+#endif
+
 namespace std {
 
 template <typename T>
@@ -52,6 +62,19 @@ constexpr const char *__cppsh_cstr(const T &v) {
     return std::visit([](const auto &a) { return __cppsh_cstr(a); }, v);
   else
     return static_cast<const char *>(v);
+}
+
+// An element as a line of text: its name or text, else as it formats.
+template <typename T>
+std::string __cppsh_cstr_or_format(const T &v) {
+  if constexpr (requires { v.text; })
+    return std::string(v.text);
+  else if constexpr (requires { std::string_view(v); })
+    return std::string(std::string_view(v));
+  else if constexpr (requires { v.name; } || __cppsh_is_variant<T>)
+    return std::string(__cppsh_cstr(v));
+  else
+    return std::format("{}", v);
 }
 
 template <typename T>
@@ -440,6 +463,8 @@ inline constexpr __cppsh_show_stage show{};
 
 namespace sh {
 
+struct command;
+
 template <char... Cs>
 struct sym {
   static constexpr const char value[sizeof...(Cs) + 1] = {Cs..., '\0'};
@@ -464,13 +489,11 @@ struct sym {
   constexpr auto operator/(sym<RCs...>) const noexcept {
     return sym<Cs..., '/', RCs...>{};
   }
+  // `git status`, `ls -la`: a command of this name and these words, run
+  // with them as its argv -- no shell between -- as its full expression
+  // ends, or where what it gives is used (std::sh::command).
   template <typename... Args>
-  int operator()(Args &&...args) const {
-    std::ostringstream cmd;
-    cmd << value;
-    ((cmd << ' ' << args), ...);
-    return std::system(cmd.str().c_str());
-  }
+  command operator()(Args &&...args) const;
 };
 
 template <char... Cs>
@@ -884,6 +907,511 @@ struct sh_result {
   constexpr explicit operator bool() const noexcept { return code == 0; }
   void dump() const { std::printf("%s", out.c_str()); }
 };
+
+// ---- External commands ---------------------------------------------------
+//
+// A command is a program and its words (argv), spawned directly -- no
+// /bin/sh re-reading them: a word is one argument, whatever it holds -- with
+// what its stdin, stdout and stderr are. It is a value, run once:
+//   - as its full expression ends, where nothing used it (`git status;`):
+//     in the foreground, the terminal its own while it runs -- Ctrl+C and
+//     Ctrl+Z go to it -- its output straight to the terminal;
+//   - where what it gives is used: its exit status (`if (git diff --quiet)`,
+//     `make && ./a.out`: explicit operator bool), its output as a string
+//     (`std::string head = git rev-parse HEAD;`, trimmed), or as lines,
+//     streamed (`git log --oneline | take 5`: a range of line_entry);
+//   - piped into another (`dmesg | grep usb`... a pipeline, one OS pipe
+//     between each two), or fed a range (`ls | where _.is_dir() | xargs echo`:
+//     its elements, a line each, its stdin).
+// Redirects: `cmd > "out.txt"`, `cmd >> "log"`, `cmd < "in.txt"`,
+// cmd.err_to_out() (2>&1). The exit status of the last run is last_status
+// -- a pipeline's, its last failing stage's (pipefail).
+
+inline int last_status = 0;
+
+// A word of a command, from what was written: a string as it is; a number
+// as it is written; an entry by its name; a range, a word per element.
+inline void __cppsh_word(std::vector<std::string> &out, const char *v) { out.emplace_back(v); }
+inline void __cppsh_word(std::vector<std::string> &out, std::string_view v) { out.emplace_back(v); }
+inline void __cppsh_word(std::vector<std::string> &out, const std::string &v) { out.push_back(v); }
+template <typename T>
+void __cppsh_word(std::vector<std::string> &out, const T &v) {
+  if constexpr (std::is_same_v<T, bool>)
+    out.emplace_back(v ? "true" : "false");
+  else if constexpr (std::is_arithmetic_v<T>)
+    out.push_back(std::format("{}", v));
+  else if constexpr (requires { std::string_view(v); })
+    out.emplace_back(std::string_view(v));
+  else if constexpr (requires { v.name; } || __cppsh_is_variant<T>)
+    out.emplace_back(__cppsh_cstr(v));
+  else if constexpr (std::ranges::input_range<T>)
+    for (const auto &e : v)
+      __cppsh_word(out, e);
+  else
+    out.push_back(std::format("{}", v));
+}
+
+#if __has_include(<spawn.h>)
+// A process started: argv, its stdin/stdout/stderr the descriptors given
+// (-1: the shell's own), in the process group `group` (0: a new one, its
+// own). The descriptors the shell keeps for other stages are closed in it.
+inline pid_t __cppsh_spawn(const std::vector<std::string> &argv, int in, int out,
+                           int err, pid_t group, const std::vector<int> &close_fds) {
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  if (in >= 0)
+    posix_spawn_file_actions_adddup2(&fa, in, 0);
+  if (out >= 0)
+    posix_spawn_file_actions_adddup2(&fa, out, 1);
+  if (err >= 0)
+    posix_spawn_file_actions_adddup2(&fa, err, 2);
+  for (int fd : close_fds)
+    posix_spawn_file_actions_addclose(&fa, fd);
+  posix_spawnattr_t at;
+  posix_spawnattr_init(&at);
+  posix_spawnattr_setpgroup(&at, group);
+  // The signals the shell catches or ignores, as a program finds them.
+  sigset_t def;
+  sigemptyset(&def);
+  for (int s : {SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU, SIGPIPE})
+    sigaddset(&def, s);
+  posix_spawnattr_setsigdefault(&at, &def);
+  posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF);
+  std::vector<char *> args;
+  for (const std::string &a : argv)
+    args.push_back(const_cast<char *>(a.c_str()));
+  args.push_back(nullptr);
+  pid_t pid = -1;
+  if (posix_spawnp(&pid, args[0], &fa, &at, args.data(), environ) != 0) {
+    std::fprintf(stderr, "cppsh: %s: command not found\n", args[0]);
+    pid = -1;
+  }
+  posix_spawn_file_actions_destroy(&fa);
+  posix_spawnattr_destroy(&at);
+  return pid;
+}
+
+// The terminal given to a foreground group while it runs, and taken back.
+struct __cppsh_foreground {
+  bool tty = ::isatty(0);
+  explicit __cppsh_foreground(pid_t group) {
+    if (tty && group > 0)
+      ::tcsetpgrp(0, group);
+  }
+  ~__cppsh_foreground() {
+    if (!tty)
+      return;
+    // Taking it back from the background is a SIGTTOU: ignored for that.
+    void (*was)(int) = ::signal(SIGTTOU, SIG_IGN);
+    ::tcsetpgrp(0, ::getpgrp());
+    ::signal(SIGTTOU, was);
+  }
+};
+
+// A process waited for: its status as a shell says it (128 + a signal).
+inline int __cppsh_wait(pid_t pid) {
+  if (pid <= 0)
+    return 127;
+  int st = 0;
+  while (::waitpid(pid, &st, WUNTRACED) < 0)
+    if (errno != EINTR)
+      return 127;
+  if (WIFEXITED(st))
+    return WEXITSTATUS(st);
+  if (WIFSIGNALED(st))
+    return 128 + WTERMSIG(st);
+  if (WIFSTOPPED(st)) {
+    std::fprintf(stderr, "\n[stopped] %d\n", static_cast<int>(pid));
+    return 128 + WSTOPSIG(st);
+  }
+  return 1;
+}
+#endif
+
+struct command {
+  std::vector<std::string> argv;
+  std::optional<std::string> in_file, out_file;
+  bool append = false, err_to_out_ = false;
+  // What its stdin is fed, where a range was piped into it.
+  std::optional<std::string> input;
+  // Run, or given over (moved, piped, consumed): not run again.
+  bool done = false;
+
+  command() = default;
+  explicit command(std::vector<std::string> words) : argv(std::move(words)) {}
+  command(const command &) = delete;
+  command &operator=(const command &) = delete;
+  command(command &&o) noexcept
+      : argv(std::move(o.argv)), in_file(std::move(o.in_file)), out_file(std::move(o.out_file)),
+        append(o.append), err_to_out_(o.err_to_out_), input(std::move(o.input)), done(o.done) {
+    o.done = true;
+  }
+  command &operator=(command &&o) noexcept {
+    if (this != &o) {
+      if (!done)
+        run();
+      argv = std::move(o.argv);
+      in_file = std::move(o.in_file);
+      out_file = std::move(o.out_file);
+      append = o.append;
+      err_to_out_ = o.err_to_out_;
+      input = std::move(o.input);
+      done = o.done;
+      o.done = true;
+    }
+    return *this;
+  }
+  // Nothing used it: it runs as its full expression ends.
+  ~command() {
+    if (!done)
+      run();
+  }
+
+  command &&err_to_out() && {
+    err_to_out_ = true;
+    return std::move(*this);
+  }
+
+  // Run in the foreground, its output to the terminal (or its file): its
+  // exit status.
+  int run();
+  // Run, its stdout taken: (status, what it wrote).
+  std::pair<int, std::string> capture();
+
+  int status() { return run(); }
+  std::string out() { return capture().second; }
+  explicit operator bool() { return run() == 0; }
+  // Its output, trailing newlines off: `std::string h = git rev-parse HEAD;`.
+  operator std::string() {
+    std::string s = capture().second;
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+      s.pop_back();
+    return s;
+  }
+
+  // Its output as lines, streamed as it writes them: a range of line_entry.
+  struct state;
+  struct iterator {
+    using iterator_concept = std::input_iterator_tag;
+    using value_type = line_entry;
+    using difference_type = std::ptrdiff_t;
+    std::shared_ptr<state> st;
+    line_entry cur{};
+    bool at_end = true;
+    void next();
+    const line_entry &operator*() const noexcept { return cur; }
+    const line_entry *operator->() const noexcept { return &cur; }
+    iterator &operator++() {
+      next();
+      return *this;
+    }
+    void operator++(int) { next(); }
+    bool operator==(std::default_sentinel_t) const noexcept { return at_end; }
+  };
+  iterator begin();
+  std::default_sentinel_t end() const noexcept { return std::default_sentinel; }
+};
+
+// Redirects.
+template <typename Path>
+  requires requires(const Path &p) { __cppsh_cstr(p); }
+command &&operator>(command &&c, const Path &p) {
+  c.out_file = __cppsh_cstr(p);
+  c.append = false;
+  return std::move(c);
+}
+template <typename Path>
+  requires requires(const Path &p) { __cppsh_cstr(p); }
+command &&operator>>(command &&c, const Path &p) {
+  c.out_file = __cppsh_cstr(p);
+  c.append = true;
+  return std::move(c);
+}
+template <typename Path>
+  requires requires(const Path &p) { __cppsh_cstr(p); }
+command &&operator<(command &&c, const Path &p) {
+  c.in_file = __cppsh_cstr(p);
+  return std::move(c);
+}
+
+// Commands one after another, each's stdout the next's stdin.
+struct pipeline {
+  std::vector<command> stages;
+  bool done = false;
+  pipeline() = default;
+  pipeline(const pipeline &) = delete;
+  pipeline(pipeline &&o) noexcept : stages(std::move(o.stages)), done(o.done) { o.done = true; }
+  ~pipeline() {
+    if (!done)
+      run();
+  }
+  // The stages run together; the status, the last failing stage's.
+  std::pair<int, std::string> run_all(bool capture);
+  int run() { return run_all(false).first; }
+  std::string out() { return run_all(true).second; }
+  explicit operator bool() { return run() == 0; }
+  operator std::string() {
+    std::string s = run_all(true).second;
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+      s.pop_back();
+    return s;
+  }
+  // Its output as lines: the stages run, the last one's output read whole.
+  std::vector<line_entry> lines() {
+    std::vector<line_entry> out_lines;
+    std::string all = run_all(true).second;
+    long long n = 0;
+    std::size_t from = 0;
+    while (from < all.size()) {
+      std::size_t to = all.find('\n', from);
+      if (to == std::string::npos)
+        to = all.size();
+      std::string s = all.substr(from, to - from);
+      if (!s.empty() && s.back() == '\r')
+        s.pop_back();
+      long long sz = static_cast<long long>(s.size());
+      out_lines.push_back(line_entry{++n, std::move(s), sz});
+      from = to + 1;
+    }
+    return out_lines;
+  }
+  auto begin() {
+    held_ = lines();
+    return held_.begin();
+  }
+  auto end() { return held_.end(); }
+  std::vector<line_entry> held_;
+};
+
+inline pipeline operator|(command &&a, command &&b) {
+  pipeline p;
+  p.stages.push_back(std::move(a));
+  p.stages.push_back(std::move(b));
+  return p;
+}
+inline pipeline operator|(pipeline &&a, command &&b) {
+  pipeline p(std::move(a));
+  p.stages.push_back(std::move(b));
+  return p;
+}
+// A range into a command: its elements, a line each, the command's stdin.
+template <typename Rng>
+  requires(std::ranges::input_range<Rng> &&
+           !std::is_same_v<std::remove_cvref_t<Rng>, command> &&
+           !std::is_same_v<std::remove_cvref_t<Rng>, pipeline>)
+command &&operator|(Rng &&rng, command &&c) {
+  std::string fed;
+  for (auto &&e : rng) {
+    fed += __cppsh_cstr_or_format(e);
+    fed += '\n';
+  }
+  c.input = std::move(fed);
+  return std::move(c);
+}
+
+#if __has_include(<spawn.h>)
+// Each stage spawned, the pipes between them, the first's stdin fed where
+// a range was piped in, the last's stdout read where it is captured.
+inline std::pair<int, std::string> __cppsh_run_stages(std::vector<command *> stages,
+                                                      bool capture) {
+  std::vector<int> all_fds;
+  std::vector<std::pair<int, int>> pipes;
+  for (std::size_t i = 0; i + 1 < stages.size(); ++i) {
+    int fds[2];
+    if (::pipe(fds) != 0)
+      return {127, {}};
+    pipes.push_back({fds[0], fds[1]});
+    all_fds.push_back(fds[0]);
+    all_fds.push_back(fds[1]);
+  }
+  int feed[2] = {-1, -1}, take[2] = {-1, -1};
+  if (stages.front()->input && ::pipe(feed) == 0) {
+    all_fds.push_back(feed[0]);
+    all_fds.push_back(feed[1]);
+  }
+  if (capture && ::pipe(take) == 0) {
+    all_fds.push_back(take[0]);
+    all_fds.push_back(take[1]);
+  }
+  std::vector<int> files;
+  std::vector<pid_t> pids;
+  pid_t group = 0;
+  for (std::size_t i = 0; i < stages.size(); ++i) {
+    command &c = *stages[i];
+    int in = i > 0 ? pipes[i - 1].first : feed[0];
+    int out = i + 1 < stages.size() ? pipes[i].second : take[1];
+    if (c.in_file) {
+      int fd = ::open(c.in_file->c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd >= 0) {
+        files.push_back(fd);
+        in = fd;
+      }
+    }
+    if (c.out_file) {
+      int fd = ::open(c.out_file->c_str(),
+                      O_WRONLY | O_CREAT | O_CLOEXEC | (c.append ? O_APPEND : O_TRUNC), 0644);
+      if (fd >= 0) {
+        files.push_back(fd);
+        out = fd;
+      }
+    }
+    int err = c.err_to_out_ ? (out >= 0 ? out : 1) : -1;
+    pid_t pid = __cppsh_spawn(c.argv, in, out, err, group, all_fds);
+    if (group == 0 && pid > 0)
+      group = pid;
+    pids.push_back(pid);
+    c.done = true;
+  }
+  for (std::size_t i = 0; i < all_fds.size(); ++i)
+    if (all_fds[i] != feed[1] && all_fds[i] != take[0])
+      ::close(all_fds[i]);
+  for (int fd : files)
+    ::close(fd);
+  // stdin fed on a thread of its own: a child writing a lot and reading
+  // a lot would block either side otherwise.
+  std::thread feeder;
+  if (feed[1] >= 0) {
+    feeder = std::thread([fd = feed[1], data = *stages.front()->input] {
+      std::size_t off = 0;
+      while (off < data.size()) {
+        ssize_t n = ::write(fd, data.data() + off, data.size() - off);
+        if (n <= 0)
+          break;
+        off += static_cast<std::size_t>(n);
+      }
+      ::close(fd);
+    });
+  }
+  std::string got;
+  int status = 0;
+  {
+    // The terminal the group's while it runs, captured or not: what it
+    // asks the user (a password, a pager) reaches them.
+    __cppsh_foreground fg(group);
+    if (take[0] >= 0) {
+      char buf[4096];
+      ssize_t n;
+      while ((n = ::read(take[0], buf, sizeof buf)) > 0 || (n < 0 && errno == EINTR))
+        if (n > 0)
+          got.append(buf, static_cast<std::size_t>(n));
+      ::close(take[0]);
+    }
+    for (pid_t pid : pids) {
+      int s = __cppsh_wait(pid);
+      if (s != 0)
+        status = s;
+    }
+  }
+  if (feeder.joinable())
+    feeder.join();
+  last_status = status;
+  return {status, std::move(got)};
+}
+
+inline int command::run() {
+  if (done)
+    return last_status;
+  return __cppsh_run_stages({this}, false).first;
+}
+inline std::pair<int, std::string> command::capture() {
+  if (done)
+    return {last_status, {}};
+  return __cppsh_run_stages({this}, true);
+}
+inline std::pair<int, std::string> pipeline::run_all(bool capture) {
+  done = true;
+  std::vector<command *> all;
+  for (command &c : stages)
+    all.push_back(&c);
+  if (all.empty())
+    return {0, {}};
+  return __cppsh_run_stages(std::move(all), capture);
+}
+
+// Lines streamed: the command spawned as iteration begins, read a line at a
+// time, waited for at the end.
+struct command::state {
+  FILE *in = nullptr;
+  pid_t pid = -1;
+  long long line_no = 0;
+  ~state() {
+    if (in)
+      std::fclose(in);
+    if (pid > 0)
+      last_status = __cppsh_wait(pid);
+  }
+};
+inline command::iterator command::begin() {
+  iterator it;
+  if (done)
+    return it;
+  done = true;
+  int fds[2];
+  if (::pipe(fds) != 0)
+    return it;
+  int in = -1;
+  if (in_file)
+    in = ::open(in_file->c_str(), O_RDONLY | O_CLOEXEC);
+  pid_t pid = __cppsh_spawn(argv, in, fds[1], err_to_out_ ? fds[1] : -1, 0, {fds[0]});
+  ::close(fds[1]);
+  if (in >= 0)
+    ::close(in);
+  it.st = std::make_shared<state>();
+  it.st->pid = pid;
+  it.st->in = ::fdopen(fds[0], "r");
+  it.at_end = false;
+  it.next();
+  return it;
+}
+inline void command::iterator::next() {
+  if (!st || !st->in) {
+    at_end = true;
+    st.reset();
+    return;
+  }
+  char *line = nullptr;
+  std::size_t cap = 0;
+  ssize_t n = ::getline(&line, &cap, st->in);
+  if (n < 0) {
+    std::free(line);
+    at_end = true;
+    st.reset();
+    return;
+  }
+  std::string s(line, static_cast<std::size_t>(n));
+  std::free(line);
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+    s.pop_back();
+  long long sz = static_cast<long long>(s.size());
+  cur = line_entry{++st->line_no, std::move(s), sz};
+}
+#else
+inline int command::run() {
+  done = true;
+  return last_status = 127;
+}
+inline std::pair<int, std::string> command::capture() {
+  done = true;
+  return {last_status = 127, {}};
+}
+inline std::pair<int, std::string> pipeline::run_all(bool) {
+  done = true;
+  return {last_status = 127, {}};
+}
+inline command::iterator command::begin() {
+  done = true;
+  return {};
+}
+inline void command::iterator::next() { at_end = true; }
+#endif
+
+template <char... Cs>
+template <typename... Args>
+command sym<Cs...>::operator()(Args &&...args) const {
+  std::vector<std::string> words{std::string(value, sizeof...(Cs))};
+  (__cppsh_word(words, args), ...);
+  return command(std::move(words));
+}
 
 template <typename Cmd>
 inline int run(const Cmd &cmd) {

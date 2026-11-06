@@ -571,6 +571,15 @@ llvm::Expected<Expr *> Interpreter::convertExprToValue(Expr *E) {
 
     if (CXXRecordDecl *RD = E->getType().getNonReferenceType()->getAsCXXRecordDecl()) {
       llvm::StringRef RName = RD->getIdentifier() ? RD->getIdentifier()->getName() : "";
+      // A command or a pipeline (`git status`): run as the statement ends --
+      // its output is the terminal's -- not printed as a value, nor shown
+      // as a table of its lines.
+      if ((RName == "command" || RName == "pipeline") && RD->getDeclContext()->isNamespace()) {
+        ExprResult Discarded = S.BuildCStyleCastExpr(
+            E->getBeginLoc(), Ctx.getTrivialTypeSourceInfo(Ctx.VoidTy), E->getEndLoc(), E);
+        if (Discarded.isUsable())
+          return S.MaybeCreateExprWithCleanups(Discarded.get());
+      }
       if (RName != "basic_string" && RName != "basic_string_view" &&
           RName != "sym" && !RD->lookup(&Ctx.Idents.get("begin")).empty()) {
         LookupResult ShowR(S, &Ctx.Idents.get("show"), E->getBeginLoc(),
