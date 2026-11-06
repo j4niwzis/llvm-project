@@ -1565,8 +1565,13 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
   // The input as staging rewrites it: a hoisted call replaced by its result.
   std::string Rewritten;
   for (;;) {
-    if (CppshBeforeChunk)
-      CppshBeforeChunk(*this, Code);
+    // Off while it runs: what it compiles (the snapshots) names the same
+    // variables, and would snapshot them again, without end.
+    if (auto *Hook = CppshBeforeChunk) {
+      CppshBeforeChunk = nullptr;
+      Hook(*this, Code);
+      CppshBeforeChunk = Hook;
+    }
 
     CppshStagePlan Plan;
     if (cppshSeveralStatements(Code))
