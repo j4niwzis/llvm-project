@@ -374,13 +374,20 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
       BodyToks.push_back(Cur);
       ConsumeAnyToken();
     }
-    Out.push_back(makeTok(tok::l_brace, EqLoc));
-    if (!BodyToks.empty() &&
-        !BodyToks.front().isOneOf(tok::kw_return, tok::caret))
-      Out.push_back(makeKwTok(tok::kw_return, "return", EqLoc));
-    Out.append(BodyToks.begin(), BodyToks.end());
-    Out.push_back(makeTok(tok::semi, EqLoc));
-    Out.push_back(makeTok(tok::r_brace, EqLoc));
+    bool IsCompoundBody = BodyToks.size() >= 2 &&
+                          BodyToks.front().is(tok::l_brace) &&
+                          BodyToks.back().is(tok::r_brace);
+    if (IsCompoundBody) {
+      Out.append(BodyToks.begin(), BodyToks.end());
+    } else {
+      Out.push_back(makeTok(tok::l_brace, EqLoc));
+      if (!BodyToks.empty() &&
+          !BodyToks.front().isOneOf(tok::kw_return, tok::caret))
+        Out.push_back(makeKwTok(tok::kw_return, "return", EqLoc));
+      Out.append(BodyToks.begin(), BodyToks.end());
+      Out.push_back(makeTok(tok::semi, EqLoc));
+      Out.push_back(makeTok(tok::r_brace, EqLoc));
+    }
   }
 
   Out.push_back(Tok);
@@ -1493,9 +1500,15 @@ Parser::isCXXDeclarationSpecifier(ImplicitTypenameContext AllowImplicitTypename,
       return TPResult::True;
 
     const Token &Next = NextToken();
-    // In 'foo bar', 'foo' is always a type name outside of Objective-C.
-    if (!getLangOpts().ObjC && Next.is(tok::identifier))
-      return TPResult::True;
+    // In 'foo bar', 'foo' is a type name only if it actually resolves to a type
+    // in user code (otherwise 'foo bar' is an unparenthesized call expression).
+    if (!getLangOpts().ObjC && Next.is(tok::identifier)) {
+      if (PP.getSourceManager().isInSystemHeader(Tok.getLocation()) ||
+          Actions.getTypeName(*Tok.getIdentifierInfo(), Tok.getLocation(),
+                              getCurScope()))
+        return TPResult::True;
+      return TPResult::False;
+    }
 
     // If this identifier was reverted from a token ID, and the next token
     // is a '(', we assume it to be a use of a type trait, so this
@@ -1511,8 +1524,10 @@ Parser::isCXXDeclarationSpecifier(ImplicitTypenameContext AllowImplicitTypename,
       // a parse error one way or another. In that case, tell the caller that
       // this is ambiguous. Typo-correct to type and expression keywords and
       // to types and identifiers, in order to try to recover from errors.
+      bool InSysHeader =
+          PP.getSourceManager().isInSystemHeader(Tok.getLocation());
       TentativeParseCCC CCC(Next);
-      switch (TryAnnotateName(&CCC)) {
+      switch (TryAnnotateName(InSysHeader ? &CCC : nullptr)) {
       case AnnotatedNameKind::Error:
         return TPResult::Error;
       case AnnotatedNameKind::TentativeDecl:
@@ -1533,7 +1548,8 @@ Parser::isCXXDeclarationSpecifier(ImplicitTypenameContext AllowImplicitTypename,
         // argument is an error, and was probably intended to be a type.
         return GreaterThanIsOperator ? TPResult::True : TPResult::False;
       case AnnotatedNameKind::Unresolved:
-        return InvalidAsDeclSpec ? TPResult::Ambiguous : TPResult::False;
+        return (InSysHeader && InvalidAsDeclSpec) ? TPResult::Ambiguous
+                                                  : TPResult::False;
       case AnnotatedNameKind::Success:
         break;
       }
