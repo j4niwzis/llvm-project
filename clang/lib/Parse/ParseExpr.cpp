@@ -128,7 +128,7 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
   auto isPathStart = [&]() -> bool {
     return Tok.isOneOf(tok::slash, tok::period, tok::tilde, tok::star, tok::unknown) &&
            Tok.hasLeadingSpace() && !NextToken().hasLeadingSpace() &&
-           !NextToken().isOneOf(tok::eof, tok::semi, tok::pipe, tok::annot_repl_input_end);
+           !NextToken().isOneOf(tok::eof, tok::semi, tok::pipe);
   };
   auto canStartArg = [&]() -> bool {
     if (Tok.is(tok::l_brace))
@@ -161,7 +161,7 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
       return T.hasLeadingSpace() || T.isAtStartOfLine() ||
              T.isOneOf(tok::eof, tok::semi, tok::pipe, tok::pipepipe, tok::ampamp,
                        tok::r_paren, tok::r_brace, tok::r_square, tok::comma,
-                       tok::l_brace, tok::annot_repl_input_end);
+                       tok::l_brace);
     };
     auto shellOnly = [](const Token &T) {
       return T.isOneOf(tok::tilde, tok::colon, tok::star, tok::equal, tok::question,
