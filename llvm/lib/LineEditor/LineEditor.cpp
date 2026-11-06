@@ -257,6 +257,25 @@ unsigned char ElHintWordRightFn(EditLine *EL, int) { return hintMove(EL, 0, 1); 
 // libedit for it is bound here, and the line drawn again.
 unsigned char ElHintReadyFn(EditLine *, int) { return CC_REFRESH; }
 
+// Up, Down (Ctrl+P, Ctrl+N): libedit own step through the history -- bound
+// to ^X^P, ^X^N for this alone, its key pushed back -- then ^X^R: the hint
+// of the line it brought (the old one stayed until a key was typed).
+unsigned char ElHintHistPrevFn(EditLine *EL, int) {
+  ::el_push(EL, const_cast<char *>("\030\020\030\022"));
+  return CC_NORM;
+}
+unsigned char ElHintHistNextFn(EditLine *EL, int) {
+  ::el_push(EL, const_cast<char *>("\030\016\030\022"));
+  return CC_NORM;
+}
+unsigned char ElHintRefreshFn(EditLine *EL, int) {
+  LineEditor::InternalData *Data;
+  if (el_get(EL, EL_CLIENTDATA, &Data) != 0)
+    return CC_ERROR;
+  refreshHint(EL, Data);
+  return CC_REFRESH;
+}
+
 // Keys read for libedit (EL_GETCFN), waiting for the background hint too:
 // the terminal and the hint's descriptor polled together, so that typing is
 // never held up by a hint being worked out, and a hint that comes is shown
@@ -527,6 +546,16 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
     ::el_set(Data->EL, EL_BIND, Key, "hint_word_left", NULL);
   for (const char *Key : {"\\e[1;5C", "\\e[5C", "\\eOc", "\\e\\e[C"})
     ::el_set(Data->EL, EL_BIND, Key, "hint_word_right", NULL);
+  ::el_set(Data->EL, EL_ADDFN, "hint_hist_prev", "History back, then hint", ElHintHistPrevFn);
+  ::el_set(Data->EL, EL_ADDFN, "hint_hist_next", "History on, then hint", ElHintHistNextFn);
+  ::el_set(Data->EL, EL_ADDFN, "hint_refresh", "The hint of the line", ElHintRefreshFn);
+  ::el_set(Data->EL, EL_BIND, "^X^P", "ed-prev-history", NULL);
+  ::el_set(Data->EL, EL_BIND, "^X^N", "ed-next-history", NULL);
+  ::el_set(Data->EL, EL_BIND, "^X^R", "hint_refresh", NULL);
+  for (const char *Key : {"\\e[A", "\\eOA", "^P"})
+    ::el_set(Data->EL, EL_BIND, Key, "hint_hist_prev", NULL);
+  for (const char *Key : {"\\e[B", "\\eOB", "^N"})
+    ::el_set(Data->EL, EL_BIND, Key, "hint_hist_next", NULL);
   ::el_set(Data->EL, EL_BIND, "^r", "em-inc-search-prev",
            NULL); // Cycle through backwards search, entering string
   ::el_set(Data->EL, EL_BIND, "^w", "ed-delete-prev-word",
