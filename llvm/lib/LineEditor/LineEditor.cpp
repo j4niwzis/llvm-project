@@ -182,34 +182,19 @@ unsigned char ElHintDeleteFn(EditLine *EL, int) {
   return CC_REFRESH;
 }
 
-// Enter: the hint taken off the line before it is entered -- the line drawn
-// again without it -- so that none stays in what was typed.
+// Enter: the hint taken off the line, then libedit's own newline. The line
+// is drawn again without the hint (CC_REFRESH), and ed-newline -- bound to
+// ^X^J for this alone, its key pushed back -- enters it as libedit always
+// does: drawing it ourselves left the line's colours to the hint's (the line
+// dim) and the hint itself behind.
 unsigned char ElHintEnterFn(EditLine *EL, int) {
   LineEditor::InternalData *Data;
   if (el_get(EL, EL_CLIENTDATA, &Data) != 0)
     return CC_ERROR;
-  bool Shown = !Data->RPrompt.empty();
   Data->LE->clearHint();
   Data->RPrompt.clear();
-  const LineInfo *LI = ::el_line(EL);
-  if (Shown) {
-    std::string Line = "\r";
-    for (char Ch : Data->LE->getPrompt())
-      if (Ch != '\001')
-        Line += Ch;
-    Line.append(LI->buffer, LI->lastchar - LI->buffer);
-    Line += "\033[K";
-    ::fwrite(Line.data(), Line.size(), 1, Data->Out);
-    ::fflush(Data->Out);
-  }
-  // As libedit's own newline (ed-newline): the line ended with '\n' at its
-  // end, and the terminal taken to the next line -- which ed-newline does
-  // itself, and a function of ours returning CC_NEWLINE does not get.
-  ::el_cursor(EL, static_cast<int>(LI->lastchar - LI->cursor));
-  ::el_insertstr(EL, "\n");
-  ::fwrite("\n", 1, 1, Data->Out);
-  ::fflush(Data->Out);
-  return CC_NEWLINE;
+  ::el_push(EL, const_cast<char *>("\030\012"));
+  return CC_REFRESH;
 }
 
 // Handles tab completion.
@@ -396,6 +381,7 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
   ::el_set(Data->EL, EL_BIND, "^H", "hint_delete", NULL);
   ::el_set(Data->EL, EL_BIND, "^M", "hint_enter", NULL);
   ::el_set(Data->EL, EL_BIND, "^J", "hint_enter", NULL);
+  ::el_set(Data->EL, EL_BIND, "^X^J", "ed-newline", NULL);
   ::el_set(Data->EL, EL_BIND, "^r", "em-inc-search-prev",
            NULL); // Cycle through backwards search, entering string
   ::el_set(Data->EL, EL_BIND, "^w", "ed-delete-prev-word",
