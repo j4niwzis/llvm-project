@@ -21,6 +21,7 @@
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Sema.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/LineEditor/LineEditor.h"
@@ -41,7 +42,9 @@
 #include <cctype>
 #include <clocale>
 #include <cstdlib>
+#include <map>
 #include <optional>
+#include <regex>
 #include <set>
 #include <string>
 #include <vector>
@@ -223,64 +226,608 @@ struct ReplListCompleter {
     }
   }
 
-  static void completeRecordMembers(const clang::CXXRecordDecl *RD,
-                                    llvm::StringRef Prefix,
-                                    bool OnlyFields,
-                                    std::vector<llvm::LineEditor::Completion> &Out) {
-    if (!RD)
+  struct MemberItem {
+    std::string Typed;
+    std::string Display;
+    std::string SortKey;
+  };
+
+  static bool isPublic(const clang::Decl *D) {
+    return D->getAccess() == clang::AS_public || D->getAccess() == clang::AS_none;
+  }
+
+  // Shortens what a type prints as, for a hint: the strings and views of
+  // libc++ by their everyday names.
+  static std::string shortTypeName(clang::QualType T, const clang::ASTContext &Ctx) {
+    if (T.isNull())
+      return "?";
+    clang::PrintingPolicy PP(Ctx.getLangOpts());
+    PP.SuppressScope = true;
+    std::string S = T.getNonReferenceType().getUnqualifiedType().getAsString(PP);
+    if (S.find("basic_string_view") != std::string::npos)
+      return "string_view";
+    if (S.find("basic_string") != std::string::npos)
+      return "string";
+    if (S.size() > 40)
+      S = S.substr(0, 37) + "...";
+    return S;
+  }
+
+  // The members of a record that a user may name: its own and its public
+  // bases', public, not the implementation's (`__x`), each once -- the most
+  // derived one where a base's has the same name.
+  static void collectMembers(const clang::CXXRecordDecl *RD,
+                             llvm::StringRef Prefix, bool OnlyFields,
+                             std::vector<MemberItem> &Items,
+                             std::set<std::string> &Seen, unsigned Depth = 0) {
+    if (!RD || Depth > 16)
       return;
     RD = RD->getDefinition();
     if (!RD)
       return;
-
-    struct Item {
-      std::string Typed;
-      std::string Display;
-      std::string SortKey;
-    };
-    std::vector<Item> Items;
-    std::set<std::string> Seen;
+    const clang::ASTContext &Ctx = RD->getASTContext();
 
     for (const clang::FieldDecl *FD : RD->fields()) {
-      if (!FD->getIdentifier())
+      if (!FD->getIdentifier() || !isPublic(FD))
         continue;
       llvm::StringRef FName = FD->getName();
       if (!FName.starts_with(Prefix) || FName.starts_with("__"))
         continue;
       if (!Seen.insert(FName.str()).second)
         continue;
-      std::string TypeStr = FD->getType().getAsString();
-      if (TypeStr.find("basic_string") != std::string::npos)
-        TypeStr = "string";
       std::string Rest = FName.substr(Prefix.size()).str();
       if (OnlyFields)
         Rest += " = ";
       std::string Disp = "\033[1;36m." + FName.str() + "\033[0m \033[90m(" +
-                         TypeStr + ")\033[0m";
+                         shortTypeName(FD->getType(), Ctx) + ")\033[0m";
       Items.push_back({Rest, Disp, FName.str()});
     }
 
     if (!OnlyFields) {
-      for (const clang::CXXMethodDecl *MD : RD->methods()) {
-        if (!MD->getIdentifier() || MD->isImplicit())
-          continue;
+      auto addMethod = [&](const clang::FunctionDecl *MD) {
+        if (!MD || !MD->getIdentifier() || MD->isImplicit() || !isPublic(MD))
+          return;
+        if (const auto *M = llvm::dyn_cast<clang::CXXMethodDecl>(MD))
+          if (llvm::isa<clang::CXXConstructorDecl, clang::CXXDestructorDecl>(M))
+            return;
         llvm::StringRef MName = MD->getName();
         if (!MName.starts_with(Prefix) || MName.starts_with("__") ||
             MName == "dump")
-          continue;
+          return;
         if (!Seen.insert(MName.str()).second)
-          continue;
+          return;
         std::string Rest = MName.substr(Prefix.size()).str();
         Rest += (MD->getMinRequiredArguments() == 0) ? "()" : "(";
         std::string Disp = "\033[1;33m." + MName.str() + "()\033[0m";
         Items.push_back({Rest, Disp, MName.str()});
+      };
+      for (const clang::Decl *D : RD->decls()) {
+        if (const auto *MD = llvm::dyn_cast<clang::CXXMethodDecl>(D))
+          addMethod(MD);
+        else if (const auto *FTD = llvm::dyn_cast<clang::FunctionTemplateDecl>(D))
+          if (isPublic(FTD))
+            addMethod(FTD->getTemplatedDecl());
       }
     }
 
-    std::sort(Items.begin(), Items.end(),
-              [](const Item &A, const Item &B) { return A.SortKey < B.SortKey; });
+    for (const clang::CXXBaseSpecifier &B : RD->bases()) {
+      if (B.getAccessSpecifier() != clang::AS_public)
+        continue;
+      if (const clang::CXXRecordDecl *Base = B.getType()->getAsCXXRecordDecl())
+        collectMembers(Base, Prefix, OnlyFields, Items, Seen, Depth + 1);
+    }
+  }
+
+  static void completeRecordMembers(const clang::CXXRecordDecl *RD,
+                                    llvm::StringRef Prefix,
+                                    bool OnlyFields,
+                                    std::vector<llvm::LineEditor::Completion> &Out) {
+    std::vector<MemberItem> Items;
+    std::set<std::string> Seen;
+    collectMembers(RD, Prefix, OnlyFields, Items, Seen);
+    std::sort(Items.begin(), Items.end(), [](const MemberItem &A, const MemberItem &B) {
+      return A.SortKey < B.SortKey;
+    });
     for (auto &It : Items)
       Out.emplace_back(It.Typed, It.Display);
+  }
+
+  // ---- What an expression before `.` is, from the AST ----------------------
+  //
+  // The completer has text, not an expression: what stands before the dot is
+  // read as a chain -- a name, then `.member` or `.method(...)` steps -- and
+  // each step resolved against the session's declarations. The chain's root
+  // is a placeholder of a pipeline (`_`, `_1`: an element of what the
+  // pipeline starts from), a range-for's variable (an element of its range),
+  // a variable, or a function's result (called, or a 0-argument command,
+  // which the shell calls on its own).
+
+  struct ChainPart {
+    std::string Name;
+    bool Called = false;
+  };
+
+  // A function's result type: deduced where it is still `auto` -- its body
+  // instantiated as a call would -- without a diagnostic reaching the user's
+  // session (a SFINAE trap holds them).
+  static clang::QualType returnTypeOf(clang::Sema &S, clang::FunctionDecl *FD) {
+    if (!FD)
+      return {};
+    clang::QualType R = FD->getReturnType();
+    if (R->isUndeducedType()) {
+      clang::Sema::SFINAETrap Trap(S);
+      if (S.DeduceReturnType(FD, FD->getLocation(), /*Diagnose=*/false))
+        return {};
+      R = FD->getReturnType();
+      if (R->isUndeducedType())
+        return {};
+    }
+    return R;
+  }
+
+  // The record a type names, complete -- a template's specialization
+  // instantiated for it -- or none.
+  static const clang::CXXRecordDecl *recordOf(clang::Sema &S, clang::QualType T) {
+    if (T.isNull())
+      return nullptr;
+    T = T.getNonReferenceType().getUnqualifiedType();
+    if (const auto *PT = T->getAs<clang::PointerType>())
+      T = PT->getPointeeType().getUnqualifiedType();
+    if (!T->getAsCXXRecordDecl())
+      return nullptr;
+    {
+      clang::Sema::SFINAETrap Trap(S);
+      if (!S.isCompleteType(clang::SourceLocation(), T))
+        return nullptr;
+    }
+    const clang::CXXRecordDecl *RD = T->getAsCXXRecordDecl();
+    return RD ? RD->getDefinition() : nullptr;
+  }
+
+  // A member of a record by name: its own, or a public base's.
+  static clang::NamedDecl *findMember(const clang::CXXRecordDecl *RD,
+                                      clang::DeclarationName Name,
+                                      unsigned Depth = 0) {
+    if (!RD || Depth > 16)
+      return nullptr;
+    RD = RD->getDefinition();
+    if (!RD)
+      return nullptr;
+    for (clang::NamedDecl *ND : RD->lookup(Name))
+      if (isPublic(ND))
+        return ND;
+    for (const clang::CXXBaseSpecifier &B : RD->bases()) {
+      if (B.getAccessSpecifier() != clang::AS_public)
+        continue;
+      if (const clang::CXXRecordDecl *Base = B.getType()->getAsCXXRecordDecl())
+        if (clang::NamedDecl *Found = findMember(Base, Name, Depth + 1))
+          return Found;
+    }
+    return nullptr;
+  }
+  static clang::NamedDecl *findMember(const clang::CXXRecordDecl *RD,
+                                      llvm::StringRef Name) {
+    if (!RD)
+      return nullptr;
+    return findMember(RD, &RD->getASTContext().Idents.get(Name));
+  }
+
+  // The type a member gives: a field's, a static's, a method's result.
+  static clang::QualType memberType(clang::Sema &S, clang::NamedDecl *ND) {
+    if (!ND)
+      return {};
+    ND = ND->getUnderlyingDecl();
+    if (auto *FD = llvm::dyn_cast<clang::FieldDecl>(ND))
+      return FD->getType();
+    if (auto *VD = llvm::dyn_cast<clang::VarDecl>(ND))
+      return VD->getType();
+    if (auto *TND = llvm::dyn_cast<clang::TypedefNameDecl>(ND))
+      return TND->getUnderlyingType();
+    if (auto *FD = llvm::dyn_cast<clang::FunctionDecl>(ND))
+      return returnTypeOf(S, FD);
+    return {};
+  }
+
+  // What a range yields: its value_type; else what its begin() points at or
+  // its iterator's operator* gives; else, a template's, its first argument
+  // (a container of T); an array's element.
+  static clang::QualType elementTypeOf(clang::Sema &S, clang::QualType T) {
+    if (T.isNull())
+      return {};
+    clang::ASTContext &Ctx = S.getASTContext();
+    if (const clang::ArrayType *AT = Ctx.getAsArrayType(T.getNonReferenceType()))
+      return AT->getElementType();
+    const clang::CXXRecordDecl *RD = recordOf(S, T);
+    if (!RD)
+      return {};
+    clang::QualType Out = memberType(S, findMember(RD, "value_type"));
+    if (!Out.isNull())
+      return Out;
+    clang::QualType It = memberType(S, findMember(RD, "begin"));
+    if (!It.isNull()) {
+      if (const auto *PT = It.getNonReferenceType()->getAs<clang::PointerType>())
+        return PT->getPointeeType();
+      if (const clang::CXXRecordDecl *IRD = recordOf(S, It)) {
+        clang::QualType Deref = memberType(
+            S, findMember(IRD, Ctx.DeclarationNames.getCXXOperatorName(clang::OO_Star)));
+        if (!Deref.isNull())
+          return Deref.getNonReferenceType();
+        Out = memberType(S, findMember(IRD, "value_type"));
+        if (!Out.isNull())
+          return Out;
+      }
+    }
+    if (const auto *Spec = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(RD)) {
+      const clang::TemplateArgumentList &Args = Spec->getTemplateArgs();
+      if (Args.size() > 0 && Args[0].getKind() == clang::TemplateArgument::Type)
+        return Args[0].getAsType();
+    }
+    return {};
+  }
+
+  // Skips a balanced (...) or {...} backwards from just past its closing
+  // bracket; returns where it opens, or npos.
+  static size_t skipBackBalanced(llvm::StringRef E, size_t End) {
+    char Close = E[End - 1], Open = Close == ')' ? '(' : '{';
+    int Depth = 0;
+    for (size_t I = End; I > 0; --I) {
+      char C = E[I - 1];
+      if (C == Close)
+        ++Depth;
+      else if (C == Open && --Depth == 0)
+        return I - 1;
+    }
+    return llvm::StringRef::npos;
+  }
+
+  // The chain ending at the end of E: `x.name`, `obj.items().front`, `ls()`.
+  static std::vector<ChainPart> chainBackward(llvm::StringRef E) {
+    std::vector<ChainPart> Parts;
+    size_t I = E.rtrim().size();
+    for (;;) {
+      bool Called = false;
+      if (I > 0 && E[I - 1] == ')') {
+        size_t Open = skipBackBalanced(E, I);
+        if (Open == llvm::StringRef::npos)
+          return {};
+        I = Open;
+        Called = true;
+      }
+      size_t End = I;
+      while (I > 0 && isIdentChar(E[I - 1]))
+        --I;
+      if (I == End)
+        return {};
+      Parts.insert(Parts.begin(), ChainPart{E.substr(I, End - I).str(), Called});
+      if (I > 0 && E[I - 1] == '.')
+        --I;
+      else if (I > 1 && E[I - 1] == '>' && E[I - 2] == '-')
+        I -= 2;
+      else
+        break;
+    }
+    return Parts;
+  }
+
+  // The chain starting E: what a pipeline or a range starts from -- `ls`,
+  // `ls "." {.all = true}`, `obj.items()`, `lines("f")` -- its arguments
+  // skipped.
+  static std::vector<ChainPart> chainForward(llvm::StringRef E) {
+    std::vector<ChainPart> Parts;
+    E = E.ltrim();
+    size_t I = 0;
+    for (;;) {
+      size_t Start = I;
+      while (I < E.size() && isIdentChar(E[I]))
+        ++I;
+      // A qualified name: only its last part is looked up.
+      while (I + 1 < E.size() && E[I] == ':' && E[I + 1] == ':') {
+        I += 2;
+        Start = I;
+        while (I < E.size() && isIdentChar(E[I]))
+          ++I;
+      }
+      if (I == Start)
+        break;
+      ChainPart Part{E.substr(Start, I - Start).str(), false};
+      size_t J = I;
+      while (J < E.size() && E[J] == ' ')
+        ++J;
+      if (J < E.size() && E[J] == '(') {
+        int Depth = 0;
+        for (; J < E.size(); ++J) {
+          if (E[J] == '(')
+            ++Depth;
+          else if (E[J] == ')' && --Depth == 0) {
+            ++J;
+            break;
+          }
+        }
+        Part.Called = true;
+        I = J;
+      } else if (J > I && J < E.size() && E[J] != '.' && E[J] != '|' &&
+                 E[J] != '-' && E[J] != ';') {
+        // Called without parentheses, its arguments juxtaposed:
+        // `lines "f"`, `ls "." {.all = true}` -- the chain ends with it.
+        Part.Called = true;
+        Parts.push_back(std::move(Part));
+        break;
+      }
+      Parts.push_back(std::move(Part));
+      if (I < E.size() && E[I] == '.')
+        ++I;
+      else if (I + 1 < E.size() && E[I] == '-' && E[I + 1] == '>')
+        I += 2;
+      else
+        break;
+    }
+    return Parts;
+  }
+
+  // The statement the cursor is in: past the last `;` or `{` at the top.
+  static llvm::StringRef currentStatement(llvm::StringRef Before) {
+    int Depth = 0;
+    for (size_t I = Before.size(); I > 0; --I) {
+      char C = Before[I - 1];
+      if (C == ')' || C == '}' || C == ']')
+        ++Depth;
+      else if (C == '(' || C == '[') {
+        if (Depth > 0)
+          --Depth;
+      } else if (C == '{') {
+        if (Depth > 0)
+          --Depth;
+        else
+          return Before.substr(I);
+      } else if (C == ';' && Depth == 0)
+        return Before.substr(I);
+    }
+    return Before;
+  }
+
+  // A name's type: a variable's; a function's result -- called, or one the
+  // shell calls on its own (a command taking nothing). An overload set
+  // gives its first that resolves.
+  static clang::QualType nameType(clang::Sema &S, const ChainPart &Root) {
+    llvm::SmallVector<clang::NamedDecl *, 8> Decls;
+    lookupDeclsByName(S, Root.Name, Decls);
+    for (clang::NamedDecl *ND : Decls) {
+      if (auto *VD = llvm::dyn_cast<clang::VarDecl>(ND)) {
+        clang::QualType T = VD->getType();
+        if (T->isUndeducedType())
+          continue;
+        return T;
+      }
+      if (auto *FD = llvm::dyn_cast<clang::FunctionDecl>(ND)) {
+        if (!Root.Called && FD->getMinRequiredArguments() != 0)
+          continue;
+        clang::QualType T = returnTypeOf(S, FD);
+        if (!T.isNull())
+          return T;
+      }
+    }
+    return {};
+  }
+
+  // A range-for's variable named in the buffer, before the cursor: the
+  // range it goes over, as written (`for (auto &x : ls)` -> `ls`).
+  static std::optional<std::string> loopRange(llvm::StringRef Before,
+                                              llvm::StringRef Var) {
+    std::string Text = Before.str();
+    std::regex Loop("for\\s*\\(\\s*(?:const\\s+)?(?:auto|[A-Za-z_][\\w:<>]*)?\\s*[&*]*\\s*" +
+                    Var.str() + "\\s*:");
+    std::optional<std::string> Found;
+    for (std::sregex_iterator It(Text.begin(), Text.end(), Loop), End; It != End; ++It) {
+      size_t From = It->position() + It->length();
+      int Depth = 1;
+      size_t I = From;
+      for (; I < Text.size(); ++I) {
+        if (Text[I] == '(')
+          ++Depth;
+        else if (Text[I] == ')' && --Depth == 0)
+          break;
+      }
+      Found = Text.substr(From, I - From);
+    }
+    return Found;
+  }
+
+  static clang::QualType chainTypeImpl(clang::Sema &S, llvm::StringRef Before,
+                                       const std::vector<ChainPart> &Parts,
+                                       unsigned Depth);
+  static clang::QualType chainType(clang::Sema &S, llvm::StringRef Before,
+                                   const std::vector<ChainPart> &Parts,
+                                   unsigned Depth = 0) {
+    return chainTypeImpl(S, Before, Parts, Depth);
+  }
+
+  // What a range expression, as written, yields: where its pipeline starts
+  // (before its first `|`), an element of that.
+  static clang::QualType rangeElement(clang::Sema &S, llvm::StringRef Before,
+                                      llvm::StringRef Range, unsigned Depth) {
+    llvm::StringRef Source = Range.split('|').first.trim();
+    std::vector<ChainPart> Parts = chainForward(Source);
+    if (Parts.empty())
+      return {};
+    return elementTypeOf(S, chainType(S, Before, Parts, Depth + 1));
+  }
+
+  static clang::QualType rootType(clang::Sema &S, llvm::StringRef Before,
+                                  const ChainPart &Root, unsigned Depth) {
+    if (Depth > 8)
+      return {};
+    // A placeholder: an element of what the pipeline starts from.
+    if (Root.Name == "_" || Root.Name == "_1")
+      return rangeElement(S, Before, currentStatement(Before), Depth);
+    // A range-for's variable: an element of its range.
+    if (std::optional<std::string> Range = loopRange(Before, Root.Name)) {
+      clang::QualType T = rangeElement(S, Before, *Range, Depth);
+      if (!T.isNull())
+        return T;
+    }
+    return nameType(S, Root);
+  }
+
+  static clang::QualType chainTypeImpl(clang::Sema &S, llvm::StringRef Before,
+                                       const std::vector<ChainPart> &Parts,
+                                       unsigned Depth) {
+    if (Parts.empty())
+      return {};
+    clang::QualType T = rootType(S, Before, Parts.front(), Depth);
+    for (size_t I = 1; I < Parts.size() && !T.isNull(); ++I)
+      T = memberType(S, findMember(recordOf(S, T), Parts[I].Name));
+    return T;
+  }
+
+  // ---- A command's card, on Tab after its whole name ------------------------
+
+  struct CommandInfo {
+    const char *Name;
+    const char *Badge;
+    bool IsPipeStage;
+    const char *Examples;  // '\n'-separated
+  };
+  static llvm::ArrayRef<CommandInfo> commands() {
+    static const CommandInfo Table[] = {
+        {"ls", "dir listing", false,
+         "ls\nls \".\" {.all = true}\nls | where _.size > 10_KB | sort_by(_.size)"},
+        {"where", "filter rows", true, "ls | where _.is_dir"},
+        {"filter", "filter rows", true, "ls | filter(_.ext == \".cpp\")"},
+        {"select", "project columns", true, "ls | select(_.name)"},
+        {"transform", "map elements", true, "ls | transform(_.name)"},
+        {"sort_by", "sort by key", true, "ls | sort_by(_.size)"},
+        {"take", "first N rows", true, "ls | take 5"},
+        {"drop", "skip N rows", true, "lines \"log.txt\" | drop 10"},
+        {"reverse", "reverse order", true, "ls | sort_by(_.size) | reverse"},
+        {"grep", "match pattern", true, "lines \"log.txt\" | grep \"error\""},
+        {"show", "render table", true, "ls | show"},
+        {"lines", "read file lines", false,
+         "lines \"file.txt\"\nlines \"file.txt\" | grep \"TODO\" | take 5"},
+        {"cat", "print file", false, "cat \"file.txt\""},
+        {"head", "first N lines", false, "head \"file.txt\" 10"},
+        {"tail", "last N lines", false, "tail \"file.txt\" 10"},
+        {"wc_l", "count lines", false, "wc_l \"file.txt\""},
+        {"pwd", "working dir", false, "pwd"},
+        {"cd", "change dir", false, "cd \"~/src\""},
+        {"env", "get env var", false, "env \"HOME\""},
+        {"setenv", "set env var", false, "setenv \"EDITOR\" \"vim\""},
+        {"exists", "path exists", false, "exists \"build\""},
+        {"mkdir_p", "create dirs", false, "mkdir_p \"out/logs\""},
+        {"rm", "remove path", false, "rm \"tmp.txt\""},
+        {"cp", "copy path", false, "cp \"a.txt\" \"b.txt\""},
+        {"mv", "move path", false, "mv \"a.txt\" \"b.txt\""},
+        {"touch", "touch file", false, "touch \"new.txt\""},
+        {"run", "system command", false, "run \"make -j4\""},
+        {"exec", "capture command", false, "r = exec \"git status\"; r.out"},
+        {"clear", "clear screen", false, "clear"},
+        {"exit", "exit shell", false, "exit"},
+    };
+    return Table;
+  }
+
+  // The fields of a record, on one line: `.name (string)  .size (...)`.
+  static std::string fieldLine(const clang::CXXRecordDecl *RD) {
+    std::vector<llvm::LineEditor::Completion> Fields;
+    completeRecordMembers(RD, "", /*OnlyFields=*/true, Fields);
+    std::string Line;
+    for (const auto &F : Fields) {
+      if (!Line.empty())
+        Line += "  ";
+      Line += F.DisplayText;
+    }
+    return Line;
+  }
+
+  static bool isStringRecord(const clang::CXXRecordDecl *RD) {
+    llvm::StringRef N = RD && RD->getIdentifier() ? RD->getName() : "";
+    return N == "basic_string" || N == "basic_string_view" || N == "sym";
+  }
+
+  // What a command is, from the AST: each overload's signature, the options
+  // a record parameter takes, what it yields (its range's elements' fields,
+  // or its result's), and how it is used.
+  static std::string commandCard(clang::Sema &S, llvm::StringRef Name) {
+    const CommandInfo *Known = nullptr;
+    for (const CommandInfo &C : commands())
+      if (Name == C.Name)
+        Known = &C;
+    clang::ASTContext &Ctx = S.getASTContext();
+    llvm::SmallVector<clang::NamedDecl *, 8> Decls;
+    lookupDeclsByName(S, Name, Decls);
+
+    const char *Bar = "\033[90m│\033[0m ";
+    std::string Card = "\033[90m╭─\033[0m \033[1;32m" + Name.str() + "\033[0m";
+    if (Known)
+      Card += " \033[90m— " + std::string(Known->Badge) + "\033[0m";
+    Card += "\n";
+
+    std::set<std::string> Signatures;
+    std::string Options, Yields;
+    for (clang::NamedDecl *ND : Decls) {
+      clang::FunctionDecl *FD = llvm::dyn_cast<clang::FunctionDecl>(ND);
+      if (auto *FTD = llvm::dyn_cast<clang::FunctionTemplateDecl>(ND))
+        FD = FTD->getTemplatedDecl();
+      if (!FD)
+        continue;
+      std::string Sig = Name.str() + "(";
+      bool First = true;
+      for (const clang::ParmVarDecl *PVD : FD->parameters()) {
+        if (!First)
+          Sig += ", ";
+        First = false;
+        Sig += shortTypeName(PVD->getType(), Ctx);
+        if (PVD->getIdentifier())
+          Sig += " " + PVD->getName().str();
+        if (PVD->hasDefaultArg())
+          Sig += " = …";
+        clang::QualType PT = PVD->getType().getNonReferenceType();
+        if (const clang::CXXRecordDecl *RD = PT->getAsCXXRecordDecl())
+          if (!isStringRecord(RD) && Options.empty()) {
+            std::string Line = fieldLine(RD);
+            if (!Line.empty())
+              Options = "\033[1moptions\033[0m (" + shortTypeName(PT, Ctx) + "): " + Line;
+          }
+      }
+      Sig += ")";
+      if (!FD->isTemplated() && Yields.empty()) {
+        clang::QualType R = returnTypeOf(S, FD);
+        if (!R.isNull() && !R->isVoidType()) {
+          clang::QualType Elem = elementTypeOf(S, R);
+          const clang::CXXRecordDecl *ERD = recordOf(S, Elem);
+          if (ERD && !isStringRecord(ERD)) {
+            std::string Line = fieldLine(ERD);
+            if (!Line.empty())
+              Yields = "\033[1myields\033[0m (" + shortTypeName(Elem, Ctx) + "): " + Line;
+          } else if (const clang::CXXRecordDecl *RRD = recordOf(S, R);
+                     RRD && !isStringRecord(RRD) && Elem.isNull()) {
+            std::string Line = fieldLine(RRD);
+            if (!Line.empty())
+              Yields = "\033[1mreturns\033[0m (" + shortTypeName(R, Ctx) + "): " + Line;
+          } else {
+            Sig += " -> " + shortTypeName(R, Ctx);
+          }
+        }
+      }
+      Signatures.insert(Sig);
+    }
+    if (Signatures.empty() && !Known)
+      return {};
+    for (const std::string &Sig : Signatures)
+      Card += Bar + std::string("\033[1;33m") + Sig + "\033[0m\n";
+    if (!Options.empty())
+      Card += Bar + Options + "\n";
+    if (!Yields.empty())
+      Card += Bar + Yields + "\n";
+    if (Known && *Known->Examples) {
+      Card += Bar + std::string("\033[1mexamples\033[0m\n");
+      for (llvm::StringRef Rest = Known->Examples; !Rest.empty();) {
+        auto [Line, Tail] = Rest.split('\n');
+        Card += Bar + std::string("  \033[36m") + Line.str() + "\033[0m\n";
+        Rest = Tail;
+      }
+    }
+    Card += "\033[90m╰─\033[0m";
+    return Card;
   }
 
   std::vector<llvm::LineEditor::Completion> operator()(llvm::StringRef Buffer,
@@ -379,35 +926,28 @@ struct ReplListCompleter {
         }
       }
 
-      // 2. Placeholder member completion: `_.` or `_.name.`
-      if (BeforeDot.ends_with("_") || BeforeDot.ends_with("_1") ||
-          BeforeDot.ends_with(".name") || BeforeDot.ends_with(".ext") ||
-          BeforeDot.ends_with(".text")) {
-        if (BeforeDot.ends_with(".name") || BeforeDot.ends_with(".ext") ||
-            BeforeDot.ends_with(".text")) {
-          // Chained string member completion
-          const char *StrMethods[] = {"size()",        "length()",
-                                      "empty()",       "contains(",
-                                      "starts_with(",  "ends_with(",
-                                      "substr(",       "find(",
-                                      "c_str()"};
-          for (const char *M : StrMethods) {
-            llvm::StringRef MS(M);
-            if (MS.starts_with(Prefix)) {
-              Out.emplace_back(MS.substr(Prefix.size()).str(),
-                               "\033[1;33m." + MS.str() + "\033[0m");
-            }
+      // 2. Members of whatever stands before the dot -- `_.`, `x.`, `obj.`,
+      //    `x.name.`, `ls().` -- its type resolved from the AST.
+      if (!BeforeDot.empty() && BeforeDot.size() == Prior.size() - 1 &&
+          (isIdentChar(BeforeDot.back()) || BeforeDot.back() == ')')) {
+        std::vector<ChainPart> Parts = chainBackward(BeforeDot);
+        if (!Parts.empty()) {
+          clang::QualType T = chainType(S, Before, Parts);
+          if (const clang::CXXRecordDecl *RD = recordOf(S, T)) {
+            completeRecordMembers(RD, Prefix, /*OnlyFields=*/false, Out);
+            if (!Out.empty())
+              return Out;
           }
-          if (!Out.empty())
-            return Out;
         }
+      }
 
-        // Determine pipeline element record type (`ls` -> `file_entry`, `lines` -> `line_entry`)
+      // Where the AST cannot say (a pipeline through a lambda's result):
+      // what `ls` and `lines` yield, by the command named.
+      if (BeforeDot.ends_with("_") || BeforeDot.ends_with("_1")) {
         llvm::StringRef TargetStruct = "file_entry";
         if (Before.contains("lines") || Before.contains("head") ||
             Before.contains("tail"))
           TargetStruct = "line_entry";
-
         llvm::SmallVector<clang::NamedDecl *, 4> StructDecls;
         lookupDeclsByName(S, TargetStruct, StructDecls);
         for (clang::NamedDecl *ND : StructDecls) {
@@ -481,46 +1021,8 @@ struct ReplListCompleter {
 
     // 4. Pipeline stage or general command/symbol completion
     bool AfterPipe = Prior.rtrim().ends_with("|");
-    struct CmdEntry {
-      const char *Name;
-      const char *Badge;
-      bool IsPipeStage;
-    };
-    static const CmdEntry Builtins[] = {
-        {"ls", "dir listing", false},
-        {"where", "filter rows", true},
-        {"filter", "filter rows", true},
-        {"select", "project columns", true},
-        {"transform", "map elements", true},
-        {"sort_by", "sort by key", true},
-        {"take", "first N rows", true},
-        {"drop", "skip N rows", true},
-        {"reverse", "reverse order", true},
-        {"grep", "match pattern", true},
-        {"show", "render table", true},
-        {"lines", "read file lines", false},
-        {"cat", "print file", false},
-        {"head", "first N lines", false},
-        {"tail", "last N lines", false},
-        {"wc_l", "count lines", false},
-        {"pwd", "working dir", false},
-        {"cd", "change dir", false},
-        {"env", "get env var", false},
-        {"setenv", "set env var", false},
-        {"exists", "path exists", false},
-        {"mkdir_p", "create dirs", false},
-        {"rm", "remove path", false},
-        {"cp", "copy path", false},
-        {"mv", "move path", false},
-        {"touch", "touch file", false},
-        {"run", "system command", false},
-        {"exec", "capture command", false},
-        {"clear", "clear screen", false},
-        {"exit", "exit shell", false},
-    };
-
     std::set<std::string> Seen;
-    for (const auto &B : Builtins) {
+    for (const CommandInfo &B : commands()) {
       if (AfterPipe && !B.IsPipeStage)
         continue;
       llvm::StringRef Name(B.Name);
@@ -552,6 +1054,14 @@ struct ReplListCompleter {
       }
     }
 
+    // 5. The name typed is the one completion left, whole: its card.
+    if (!Prefix.empty() && Out.size() == 1 && Out.front().TypedText.empty()) {
+      std::string Card = commandCard(S, Prefix);
+      if (!Card.empty()) {
+        Out.clear();
+        Out.emplace_back("", Card);
+      }
+    }
     return Out;
   }
 };
@@ -682,6 +1192,14 @@ int main(int argc, const char **argv) {
     LE.setPrompt(buildBashPrompt(LastFailed));
 
     while (std::optional<std::string> Line = LE.readLine()) {
+      // Ctrl+C (the LineEditor's "\x03"): what was typed, continued lines
+      // too, dropped; the prompt's `$` red, as after a failed command.
+      if (*Line == "\x03") {
+        Input.clear();
+        LastFailed = true;
+        LE.setPrompt(buildBashPrompt(LastFailed));
+        continue;
+      }
       llvm::StringRef L = *Line;
       L = L.trim();
       if (L.ends_with("\\")) {

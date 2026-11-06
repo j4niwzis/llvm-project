@@ -57,25 +57,19 @@
 
 ---
 
-## 3. Текущий статус и оставшиеся задачи в `clang/tools/cppsh/CppSh.cpp`
+## 3. Текущий статус `clang/tools/cppsh/CppSh.cpp`
 
-Все изменения в компиляторе, `Interpreter.cpp`, `CompilerInstance.cpp`, `LineEditor.cpp`, `ParseStmt.cpp`, `ParseDecl.cpp`, `libcxx/include/sh` и `libcxx/include/__sh/sh_using.h` уже написаны и запушены.
+Все изменения в компиляторе, `Interpreter.cpp`, `CompilerInstance.cpp`, `LineEditor.cpp`, `ParseStmt.cpp`, `ParseDecl.cpp`, `libcxx/include/sh` и `libcxx/include/__sh/sh_using.h` написаны и запушены. В `CppSh.cpp` дописано:
 
-Что осталось дописать непосредственно в `clang/tools/cppsh/CppSh.cpp`:
-1. **Обработка маркера `"\x03"` от `LineEditor::readLine()` в `main()`:**
-   В цикле `while (std::optional<std::string> Line = LE.readLine())` добавить проверку:
-   ```cpp
-   if (*Line == "\x03") {
-     Input.clear();
-     LastFailed = true;
-     LE.setPrompt(buildBashPrompt(LastFailed));
-     continue;
-   }
-   ```
-2. **Универсальный резолв типов выражений при нажатии `Tab` после `.` (`ReplListCompleter`):**
-   - Обходить базовые классы (`RD->bases()`) в `completeRecordMembers` и фильтровать только `AS_public` поля/методы.
-   - При нажатии `Tab` после `<expr>.`:
-     - Искать объявление переменной цикла `for (x : rng)` / `for (auto &x : rng)` в текущем буфере `Before`, резолвить тип `rng` (из `TranslationUnitDecl`, вызова функции `ls()`, 0-аргументной функции `ls` или пайплайна `rng | ...`), извлекать тип элемента диапазона (`iterator::value_type`, `value_type`, `begin()->operator*()` или аргумент шаблона `ClassTemplateSpecializationDecl`) и выдавать все поля и методы `x`.
-     - Резолвить тип глобальных переменных в `TranslationUnitDecl` (`obj.<Tab>`) и цепочек обращений к полям/методам (`x.name.<Tab>`).
-3. **Подробная карточка команды при нажатии `Tab` на имени команды (`ls<Tab>`):**
-   - Когда введённый префикс однозначно совпадает с командой (например, `ls` + `Tab`), выводить карточку с сигнатурой из AST, списком опций (`ls_opts`: `.all`, `.recursive`, `.dirs_only`, `.files_only`), полями выходных элементов (`file_entry`: `.name`, `.ext`, `.size`, `.is_dir`) и примерами вызовов.
+1. **`Ctrl + C` (маркер `"\x03"` от `LineEditor::readLine()`):** в `main()` ввод (вместе с продолженными через `\` строками) сбрасывается, `$` в промпте становится красным, выводится новый промпт.
+2. **Резолв типа выражения перед `.` по AST (`ReplListCompleter`):**
+   - текст перед точкой читается как цепочка (`chainBackward`): имя, затем шаги `.member` / `.method(...)`;
+   - корень цепочки (`rootType`): плейсхолдер `_` / `_1` — элемент того, с чего начинается пайплайн текущего выражения (до первого `|`); переменная `for (x : rng)` / `for (auto &x : rng)` из буфера — элемент `rng`; глобальная переменная из `TranslationUnitDecl`; результат функции — вызванной (`f()`, `lines "f"`) или 0-аргументной команды (`ls`), которую шелл вызывает сам;
+   - тип элемента диапазона (`elementTypeOf`): `value_type`, иначе `begin()` (указатель или `operator*` итератора), иначе первый аргумент шаблона `ClassTemplateSpecializationDecl`, у массива — элемент;
+   - шаги цепочки: поле, статический член или метод (тип результата), с обходом публичных баз;
+   - `auto`-типы результата выводятся `Sema::DeduceReturnType` под `SFINAETrap`, неполные специализации инстанцируются `isCompleteType` — диагностика не попадает в сессию;
+   - `completeRecordMembers` обходит публичные базы (`RD->bases()`), показывает только `AS_public` поля и методы (включая шаблонные), без конструкторов, деструкторов и `__`-имён;
+   - если AST не даёт типа (пайплайн через результат лямбды), остаётся прежняя эвристика `file_entry` / `line_entry`.
+3. **Карточка команды (`ls` + `Tab`):** когда введённое имя — единственное оставшееся дополнение, выводится карточка (`commandCard`): сигнатуры всех перегрузок из AST, опции из record-параметра (`ls_opts`: `.all`, `.recursive`, `.dirs_only`, `.files_only`), поля элементов результата (`yields (file_entry)`: `.name`, `.ext`, `.size`, `.is_dir`) или поля результата (`returns (sh_result)`), и примеры вызова. Таблица команд (`commands()`) общая для списка дополнений и карточек.
+
+Не проверено сборкой: изменения написаны без локальной сборки clang (на машине, где они писались, не было места под llvm-project).
