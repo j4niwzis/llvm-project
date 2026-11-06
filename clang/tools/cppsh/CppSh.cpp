@@ -240,11 +240,19 @@ static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Cod
 }
 
 // The type of the expression being typed, for the line editor's hint: the
-// statement up to the cursor parsed -- not run -- as `decltype(auto)
-// __cppsh_hint = <it>;`, its diagnostics muted, and undone. The type is
-// Sema's own, the value specialization's included (`ls {.files_only =
-// true}`: ls_view<file_entry>). Nothing where it does not parse yet, where
-// a statement was just ended, or for the shell's own commands.
+// statement up to the cursor parsed -- not run -- as `using __cppsh_hint_t =
+// decltype(<it>);`, its diagnostics muted, and undone. The type is Sema's
+// own, the value specialization's included (`ls {.files_only = true}`:
+// ls_view<file_entry>). Nothing where it does not parse yet, where a
+// statement was just ended, or for the shell's own commands.
+//
+// Unevaluated, so that the parse leaves nothing a later statement needs: what
+// it instantiates -- a function whose return type it deduced, the friends a
+// class template's instantiation defines -- is not odr-used, so nothing of it
+// is emitted into the module the undo drops; a later statement that uses it
+// has it emitted then, into its own. (A variable initialized with the
+// expression emitted it there, and those definitions were gone with the
+// module, while Sema took them as emitted.)
 static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
                             size_t Pos) {
   std::vector<std::string> Stmts = splitStatements(Buffer.substr(0, Pos));
@@ -270,14 +278,14 @@ static std::string typeHint(clang::Interpreter &Interp, llvm::StringRef Buffer,
   Diags.setClient(&Ignore, /*ShouldOwnClient=*/false);
 
   std::string Hint;
-  std::string Code = "decltype(auto) __cppsh_hint = " + Expr.str() + ";";
+  std::string Code = "using __cppsh_hint_t = decltype(" + Expr.str() + ");";
   if (llvm::Expected<clang::PartialTranslationUnit &> PTU = Interp.Parse(Code)) {
     for (clang::Decl *D : PTU->TUPart->decls())
-      if (auto *VD = llvm::dyn_cast<clang::VarDecl>(D))
-        if (VD->getIdentifier() && VD->getName() == "__cppsh_hint") {
-          clang::PrintingPolicy PP(VD->getASTContext().getLangOpts());
+      if (auto *Alias = llvm::dyn_cast<clang::TypeAliasDecl>(D))
+        if (Alias->getIdentifier() && Alias->getName() == "__cppsh_hint_t") {
+          clang::PrintingPolicy PP(Alias->getASTContext().getLangOpts());
           PP.SuppressScope = true;
-          Hint = VD->getType().getAsString(PP);
+          Hint = Alias->getUnderlyingType().getAsString(PP);
           if (Hint.size() > 60)
             Hint = Hint.substr(0, 57) + "...";
         }
