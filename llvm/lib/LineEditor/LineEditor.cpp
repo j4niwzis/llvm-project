@@ -14,7 +14,9 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <clocale>
+#include <csignal>
 #include <cstdio>
 #if !defined(_WIN32)
 #include <sys/ioctl.h>
@@ -26,6 +28,22 @@ constexpr int DefaultHistorySize = 800;
 #endif
 
 using namespace llvm;
+
+namespace {
+static volatile sig_atomic_t GotSigInt = 0;
+#if !defined(_WIN32)
+static void LineEditorSigIntHandler(int) { GotSigInt = 1; }
+static void installSigIntHandler() {
+  struct sigaction SA = {};
+  SA.sa_handler = LineEditorSigIntHandler;
+  sigemptyset(&SA.sa_mask);
+  SA.sa_flags = 0; // Do not SA_RESTART so read() returns EINTR
+  ::sigaction(SIGINT, &SA, nullptr);
+}
+#else
+static void installSigIntHandler() {}
+#endif
+} // namespace
 
 std::string LineEditor::getDefaultHistoryPath(StringRef ProgName) {
   SmallString<32> Path;
@@ -204,17 +222,23 @@ unsigned char ElCompletionFn(EditLine *EL, int ch) {
         if (::ioctl(fileno(Data->Out), TIOCGWINSZ, &WS) == 0 && WS.ws_col > 20)
           TermWidth = WS.ws_col;
 #endif
+        bool HasMultiline = false;
         size_t MaxW = 0;
         std::vector<size_t> Widths;
         Widths.reserve(Action.Completions.size());
         for (const std::string &C : Action.Completions) {
+          if (C.find('\n') != std::string::npos)
+            HasMultiline = true;
           size_t W = visualWidth(C);
           Widths.push_back(W);
           if (W > MaxW)
             MaxW = W;
         }
         size_t ColWidth = MaxW + 3;
-        size_t NumCols = std::max<size_t>(1, TermWidth / std::max<size_t>(1, ColWidth));
+        size_t NumCols =
+            HasMultiline
+                ? 1
+                : std::max<size_t>(1, TermWidth / std::max<size_t>(1, ColWidth));
         size_t NumItems = Action.Completions.size();
         size_t NumRows = (NumItems + NumCols - 1) / NumCols;
 
@@ -265,6 +289,8 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
   if (!std::setlocale(LC_ALL, ""))
     std::setlocale(LC_ALL, "C.UTF-8");
 
+  installSigIntHandler();
+
   Data->Hist = ::history_init();
   assert(Data->Hist);
 
@@ -273,7 +299,7 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
 
   ::el_set(Data->EL, EL_PROMPT_ESC, ElGetPromptFn, '\001');
   ::el_set(Data->EL, EL_EDITOR, "emacs");
-  ::el_set(Data->EL, EL_SIGNAL, 1);
+  ::el_set(Data->EL, EL_SIGNAL, 0);
   ::el_set(Data->EL, EL_HIST, history, Data->Hist);
   ::el_set(Data->EL, EL_ADDFN, "tab_complete", "Tab completion function",
            ElCompletionFn);
@@ -320,9 +346,21 @@ void LineEditor::setHistorySize(int size) {
 }
 
 std::optional<std::string> LineEditor::readLine() const {
+  installSigIntHandler();
+  GotSigInt = 0;
+  errno = 0;
+
   // Call el_gets to prompt the user and read the user's input.
   int LineLen = 0;
   const char *Line = ::el_gets(Data->EL, &LineLen);
+
+  if (GotSigInt || (!Line && errno == EINTR) || LineLen < 0) {
+    GotSigInt = 0;
+    ::el_reset(Data->EL);
+    ::fwrite("^C\n", 1, 3, Data->Out);
+    ::fflush(Data->Out);
+    return std::string("\x03");
+  }
 
   // Either of these may mean end-of-file.
   if (!Line || LineLen == 0)

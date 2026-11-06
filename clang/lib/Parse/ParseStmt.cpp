@@ -1983,6 +1983,18 @@ void Parser::ParseForRangeInitializerAfterColon(ForRangeInit &FRI,
     FRI.RangeExpr = ParseBraceInitializer();
   } else {
     FRI.RangeExpr = ParseExpression();
+    if (FRI.RangeExpr.isUsable()) {
+      Expr *RE = FRI.RangeExpr.get()->IgnoreImplicit();
+      if (auto *DRE = dyn_cast<DeclRefExpr>(RE)) {
+        if (auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
+          if (FD->getMinRequiredArguments() == 0 &&
+              !FD->getReturnType()->isVoidType())
+            FRI.RangeExpr = Actions.BuildCallExpr(
+                getCurScope(), FRI.RangeExpr.get(), RE->getBeginLoc(), {},
+                RE->getEndLoc());
+        }
+      }
+    }
   }
 
   // Before c++23, ForRangeLifetimeExtendTemps should be empty.

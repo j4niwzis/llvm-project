@@ -54,6 +54,7 @@
 #include "llvm/ExecutionEngine/Orc/EPCDynamicLibrarySearchGenerator.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
@@ -189,6 +190,29 @@ CreateCI(const llvm::opt::ArgStringList &Argv) {
     if (!FoundIostream) {
       static std::vector<std::string> CachedSysDirs = []() {
         std::vector<std::string> Dirs;
+        llvm::SmallString<128> CachePath;
+        llvm::sys::path::system_temp_directory(/*erasedOnReboot=*/true,
+                                               CachePath);
+        llvm::sys::path::append(CachePath, "cppsh_sysdirs.cache");
+        if (auto MB = llvm::MemoryBuffer::getFile(CachePath)) {
+          llvm::SmallVector<llvm::StringRef, 8> Lines;
+          (*MB)->getBuffer().split(Lines, '\n', /*MaxSplit=*/-1,
+                                   /*KeepEmpty=*/false);
+          bool HasIO = false;
+          for (llvm::StringRef L : Lines) {
+            llvm::StringRef D = L.trim();
+            if (!D.empty() && llvm::sys::fs::is_directory(D)) {
+              Dirs.push_back(D.str());
+              llvm::SmallString<256> P(D);
+              llvm::sys::path::append(P, "iostream");
+              if (llvm::sys::fs::exists(P))
+                HasIO = true;
+            }
+          }
+          if (HasIO)
+            return Dirs;
+          Dirs.clear();
+        }
         for (const char *Cmd :
              {"g++ -Wp,-v -E -x c++ /dev/null 2>&1",
               "c++ -Wp,-v -E -x c++ /dev/null 2>&1",
@@ -224,8 +248,14 @@ CreateCI(const llvm::opt::ArgStringList &Argv) {
               break;
             }
           }
-          if (HasIO)
+          if (HasIO) {
+            std::error_code EC;
+            llvm::raw_fd_ostream OS(CachePath, EC, llvm::sys::fs::OF_Text);
+            if (!EC)
+              for (const auto &D : Dirs)
+                OS << D << "\n";
             break;
+          }
           Dirs.clear();
         }
         return Dirs;
@@ -576,11 +606,81 @@ IncrementalCompilerBuilder::CreateHost(OffloadType Type) {
   return IncrementalCompilerBuilder::createOffload(/*device=*/false, Type);
 }
 
+#if defined(__SIZEOF_INT128__)
+extern "C" {
+LLVM_ATTRIBUTE_USED unsigned __int128
+__cppsh_udivmodti4(unsigned __int128 a, unsigned __int128 b,
+                   unsigned __int128 *rem) {
+  if (b == 0) {
+    if (rem)
+      *rem = 0;
+    return 0;
+  }
+  unsigned __int128 q = 0, r = 0;
+  for (int i = 127; i >= 0; --i) {
+    r = (r << 1) | ((a >> i) & 1);
+    if (r >= b) {
+      r -= b;
+      q |= (static_cast<unsigned __int128>(1) << i);
+    }
+  }
+  if (rem)
+    *rem = r;
+  return q;
+}
+
+LLVM_ATTRIBUTE_USED unsigned __int128 __cppsh_udivti3(unsigned __int128 a,
+                                                      unsigned __int128 b) {
+  return __cppsh_udivmodti4(a, b, nullptr);
+}
+
+LLVM_ATTRIBUTE_USED unsigned __int128 __cppsh_umodti3(unsigned __int128 a,
+                                                      unsigned __int128 b) {
+  unsigned __int128 r = 0;
+  __cppsh_udivmodti4(a, b, &r);
+  return r;
+}
+
+LLVM_ATTRIBUTE_USED __int128 __cppsh_divti3(__int128 a, __int128 b) {
+  bool neg = (a < 0) != (b < 0);
+  unsigned __int128 ua = a < 0 ? -static_cast<unsigned __int128>(a)
+                               : static_cast<unsigned __int128>(a);
+  unsigned __int128 ub = b < 0 ? -static_cast<unsigned __int128>(b)
+                               : static_cast<unsigned __int128>(b);
+  unsigned __int128 uq = __cppsh_udivmodti4(ua, ub, nullptr);
+  return neg ? -static_cast<__int128>(uq) : static_cast<__int128>(uq);
+}
+
+LLVM_ATTRIBUTE_USED __int128 __cppsh_modti3(__int128 a, __int128 b) {
+  bool neg = (a < 0);
+  unsigned __int128 ua = a < 0 ? -static_cast<unsigned __int128>(a)
+                               : static_cast<unsigned __int128>(a);
+  unsigned __int128 ub = b < 0 ? -static_cast<unsigned __int128>(b)
+                               : static_cast<unsigned __int128>(b);
+  unsigned __int128 ur = 0;
+  __cppsh_udivmodti4(ua, ub, &ur);
+  return neg ? -static_cast<__int128>(ur) : static_cast<__int128>(ur);
+}
+} // extern "C"
+#endif
+
 Interpreter::Interpreter(std::unique_ptr<CompilerInstance> Instance,
                          llvm::Error &ErrOut,
                          std::unique_ptr<IncrementalExecutorBuilder> IEB,
                          std::unique_ptr<clang::ASTConsumer> Consumer)
     : IncrExecutorBuilder(std::move(IEB)) {
+#if defined(__SIZEOF_INT128__)
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "__udivmodti4", reinterpret_cast<void *>(&__cppsh_udivmodti4));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "__udivti3", reinterpret_cast<void *>(&__cppsh_udivti3));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "__umodti3", reinterpret_cast<void *>(&__cppsh_umodti3));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "__divti3", reinterpret_cast<void *>(&__cppsh_divti3));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "__modti3", reinterpret_cast<void *>(&__cppsh_modti3));
+#endif
   CI = std::move(Instance);
   llvm::ErrorAsOutParameter EAO(&ErrOut);
   auto LLVMCtx = std::make_unique<llvm::LLVMContext>();

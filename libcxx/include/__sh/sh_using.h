@@ -13,7 +13,9 @@
 #include <meta>
 #include <sh>
 
+using std::format;
 using std::print;
+using std::println;
 using std::ranges::views::drop;
 using std::ranges::views::filter;
 using std::ranges::views::grep;

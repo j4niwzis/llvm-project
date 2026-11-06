@@ -2657,6 +2657,21 @@ Decl *Parser::ParseDeclarationAfterDeclaratorAndAttributes(
 
       PreferredType.enterVariableInit(Tok.getLocation(), ThisDecl);
       ExprResult Init = ParseInitializer(ThisDecl);
+      if (Init.isUsable() && D.getDeclSpec().getTypeSpecType() == TST_auto) {
+        if (auto *DRE = dyn_cast<DeclRefExpr>(Init.get()->IgnoreImplicit())) {
+          if (auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
+            if (FD->getMinRequiredArguments() == 0 &&
+                !FD->getReturnType()->isVoidType()) {
+              if (auto *NS = dyn_cast<NamespaceDecl>(FD->getDeclContext())) {
+                if (NS->getName() == "sh")
+                  Init = Actions.BuildCallExpr(getCurScope(), Init.get(),
+                                               DRE->getBeginLoc(), {},
+                                               DRE->getEndLoc());
+              }
+            }
+          }
+        }
+      }
 
       // If this is the only decl in (possibly) range based for statement,
       // our best guess is that the user meant ':' instead of '='.

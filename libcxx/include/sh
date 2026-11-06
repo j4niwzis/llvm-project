@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -26,6 +27,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <print>
 #include <ranges>
 #include <set>
 #include <sstream>
@@ -737,6 +739,34 @@ inline sh_result exec(const Cmd &cmd) {
 }
 
 } // namespace sh
+
+template <>
+struct formatter<std::sh::file_entry, char> {
+  constexpr auto parse(format_parse_context &ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const std::sh::file_entry &e, FormatContext &ctx) const {
+    return std::format_to(ctx.out(), "{}{}", e.name, e.is_dir ? "/" : "");
+  }
+};
+
+template <>
+struct formatter<std::sh::line_entry, char> {
+  constexpr auto parse(format_parse_context &ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const std::sh::line_entry &e, FormatContext &ctx) const {
+    return std::format_to(ctx.out(), "{}: {}", e.num, e.text);
+  }
+};
+
+template <>
+struct formatter<std::sh::sh_result, char> {
+  constexpr auto parse(format_parse_context &ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const std::sh::sh_result &r, FormatContext &ctx) const {
+    return std::format_to(ctx.out(), "{}", r.out);
+  }
+};
+
 } // namespace std
 
 constexpr unsigned long long operator""_KB(unsigned long long v) noexcept {

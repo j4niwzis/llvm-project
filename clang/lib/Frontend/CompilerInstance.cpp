@@ -45,10 +45,12 @@
 #include "clang/Serialization/ModuleCache.h"
 #include "clang/Serialization/ModuleManager.h"
 #include "clang/Serialization/SerializationDiagnostic.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/AdvisoryLock.h"
@@ -2011,13 +2013,43 @@ ModuleLoadResult CompilerInstance::findOrCompileModuleAndReadAST(
                           : Source == MS_PrebuiltModulePath
                                 ? 0
                                 : ASTReader::ARR_ConfigurationMismatch;
-  switch (getASTReader()->ReadAST(ModuleFilename,
-                                  Source == MS_PrebuiltModulePath
-                                      ? serialization::MK_PrebuiltModule
-                                      : Source == MS_ModuleBuildPragma
-                                            ? serialization::MK_ExplicitModule
-                                            : serialization::MK_ImplicitModule,
-                                  ImportLoc, ARRFlags)) {
+  if (ModuleName == "std" || ModuleName == "std.sh")
+    ARRFlags |= ASTReader::ARR_OutOfDate | ASTReader::ARR_Missing |
+                ASTReader::ARR_ConfigurationMismatch |
+                ASTReader::ARR_VersionMismatch;
+
+  ASTReader::ASTReadResult ReadRes = getASTReader()->ReadAST(
+      ModuleFilename,
+      Source == MS_PrebuiltModulePath
+          ? serialization::MK_PrebuiltModule
+          : Source == MS_ModuleBuildPragma ? serialization::MK_ExplicitModule
+                                           : serialization::MK_ImplicitModule,
+      ImportLoc, ARRFlags);
+  if (ReadRes != ASTReader::Success &&
+      (ModuleName == "std" || ModuleName == "std.sh")) {
+    llvm::sys::fs::remove(ModuleFilename.str());
+    BuiltModules.erase(std::string(ModuleName));
+    if (ModuleName == "std") {
+      createModuleFromSource(ImportLoc, "std",
+                             "module \"std\" [system] { export * }\n"
+                             "#pragma clang module contents\n"
+                             "#include <meta>\n"
+                             "#include <sh>\n");
+    } else {
+      createModuleFromSource(ImportLoc, "std.sh",
+                             "module \"std.sh\" [system] { export * }\n"
+                             "#pragma clang module contents\n"
+                             "#include <__sh/sh_using.h>\n");
+    }
+    ModuleFilename = ModuleFileName();
+    Source =
+        selectModuleSource(M, ModuleName, ModuleFilename, BuiltModules, HS);
+    if (!ModuleFilename.empty())
+      ReadRes = getASTReader()->ReadAST(ModuleFilename,
+                                        serialization::MK_ExplicitModule,
+                                        ImportLoc, ARRFlags);
+  }
+  switch (ReadRes) {
   case ASTReader::Success: {
     if (M)
       return M;
@@ -2337,18 +2369,70 @@ void CompilerInstance::createModuleFromSource(SourceLocation ImportLoc,
     if (!isAlphanumeric(C))
       C = '_';
 
+  bool UseDiskCache = (ModuleName == "std" || ModuleName == "std.sh");
+  SmallString<256> CachedPcmPath;
+  SmallString<256> CachedMapPath;
+  if (UseDiskCache) {
+    llvm::hash_code HC = llvm::hash_combine(
+        Source, getInvocation().computeContextHash());
+    for (const auto &E : getHeaderSearchOpts().UserEntries) {
+      for (llvm::StringRef Rel : {"sh", "meta", "__sh/sh_using.h"}) {
+        SmallString<256> P(E.Path);
+        llvm::sys::path::append(P, Rel);
+        llvm::sys::fs::file_status St;
+        if (!llvm::sys::fs::status(P, St)) {
+          HC = llvm::hash_combine(
+              HC, St.getLastModificationTime().time_since_epoch().count(),
+              St.getSize());
+        }
+      }
+    }
+    std::string MainExe = llvm::sys::fs::getMainExecutable(nullptr, nullptr);
+    if (!MainExe.empty()) {
+      llvm::sys::fs::file_status St;
+      if (!llvm::sys::fs::status(MainExe, St))
+        HC = llvm::hash_combine(
+            HC, St.getLastModificationTime().time_since_epoch().count(),
+            St.getSize());
+    }
+    std::string HashStr = llvm::utohexstr(static_cast<uint64_t>(HC), true);
+    SmallString<256> CacheDir;
+    llvm::sys::path::system_temp_directory(/*erasedOnReboot=*/true, CacheDir);
+    llvm::sys::path::append(CacheDir, "cppsh_pcm_cache");
+    llvm::sys::fs::create_directories(CacheDir);
+
+    CachedMapPath = CacheDir;
+    llvm::sys::path::append(CachedMapPath,
+                            (CleanModuleName + "_" + HashStr + ".map").str());
+    CachedPcmPath = CacheDir;
+    llvm::sys::path::append(CachedPcmPath,
+                            (CleanModuleName + "_" + HashStr + ".pcm").str());
+    DeleteBuiltModules = false;
+    if (llvm::sys::fs::exists(CachedPcmPath) &&
+        llvm::sys::fs::exists(CachedMapPath)) {
+      BuiltModules[std::string(ModuleName)] = std::string(CachedPcmPath.str());
+      return;
+    }
+    std::error_code MapEC;
+    llvm::raw_fd_ostream MapOS(CachedMapPath, MapEC, llvm::sys::fs::OF_None);
+    if (!MapEC)
+      MapOS << Source;
+  }
+
   // FIXME: Using a randomized filename here means that our intermediate .pcm
   // output is nondeterministic (as .pcm files refer to each other by name).
   // Can this affect the output in any way?
   SmallString<128> ModuleFileName;
-  int FD;
+  int FD = -1;
   if (std::error_code EC = llvm::sys::fs::createTemporaryFile(
           CleanModuleName, "pcm", FD, ModuleFileName)) {
     getDiagnostics().Report(ImportLoc, diag::err_fe_unable_to_open_output)
         << ModuleFileName << EC.message();
     return;
   }
-  std::string ModuleMapFileName = (CleanModuleName + ".map").str();
+  std::string ModuleMapFileName =
+      UseDiskCache ? std::string(CachedMapPath.str())
+                   : (CleanModuleName + ".map").str();
 
   bool IsPreprocessed = !Source.contains("#pragma clang module contents");
   FrontendInputFile Input(
@@ -2358,29 +2442,46 @@ void CompilerInstance::createModuleFromSource(SourceLocation ImportLoc,
 
   std::string NullTerminatedSource(Source.str());
 
-  auto Other = cloneForModuleCompileImpl(ImportLoc, ModuleName, Input,
-                                         StringRef(), ModuleFileName);
+  auto Other = cloneForModuleCompileImpl(
+      ImportLoc, ModuleName, Input, StringRef(),
+      UseDiskCache ? CachedPcmPath.str() : ModuleFileName.str());
 
-  // Create a virtual file containing our desired source.
-  // FIXME: We shouldn't need to do this.
-  FileEntryRef ModuleMapFile = Other->getFileManager().getVirtualFileRef(
-      ModuleMapFileName, NullTerminatedSource.size(), 0);
-  Other->getSourceManager().overrideFileContents(
-      ModuleMapFile, llvm::MemoryBuffer::getMemBuffer(NullTerminatedSource));
+  if (!UseDiskCache) {
+    // Create a virtual file containing our desired source.
+    // FIXME: We shouldn't need to do this.
+    FileEntryRef ModuleMapFile = Other->getFileManager().getVirtualFileRef(
+        ModuleMapFileName, NullTerminatedSource.size(), 0);
+    Other->getSourceManager().overrideFileContents(
+        ModuleMapFile, llvm::MemoryBuffer::getMemBuffer(NullTerminatedSource));
+  }
 
   Other->BuiltModules = std::move(BuiltModules);
   Other->DeleteBuiltModules = false;
 
   // Build the module, inheriting any modules that we've built locally.
-  std::unique_ptr<llvm::MemoryBuffer> Buffer =
-      compileModule(ImportLoc, ModuleName, ModuleFileName, *Other);
+  std::unique_ptr<llvm::MemoryBuffer> Buffer = compileModule(
+      ImportLoc, ModuleName,
+      UseDiskCache ? CachedPcmPath.str() : ModuleFileName.str(), *Other);
   BuiltModules = std::move(Other->BuiltModules);
 
   if (Buffer) {
-    llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+    {
+      llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+      OS << Buffer->getBuffer();
+    }
+    if (UseDiskCache) {
+      if (!llvm::sys::fs::rename(ModuleFileName, CachedPcmPath)) {
+        BuiltModules[std::string(ModuleName)] =
+            std::string(CachedPcmPath.str());
+        return;
+      }
+    }
     BuiltModules[std::string(ModuleName)] = std::string(ModuleFileName);
-    OS << Buffer->getBuffer();
-    llvm::sys::RemoveFileOnSignal(ModuleFileName);
+    if (!UseDiskCache)
+      llvm::sys::RemoveFileOnSignal(ModuleFileName);
+  } else if (FD != -1) {
+    { llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true); }
+    llvm::sys::fs::remove(ModuleFileName);
   }
 }
 
