@@ -7476,7 +7476,9 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
       }
     }
 
-    if (CodeSynthesisContexts.empty() && !Fn->getType()->isRecordType() &&
+    CXXRecordDecl *FnRD =
+        Fn->getType().isNull() ? nullptr : Fn->getType()->getAsCXXRecordDecl();
+    if (CodeSynthesisContexts.empty() && (!FnRD || FnRD->isLambda()) &&
         Fn->getType() != Context.BoundMemberTy) {
       CXXRecordDecl *ApplyRD = nullptr;
       unsigned ApplyArgIdx = 0;
@@ -7517,6 +7519,21 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
           return false;
         };
         auto isHigherOrderConsumer = [&]() -> bool {
+          if (FnRD && FnRD->isLambda()) {
+            if (CXXMethodDecl *CallOp = FnRD->getLambdaCallOperator()) {
+              if (ApplyArgIdx < CallOp->getNumParams()) {
+                const ParmVarDecl *P = CallOp->getParamDecl(ApplyArgIdx);
+                if (P->getType().getNonReferenceType()->getAsCXXRecordDecl() ==
+                    ApplyRD)
+                  return true;
+                if (CallOp->hasBody() &&
+                    paramIsCalledInBody(CallOp->getBody(), P,
+                                        paramIsCalledInBody))
+                  return true;
+              }
+            }
+            return false;
+          }
           SmallVector<NamedDecl *, 8> Decls;
           if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(NakedCallee)) {
             for (NamedDecl *D : ULE->decls())
