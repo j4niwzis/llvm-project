@@ -7725,9 +7725,13 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
               if (Own[J]) {
                 Rearranged.push_back(Own[J]);
               } else if (!Fields[J].empty()) {
-                Rearranged.push_back(new (Context) InitListExpr(
-                    Context, ILE->getLBraceLoc(), Fields[J], ILE->getRBraceLoc(),
-                    /*isExplicit=*/false));
+                ExprResult Part =
+                    ActOnInitList(ILE->getLBraceLoc(), Fields[J], ILE->getRBraceLoc());
+                if (!Part.isUsable()) {
+                  Rearranged.clear();
+                  break;
+                }
+                Rearranged.push_back(Part.get());
               } else if (PJ->hasDefaultArg() && !PJ->hasUninstantiatedDefaultArg() &&
                          !PJ->hasUnparsedDefaultArg() && PJ->getDefaultArg() &&
                          !PJ->getDefaultArg()->isValueDependent() &&
@@ -7792,9 +7796,11 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                 QualType PT = PatFD->getParamDecl(I)->getType();
                 if (!PT->isDependentType() && !PT->isReferenceType()) {
                   SFINAETrap Trap(*this);
-                  auto *Copy = new (Context) InitListExpr(
-                      Context, ILE->getLBraceLoc(), ILE->inits(), ILE->getRBraceLoc(),
-                      /*isExplicit=*/false);
+                  ExprResult CopyR =
+                      ActOnInitList(ILE->getLBraceLoc(), ILE->inits(), ILE->getRBraceLoc());
+                  if (!CopyR.isUsable())
+                    continue;
+                  Expr *Copy = CopyR.get();
                   InitializedEntity Entity = InitializedEntity::InitializeTemporary(PT);
                   InitializationKind Kind = InitializationKind::CreateCopy(
                       Copy->getBeginLoc(), SourceLocation());

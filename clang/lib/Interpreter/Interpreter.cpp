@@ -209,9 +209,11 @@ static Expr *cppshInitialize(Sema &S, QualType T, MultiExprArg Args, bool List,
 
 static Expr *cppshBraced(Sema &S, QualType T, ArrayRef<Expr *> Elems,
                          SourceLocation Loc) {
-  ASTContext &Ctx = S.getASTContext();
-  auto *List = new (Ctx) InitListExpr(Ctx, Loc, Elems, Loc, /*isExplicit=*/false);
-  Expr *Args[1] = {List};
+  SmallVector<Expr *, 8> Inits(Elems.begin(), Elems.end());
+  ExprResult List = S.ActOnInitList(Loc, Inits, Loc);
+  if (!List.isUsable())
+    return nullptr;
+  Expr *Args[1] = {List.get()};
   return cppshInitialize(S, T, Args, /*List=*/true, Loc);
 }
 
