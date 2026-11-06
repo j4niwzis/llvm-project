@@ -72,7 +72,7 @@
    - если AST не даёт типа (пайплайн через результат лямбды), остаётся прежняя эвристика `file_entry` / `line_entry`.
 3. **Карточка команды (`ls` + `Tab`):** когда введённое имя — единственное оставшееся дополнение, выводится карточка (`commandCard`): сигнатуры всех перегрузок из AST, опции из record-параметра (`ls_opts`: `.all`, `.recursive`, `.dirs_only`, `.files_only`), поля элементов результата (`yields (file_entry)`: `.name`, `.ext`, `.size`, `.is_dir`) или поля результата (`returns (sh_result)`), и примеры вызова. Таблица команд (`commands()`) общая для списка дополнений и карточек.
 
-Не проверено сборкой: изменения написаны без локальной сборки clang (на машине, где они писались, не было места под llvm-project).
+Built and run by the user on their machine; this machine has no room for an llvm-project build.
 
 ## 4. Run-time values as compile-time values (staging)
 
