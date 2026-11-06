@@ -1143,6 +1143,7 @@ extern std::set<const FunctionDecl *> CppshCutFunctions;
 extern std::vector<std::string> CppshCutRemainders;
 extern std::vector<std::string> CppshCutLoopRests;
 bool cppshMoveOnly(Sema &S, QualType T);
+extern const VarDecl *CppshCutNeedVar;
 extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
 } // namespace clang
 
@@ -1277,6 +1278,104 @@ static std::string cppshReplaceOwnBreaks(StringRef Code, const LangOptions &LO,
 
 static unsigned CppshBreakFlags = 0;
 
+// The local each cut was made for (the value it needed), or none: a staged
+// call, or needs of different locals.
+static llvm::DenseMap<unsigned, const VarDecl *> CppshCutNeedOf;
+
+// Whether an expression names a local, or a part of it (a member, an element).
+static bool cppshRefersTo(const Expr *E, const VarDecl *VD) {
+  while (E) {
+    E = E->IgnoreParenImpCasts();
+    if (auto *DRE = dyn_cast<DeclRefExpr>(E))
+      return DRE->getDecl() == VD;
+    if (auto *ME = dyn_cast<MemberExpr>(E)) {
+      E = ME->getBase();
+      continue;
+    }
+    if (auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
+      E = ASE->getBase();
+      continue;
+    }
+    if (auto *OCE = dyn_cast<CXXOperatorCallExpr>(E);
+        OCE && OCE->getOperator() == OO_Subscript) {
+      E = OCE->getArg(0);
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+// Whether code may change a local: assigned, incremented, its address taken,
+// bound to a reference to non-const (`std::cin >> v.x` included), a non-const
+// member function called on it. The cut itself (std::sh::__cppsh_*) is not.
+static bool cppshMutates(const Stmt *S, const VarDecl *VD) {
+  if (!S)
+    return false;
+  if (auto *BO = dyn_cast<BinaryOperator>(S))
+    if (BO->isAssignmentOp() && cppshRefersTo(BO->getLHS(), VD))
+      return true;
+  if (auto *UO = dyn_cast<UnaryOperator>(S))
+    if ((UO->isIncrementDecrementOp() || UO->getOpcode() == UO_AddrOf) &&
+        cppshRefersTo(UO->getSubExpr(), VD))
+      return true;
+  if (auto *CE = dyn_cast<CallExpr>(S)) {
+    const FunctionDecl *FD = CE->getDirectCallee();
+    if (FD && FD->getIdentifier() && FD->getName().starts_with("__cppsh_"))
+      return false;
+    if (auto *MCE = dyn_cast<CXXMemberCallExpr>(CE))
+      if (const CXXMethodDecl *MD = MCE->getMethodDecl();
+          MD && !MD->isConst() && cppshRefersTo(MCE->getImplicitObjectArgument(), VD))
+        return true;
+    unsigned Skip = 0;
+    if (auto *OCE = dyn_cast<CXXOperatorCallExpr>(CE);
+        OCE && isa_and_nonnull<CXXMethodDecl>(FD)) {
+      if (!cast<CXXMethodDecl>(FD)->isConst() && OCE->getNumArgs() > 0 &&
+          cppshRefersTo(OCE->getArg(0), VD))
+        return true;
+      Skip = 1;
+    }
+    const FunctionProtoType *FPT =
+        FD ? FD->getType()->getAs<FunctionProtoType>() : nullptr;
+    for (unsigned I = Skip; I < CE->getNumArgs(); ++I) {
+      if (!cppshRefersTo(CE->getArg(I), VD))
+        continue;
+      unsigned P = I - Skip;
+      if (!FPT || P >= FPT->getNumParams())
+        return true; // not known: as if changed
+      QualType PT = FPT->getParamType(P);
+      if (PT->isReferenceType() && !PT->getPointeeType().isConstQualified())
+        return true;
+    }
+  }
+  for (const Stmt *C : S->children())
+    if (cppshMutates(C, VD))
+      return true;
+  return false;
+}
+
+// A loop whose cuts were all made for one local declared before it, which it
+// does not change: the cut moved before the loop -- one continuation running
+// the whole loop with that value known, not one per iteration. The cuts in it
+// are dropped (the loop, cut at as a statement, is not kept) and the need
+// raised again for the block around it.
+static bool cppshHoistOutOfLoop(SourceManager &SM, size_t OpenBefore, Stmt *Loop) {
+  const VarDecl *Need = nullptr;
+  for (size_t I = OpenBefore; I < CppshOpenCuts.size(); ++I) {
+    auto It = CppshCutNeedOf.find(CppshOpenCuts[I]);
+    if (It == CppshCutNeedOf.end() || !It->second || (Need && Need != It->second))
+      return false;
+    Need = It->second;
+  }
+  if (!Need || !SM.isBeforeInTranslationUnit(Need->getLocation(), Loop->getBeginLoc()) ||
+      cppshMutates(Loop, Need))
+    return false;
+  CppshOpenCuts.resize(OpenBefore);
+  CppshCutNeeded = true;
+  CppshCutNeedVar = Need;
+  return true;
+}
+
 // A loop a cut was made in (CppshOpenCuts from OpenBefore on): each such cut
 // finishes the iteration (its remainder, in `do { ... } while (false)`, made
 // by __cppsh_cut_run), then runs the loop on from its next step -- its loop
@@ -1296,6 +1395,8 @@ static void cppshWrapLoop(Sema &S, Preprocessor &PP, size_t OpenBefore,
         .str();
   };
   Stmt *Loop = Res.get();
+  if (cppshHoistOutOfLoop(SM, OpenBefore, Loop))
+    return;
   std::string Restart;
   if (auto *W = dyn_cast<WhileStmt>(Loop))
     Restart = text(W);
@@ -1678,7 +1779,9 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
         StringRef Rest = Lexer::getSourceText(
             CharSourceRange::getCharRange(CppshStmtBegin, Tok.getLocation()), SM,
             getLangOpts());
+        const VarDecl *NeedVar = CppshCutNeedVar;
         unsigned Id = CppshEmitCut(Rest, CppshStmtBegin, FD);
+        CppshCutNeedOf[Id] = NeedVar;
         if (!CppshBody)
           CppshOpenCuts.push_back(Id);
         LastIsError = false;
@@ -1708,6 +1811,18 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
           To = "{ " + To + " } " + Rest;
       }
       unsigned Id = CppshEmitCut(Rest, After, FD);
+      // Made for what the cuts in the statement were made for, if one local.
+      {
+        const VarDecl *Common = nullptr;
+        bool One = true;
+        for (size_t I = CppshOpenBefore; I < CppshOpenCuts.size() && One; ++I) {
+          auto It = CppshCutNeedOf.find(CppshOpenCuts[I]);
+          const VarDecl *V = It == CppshCutNeedOf.end() ? nullptr : It->second;
+          One = V && (!Common || Common == V);
+          Common = V;
+        }
+        CppshCutNeedOf[Id] = One ? Common : nullptr;
+      }
       if (CppshBody)
         CppshOpenCuts.resize(CppshOpenBefore);
       else

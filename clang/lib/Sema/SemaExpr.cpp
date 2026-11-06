@@ -110,6 +110,8 @@ SourceLocation CppshStageAt;
 // and runs the rest with the locals' values known (a continuation). The
 // cuts: the rest of each body, and its live locals' names and types.
 bool CppshCutNeeded = false;
+// The local whose value the need is for; none for a staged call.
+const VarDecl *CppshCutNeedVar = nullptr;
 std::set<const FunctionDecl *> CppshCutFunctions;
 std::vector<std::string> CppshCutRemainders;
 // Per cut: where it was made in a loop, the loop run on from its next step,
@@ -7222,6 +7224,7 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
       if (FunctionDecl *Cur = getCurFunctionDecl();
           Cur && !Cur->isDependentContext()) {
         CppshCutNeeded = true; // its caller's body cut here too
+        CppshCutNeedVar = nullptr;
       } else if (!CppshInHoist && !CppshStageAt.isValid()) {
         CppshStageAt = CE->getBeginLoc(); // a top-level statement: hoisted
         CppshHoistBegin = CE->getBeginLoc();
@@ -8010,6 +8013,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                       !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)) &&
                       cppshInUserInput(*this, getCurFunctionDecl()->getLocation())) {
                     CppshCutNeeded = true;
+                    CppshCutNeedVar = VD;
                     CppshCutHere = true;
                     continue;
                   }
