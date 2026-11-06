@@ -3539,6 +3539,14 @@ static bool evaluateVarDeclInit(EvalInfo &Info, const Expr *E,
   // Used to be C++20 [expr.const]p5.12.2:
   // ... its lifetime began within the evaluation of E;
   if (isa<ParmVarDecl>(VD)) {
+    if (VD->hasConstantInitialization()) {
+      if (APValue *EvalVal = const_cast<APValue *>(VD->getEvaluatedValue())) {
+        if (EvalVal->hasValue()) {
+          Result = EvalVal;
+          return true;
+        }
+      }
+    }
     if (AllowConstexprUnknown) {
       Result = nullptr;
       return true;

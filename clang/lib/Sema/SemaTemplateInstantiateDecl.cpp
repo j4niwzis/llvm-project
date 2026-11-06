@@ -3012,7 +3012,15 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     }
   }
 
-  if (FunctionTemplate && !TemplateParams) {
+  bool HasCppshConstParam = false;
+  for (const ParmVarDecl *P : D->parameters()) {
+    if (P && P->hasConstantInitialization()) {
+      HasCppshConstParam = true;
+      break;
+    }
+  }
+
+  if (FunctionTemplate && !TemplateParams && !HasCppshConstParam) {
     ArrayRef<TemplateArgument> Innermost = TemplateArgs.getInnermost();
 
     llvm::FoldingSetInsertToken InsertToken;
@@ -3096,6 +3104,12 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
 
   DeclarationNameInfo NameInfo
     = SemaRef.SubstDeclarationNameInfo(D->getNameInfo(), TemplateArgs);
+  if (HasCppshConstParam && NameInfo.getName().isIdentifier()) {
+    static unsigned CppshSpecCounter = 0;
+    std::string SpecName = NameInfo.getName().getAsString() +
+                           "__cppsh_val_" + std::to_string(++CppshSpecCounter);
+    NameInfo.setName(&SemaRef.PP.getIdentifierTable().get(SpecName));
+  }
 
   if (FunctionRewriteKind != RewriteKind::None)
     adjustForRewrite(FunctionRewriteKind, D, T, TInfo, NameInfo);
@@ -3185,9 +3199,18 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
                  Sema::CodeSynthesisContext::BuildingDeductionGuides) {
     // Record this function template specialization.
     ArrayRef<TemplateArgument> Innermost = TemplateArgs.getInnermost();
+    SmallVector<TemplateArgument, 4> SpecArgs(Innermost.begin(),
+                                              Innermost.end());
+    if (HasCppshConstParam) {
+      static uint64_t UniqueSpecId = 0;
+      SpecArgs.push_back(TemplateArgument(
+          SemaRef.Context,
+          llvm::APSInt(llvm::APInt(64, ++UniqueSpecId), /*isUnsigned=*/true),
+          SemaRef.Context.UnsignedLongLongTy));
+    }
     Function->setFunctionTemplateSpecialization(
         FunctionTemplate,
-        TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost),
+        TemplateArgumentList::CreateCopy(SemaRef.Context, SpecArgs),
         /*InsertToken=*/{});
   } else if (isFriend && D->isThisDeclarationADefinition()) {
     // Do not connect the friend to the template unless it's actually a
@@ -5627,6 +5650,14 @@ bool Sema::addInstantiatedParametersToScope(
         FunctionParam->setType(T);
       }
 
+      if (PatternParam->hasConstantInitialization()) {
+        if (const APValue *Val = PatternParam->getEvaluatedValue()) {
+          EvaluatedStmt *ES = FunctionParam->ensureEvaluatedStmt();
+          ES->WasEvaluated = true;
+          ES->HasConstantInitialization = true;
+          ES->Evaluated = *Val;
+        }
+      }
       Scope.InstantiatedLocal(PatternParam, FunctionParam);
       ++FParamIdx;
       continue;
@@ -6332,6 +6363,14 @@ void Sema::InstantiateFunctionDefinition(SourceLocation PointOfInstantiation,
 
       // Instantiate the function body.
       Body = SubstStmt(Pattern, TemplateArgs);
+      for (ParmVarDecl *FP : Function->parameters()) {
+        if (FP) {
+          if (EvaluatedStmt *ES = FP->getEvaluatedStmt()) {
+            ES->WasEvaluated = false;
+            ES->HasConstantInitialization = false;
+          }
+        }
+      }
 
       if (Body.isInvalid())
         Function->setInvalidDecl();

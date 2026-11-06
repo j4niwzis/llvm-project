@@ -7440,6 +7440,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                     ES->HasConstantInitialization = true;
                   Context.getTranslationUnitDecl()->getFirstDecl()->addDecl(
                       ArrVD);
+                  Consumer.HandleTopLevelDecl(DeclGroupRef(ArrVD));
                   MemPtrExpr =
                       BuildDeclRefExpr(ArrVD, ArrTy, VK_LValue, LParenLoc);
                 }
@@ -7640,10 +7641,73 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         return CallExpr::Create(Context, Fn, ArgExprs, Context.DependentTy,
                                 VK_PRValue, RParenLoc, CurFPFeatureOverrides());
       OverloadExpr *ovl = find.Expression;
-      if (UnresolvedLookupExpr *ULE = dyn_cast<UnresolvedLookupExpr>(ovl))
-        return BuildOverloadedCallExpr(
+      if (UnresolvedLookupExpr *ULE = dyn_cast<UnresolvedLookupExpr>(ovl)) {
+        auto stmtHasIf = [](const Stmt *S, auto &Self) -> bool {
+          if (!S)
+            return false;
+          if (isa<IfStmt>(S))
+            return true;
+          for (const Stmt *C : S->children())
+            if (C && Self(C, Self))
+              return true;
+          return false;
+        };
+        struct SavedParamConst {
+          ParmVarDecl *P;
+          bool WasEval;
+          bool HasConstInit;
+          APValue Val;
+        };
+        SmallVector<SavedParamConst, 4> SavedParams;
+        for (NamedDecl *ND : ULE->decls()) {
+          auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
+          if (!FTD)
+            continue;
+          FunctionDecl *PatFD = FTD->getTemplatedDecl();
+          if (!PatFD || !PatFD->hasBody() ||
+              !PatFD->getReturnType()->isUndeducedType() ||
+              !stmtHasIf(PatFD->getBody(), stmtHasIf))
+            continue;
+          for (unsigned I = 0;
+               I < PatFD->getNumParams() && I < ArgExprs.size(); ++I) {
+            Expr *ArgE = ArgExprs[I];
+            if (!ArgE || ArgE->isTypeDependent() || ArgE->isValueDependent())
+              continue;
+            Expr::EvalResult EV;
+            bool Ok = ArgE->EvaluateAsRValue(EV, Context);
+            if (!Ok) {
+              if (auto *DRE = dyn_cast<DeclRefExpr>(ArgE->IgnoreParenImpCasts())) {
+                if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+                  if (const Expr *InitE = VD->getAnyInitializer()) {
+                    if (!InitE->isValueDependent())
+                      Ok = InitE->EvaluateAsRValue(EV, Context);
+                  }
+                }
+              }
+            }
+            if (Ok && EV.Val.hasValue()) {
+              ParmVarDecl *P = PatFD->getParamDecl(I);
+              EvaluatedStmt *ES = P->ensureEvaluatedStmt();
+              SavedParams.push_back(
+                  {P, ES->WasEvaluated, ES->HasConstantInitialization, ES->Evaluated});
+              ES->WasEvaluated = true;
+              ES->HasConstantInitialization = true;
+              ES->Evaluated = EV.Val;
+            }
+          }
+        }
+        ExprResult OvRes = BuildOverloadedCallExpr(
             Scope, Fn, ULE, LParenLoc, ArgExprs, RParenLoc, ExecConfig,
             /*AllowTypoCorrection=*/true, find.IsAddressOfOperand);
+        for (auto &SP : llvm::reverse(SavedParams)) {
+          if (EvaluatedStmt *ES = SP.P->getEvaluatedStmt()) {
+            ES->WasEvaluated = SP.WasEval;
+            ES->HasConstantInitialization = SP.HasConstInit;
+            ES->Evaluated = SP.Val;
+          }
+        }
+        return OvRes;
+      }
       return BuildCallToMemberFunction(Scope, Fn, LParenLoc, ArgExprs,
                                        RParenLoc, ExecConfig, IsExecConfig,
                                        AllowRecovery);
