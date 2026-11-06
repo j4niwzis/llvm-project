@@ -44,6 +44,10 @@
 #include "llvm/ADT/StringExtras.h"
 
 using namespace clang;
+
+namespace clang {
+extern bool CppshCutNeeded;
+} // namespace clang
 using namespace sema;
 
 StmtResult Sema::ActOnExprStmt(ExprResult FE, bool DiscardedValue) {
@@ -3936,6 +3940,14 @@ bool Sema::DeduceFunctionTypeFromReturnExpr(FunctionDecl *FD,
   // type from the corresponding call operator, not from the synthesized return
   // statement within it. See Sema::DeduceReturnType.
   if (isLambdaConversionOperator(FD))
+    return false;
+
+  // cppsh: a return the body is cut at (CppshCutNeeded) -- its value only
+  // known as the function runs, its expression a recovery of no type -- the
+  // parser drops it for the cut's own return: the function's type is not
+  // deduced from it (deduced from an expression of no type, it stayed
+  // dependent, and code generation of the function crashed).
+  if (CppshCutNeeded)
     return false;
 
   if (isa_and_nonnull<InitListExpr>(RetExpr)) {
