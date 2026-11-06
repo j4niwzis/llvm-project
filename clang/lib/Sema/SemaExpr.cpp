@@ -7796,8 +7796,10 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                 QualType PT = PatFD->getParamDecl(I)->getType();
                 if (!PT->isDependentType() && !PT->isReferenceType()) {
                   SFINAETrap Trap(*this);
+                  // ActOnInitList takes a mutable list: the inits copied.
+                  SmallVector<Expr *, 8> CopyInits(ILE->inits().begin(), ILE->inits().end());
                   ExprResult CopyR =
-                      ActOnInitList(ILE->getLBraceLoc(), ILE->inits(), ILE->getRBraceLoc());
+                      ActOnInitList(ILE->getLBraceLoc(), CopyInits, ILE->getRBraceLoc());
                   if (!CopyR.isUsable())
                     continue;
                   Expr *Copy = CopyR.get();
