@@ -1292,7 +1292,6 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
     // compiles and runs the rest with their values known.
     if (CppshBody && CppshCutNeeded) {
       CppshCutNeeded = false;
-      Actions.getDiagnostics().setSuppressAllDiagnostics(false);
       FunctionDecl *FD = Actions.getCurFunctionDecl();
       bool Progress = FD && !(Stmts.empty() && FD->getIdentifier() &&
                               FD->getName().starts_with("__cppsh_cont"));
@@ -1365,10 +1364,6 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
             }
           }
         }
-        // What the cut statement's analysis without the value raised is
-        // not the function's: its error state let go.
-        if (sema::FunctionScopeInfo *FSI = Actions.getCurFunction())
-          FSI->ErrorTrap.reset();
         LastIsError = false;
         continue;
       }

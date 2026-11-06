@@ -7818,6 +7818,9 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
           CppshParamValue[P] = std::move(V);
         };
         SmallVector<std::pair<ParmVarDecl *, const Expr *>, 4> SavedRebuilds;
+        // This call needs what only running its function gives (cppsh): the
+        // body is cut at its statement, so the call is not built.
+        bool CppshCutHere = false;
         for (NamedDecl *ND : ULE->decls()) {
           auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
           if (!FTD)
@@ -7882,7 +7885,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                       !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)) &&
                       cppshInUserInput(*this, getCurFunctionDecl()->getLocation())) {
                     CppshCutNeeded = true;
-                    getDiagnostics().setSuppressAllDiagnostics(true);
+                    CppshCutHere = true;
                     continue;
                   }
                   // Defined by this same input, not run yet: its value is not
@@ -7977,6 +7980,28 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
               continue;
             setValue(P, EV.Val);
           }
+        }
+        auto RestoreParams = [&] {
+          for (auto &[P, Was] : llvm::reverse(SavedRebuilds)) {
+            if (Was)
+              CppshParamRebuild[P] = Was;
+            else
+              CppshParamRebuild.erase(P);
+          }
+          SavedRebuilds.clear();
+          for (auto &[P, Was] : llvm::reverse(SavedValues)) {
+            if (Was)
+              CppshParamValue[P] = std::move(*Was);
+            else
+              CppshParamValue.erase(P);
+          }
+          SavedValues.clear();
+        };
+        if (CppshCutHere) {
+          // A recovery expression of no type: what uses it is not diagnosed,
+          // and the parser drops the statement for the cut.
+          RestoreParams();
+          return CreateRecoveryExpr(Fn->getBeginLoc(), RParenLoc, ArgExprs);
         }
         ExprResult OvRes = BuildOverloadedCallExpr(
             Scope, Fn, ULE, LParenLoc, ArgExprs, RParenLoc, ExecConfig,

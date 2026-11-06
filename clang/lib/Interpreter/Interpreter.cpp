@@ -1368,20 +1368,17 @@ llvm::Error Interpreter::Execute(PartialTranslationUnit &T) {
   return llvm::Error::success();
 }
 
-namespace clang {
+// (Inside namespace clang already.)
 extern SourceLocation CppshStageAt;
 extern std::vector<SourceLocation> CppshTopLevelStarts;
 // What the shell does before each piece of an input is compiled (cppsh: the
 // snapshots of the variables it names); none by default.
 void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef) = nullptr;
-} // namespace clang
 
-namespace clang {
 extern std::vector<std::string> CppshCutRemainders;
 extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
 extern SourceLocation CppshHoistBegin, CppshHoistEnd;
 extern bool CppshInHoist;
-} // namespace clang
 
 // The global holding the last continuation's result: what a hoisted call is
 // replaced by.
@@ -1408,19 +1405,15 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   for (unsigned I = 0; I < N && I < Names.size(); ++I) {
     std::string Global = "__cppsh_f" + Tag + "_" + Names[I];
     Code += "auto &" + Global + " = *static_cast<" + Types[I] + " *>((void *)" +
-            std::to_string(reinterpret_cast<uintptr_t>(Frame[I])) + "ULL);
-";
+            std::to_string(reinterpret_cast<uintptr_t>(Frame[I])) + "ULL);\n";
     Params += std::string(Params.empty() ? "" : ", ") + "auto " + Names[I];
     Args += std::string(Args.empty() ? "" : ", ") + Global;
   }
-  Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {
-" + CppshCutRemainders[Id] +
-          "
-}
-";
-  Code += "auto __cppsh_res" + Tag + " = ::std::sh::__cppsh_value([] { return __cppsh_cont" +
-          Tag + "(" + Args + "); });
-";
+  Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {\n" + CppshCutRemainders[Id] +
+          "\n}\n";
+  Code += "auto __cppsh_res" + Tag +
+          " = ::std::sh::__cppsh_value([] { return __cppsh_cont" + Tag + "(" + Args +
+          "); });\n";
   bool WasHoist = CppshInHoist;
   CppshInHoist = false;
   if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Code))
