@@ -47,6 +47,8 @@ constexpr const char *__cppsh_cstr(const T &v) {
     return v.c_str();
   else if constexpr (requires { v.name.c_str(); })
     return v.name.c_str();
+  else if constexpr (__cppsh_is_variant<T>)
+    return std::visit([](const auto &a) { return __cppsh_cstr(a); }, v);
   else
     return static_cast<const char *>(v);
 }
@@ -66,7 +68,9 @@ struct __cppsh_grep_pred {
   std::string pat;
   template <typename Item>
   bool operator()(const Item &item) const {
-    if constexpr (requires { item.text; })
+    if constexpr (__cppsh_is_variant<Item>)
+      return std::visit([this](const auto &a) { return (*this)(a); }, item);
+    else if constexpr (requires { item.text; })
       return item.text.find(pat) != std::string::npos;
     else if constexpr (requires { item.name; })
       return item.name.find(pat) != std::string::npos;
@@ -149,9 +153,22 @@ inline std::string __cppsh_human_size(long long bytes) {
 }
 
 template <typename T>
+inline constexpr bool __cppsh_is_optional = false;
+template <typename T>
+inline constexpr bool __cppsh_is_optional<std::optional<T>> = true;
+
+template <typename T>
 __cppsh_nu_cell __cppsh_format_cell(const T &v) {
   using U = std::remove_cvref_t<T>;
-  if constexpr (std::is_same_v<U, bool>) {
+  if constexpr (std::is_same_v<U, std::monostate>) {
+    return {"", "", false};
+  } else if constexpr (__cppsh_is_optional<U>) {
+    if (!v)
+      return {"", "", false};
+    return __cppsh_format_cell(*v);
+  } else if constexpr (__cppsh_is_variant<U>) {
+    return std::visit([](const auto &a) { return __cppsh_format_cell(a); }, v);
+  } else if constexpr (std::is_same_v<U, bool>) {
     return {v ? "true" : "false", v ? "\033[32m" : "\033[31m", false};
   } else if constexpr (std::is_integral_v<U> || std::is_floating_point_v<U>) {
     std::ostringstream oss;
@@ -253,6 +270,43 @@ inline void __cppsh_render_nu_table(
   draw_hline("╰", "┴", "╯");
 }
 
+// A field's cell: a byte count named `size` as a size.
+template <typename V>
+__cppsh_nu_cell __cppsh_field_cell(std::string_view name, const V &v) {
+  if constexpr (std::is_integral_v<V> && !std::is_same_v<V, bool>)
+    if (name == "size")
+      return {__cppsh_human_size(static_cast<long long>(v)), "\033[36m", true};
+  return __cppsh_format_cell(v);
+}
+
+// A record's fields, by reflection, as (name, cell).
+template <typename A>
+void __cppsh_record_cells(const A &item,
+                          std::vector<std::pair<std::string, __cppsh_nu_cell>> &out) {
+  constexpr meta::info R = ^^A;
+  constexpr unsigned int N = meta::members_of(R).size();
+  [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+    (([&] {
+       constexpr meta::info m = meta::members_of(R)[Is];
+       if constexpr (meta::is_nonstatic_data_member(m)) {
+         constexpr meta::info field{m.id, 2};
+         out.emplace_back(meta::identifier_of(m),
+                          __cppsh_field_cell(meta::identifier_of(m), item.[:field:]));
+       }
+     }()),
+     ...);
+  }(std::make_index_sequence<N>{});
+}
+
+// An alternative's kind, from its type's name: `dir_entry` -> "dir".
+template <typename A>
+std::string __cppsh_kind_name() {
+  std::string n = meta::identifier_of(^^A);
+  if (n.size() > 6 && n.ends_with("_entry"))
+    n.resize(n.size() - 6);
+  return n;
+}
+
 struct __cppsh_show_stage
     : std::ranges::__range_adaptor_closure<__cppsh_show_stage> {
   template <std::ranges::input_range Rng>
@@ -261,21 +315,59 @@ struct __cppsh_show_stage
     std::vector<std::string> headers;
     std::vector<std::vector<__cppsh_nu_cell>> rows;
 
-    if constexpr (requires(const ElemT &e) {
-                    e.name;
-                    e.ext;
-                    e.size;
-                    e.is_dir;
-                  }) {
-      headers = {"#", "name", "type", "size"};
-      std::size_t idx = 0;
+    if constexpr (__cppsh_is_variant<ElemT>) {
+      // Each row its alternative's fields; the columns their union, in the
+      // order first seen -- `name` first, then the kind, then the rest.
+      std::vector<std::string> fields;
+      std::vector<std::pair<std::string, std::vector<std::pair<std::string, __cppsh_nu_cell>>>> got;
       for (auto &&item : rng) {
+        std::vector<std::pair<std::string, __cppsh_nu_cell>> cells;
+        std::string kind = std::visit(
+            [&](const auto &a) {
+              using A = std::remove_cvref_t<decltype(a)>;
+              __cppsh_record_cells(a, cells);
+              return __cppsh_kind_name<A>();
+            },
+            item);
+        for (const auto &c : cells)
+          if (std::find(fields.begin(), fields.end(), c.first) == fields.end())
+            fields.push_back(c.first);
+        got.emplace_back(std::move(kind), std::move(cells));
+      }
+      auto named = std::find(fields.begin(), fields.end(), std::string("name"));
+      if (named != fields.end())
+        std::rotate(fields.begin(), named, named + 1);
+      headers.push_back("#");
+      std::size_t at = 0;
+      if (!fields.empty() && fields.front() == "name") {
+        headers.push_back("name");
+        at = 1;
+      }
+      headers.push_back("type");
+      for (std::size_t f = at; f < fields.size(); ++f)
+        headers.push_back(fields[f]);
+      std::size_t idx = 0;
+      for (auto &[kind, cells] : got) {
+        auto cell_of = [&](const std::string &f) -> __cppsh_nu_cell {
+          for (auto &c : cells)
+            if (c.first == f)
+              return c.second;
+          return {"", "", false};
+        };
+        const bool dir = kind == "dir";
         std::vector<__cppsh_nu_cell> row;
         row.push_back({std::to_string(idx++), "\033[32m", true});
-        row.push_back({item.name, item.is_dir ? "\033[1;34m" : "", false});
-        row.push_back({item.is_dir ? "dir" : "file",
-                       item.is_dir ? "\033[36m" : "\033[90m", false});
-        row.push_back({__cppsh_human_size(item.size), "\033[36m", true});
+        if (at == 1) {
+          __cppsh_nu_cell n = cell_of("name");
+          if (dir)
+            n.color = "\033[1;34m";
+          else if (kind == "link")
+            n.color = "\033[1;36m";
+          row.push_back(std::move(n));
+        }
+        row.push_back({kind, dir ? "\033[36m" : "\033[90m", false});
+        for (std::size_t f = at; f < fields.size(); ++f)
+          row.push_back(cell_of(fields[f]));
         rows.push_back(std::move(row));
       }
       __cppsh_render_nu_table(headers, rows);
@@ -319,7 +411,7 @@ struct __cppsh_show_stage
              constexpr meta::info m = meta::members_of(R)[Is];
              if constexpr (meta::is_nonstatic_data_member(m)) {
                constexpr meta::info field{m.id, 2};
-               row.push_back(__cppsh_format_cell(item.[:field:]));
+               row.push_back(__cppsh_field_cell(meta::identifier_of(m), item.[:field:]));
              }
            }()),
            ...);
@@ -385,16 +477,32 @@ constexpr auto operator_unresolved() noexcept {
   return sym<Cs...>{};
 }
 
+// What `ls` lists, each kind a type of its own: what an entry is, is which
+// of them it is -- in a range of all kinds, the alternative of a variant
+// (fs_entry) -- not a flag it stores.
 struct file_entry {
   std::string name;
   std::string ext;
   long long size = 0;
-  bool is_dir = false;
+  constexpr bool is_dir() const noexcept { return false; }
   void dump() const {
-    std::printf("%s %-28s %10lld B\n", is_dir ? "[dir] " : "[file]",
-                name.c_str(), size);
+    std::printf("[file] %-28s %10lld B\n", name.c_str(), size);
   }
 };
+struct dir_entry {
+  std::string name;
+  constexpr bool is_dir() const noexcept { return true; }
+  void dump() const { std::printf("[dir]  %s/\n", name.c_str()); }
+};
+struct link_entry {
+  std::string name;
+  std::string target;
+  constexpr bool is_dir() const noexcept { return false; }
+  void dump() const {
+    std::printf("[link] %s -> %s\n", name.c_str(), target.c_str());
+  }
+};
+using fs_entry = std::variant<file_entry, dir_entry, link_entry>;
 
 struct ls_opts {
   bool all = false;
@@ -481,19 +589,59 @@ struct lines_view : public std::ranges::view_interface<lines_view> {
   }
 };
 
-struct ls_view : public std::ranges::view_interface<ls_view> {
+// A directory entry made into what a listing of Entry holds -- false where
+// it is not one (a directory, listing files). Overloaded on what is made.
+inline bool __cppsh_make_entry(const std::filesystem::directory_entry &de,
+                               std::string name, file_entry &out) {
+  std::error_code ec;
+  if (de.is_directory(ec))
+    return false;
+  long long size = 0;
+  auto raw = de.file_size(ec);
+  if (!ec)
+    size = static_cast<long long>(raw);
+  out = file_entry{std::move(name), de.path().extension().string(), size};
+  return true;
+}
+inline bool __cppsh_make_entry(const std::filesystem::directory_entry &de,
+                               std::string name, dir_entry &out) {
+  std::error_code ec;
+  if (!de.is_directory(ec))
+    return false;
+  out = dir_entry{std::move(name)};
+  return true;
+}
+inline bool __cppsh_make_entry(const std::filesystem::directory_entry &de,
+                               std::string name, fs_entry &out) {
+  std::error_code ec;
+  if (de.is_symlink(ec)) {
+    out = link_entry{std::move(name), std::filesystem::read_symlink(de.path(), ec).string()};
+    return true;
+  }
+  if (de.is_directory(ec)) {
+    out = dir_entry{std::move(name)};
+    return true;
+  }
+  file_entry file;
+  __cppsh_make_entry(de, std::move(name), file);
+  out = std::move(file);
+  return true;
+}
+
+template <typename Entry = fs_entry>
+struct ls_view : public std::ranges::view_interface<ls_view<Entry>> {
   std::string dir = ".";
   ls_opts opts{};
 
   struct iterator {
     using iterator_concept = std::input_iterator_tag;
     using iterator_category = std::input_iterator_tag;
-    using value_type = file_entry;
+    using value_type = Entry;
     using difference_type = std::ptrdiff_t;
 
     std::filesystem::directory_iterator it;
     ls_opts opts{};
-    file_entry cur{};
+    Entry cur{};
 
     iterator() = default;
     iterator(const std::string &d, ls_opts o) : opts(o) {
@@ -510,29 +658,21 @@ struct ls_view : public std::ranges::view_interface<ls_view> {
       while (it != std::filesystem::directory_iterator{}) {
         const auto &de = *it;
         std::string fname = de.path().filename().string();
-        if (!opts.all && !fname.empty() && fname[0] == '.') {
-          it.increment(ec);
-          continue;
-        }
+        // Hidden ones, and those the options leave out where the options
+        // were not known as the call was compiled (a listing of all kinds).
         bool isDir = de.is_directory(ec);
-        if ((opts.dirs_only && !isDir) || (opts.files_only && isDir)) {
+        if ((!opts.all && !fname.empty() && fname[0] == '.') ||
+            (opts.dirs_only && !isDir) || (opts.files_only && isDir) ||
+            !__cppsh_make_entry(de, std::move(fname), cur)) {
           it.increment(ec);
           continue;
         }
-        long long fsize = 0;
-        if (!isDir) {
-          auto raw_sz = de.file_size(ec);
-          if (!ec)
-            fsize = static_cast<long long>(raw_sz);
-        }
-        std::string ext = de.path().extension().string();
-        cur = file_entry{std::move(fname), std::move(ext), fsize, isDir};
         return;
       }
     }
 
-    const file_entry &operator*() const noexcept { return cur; }
-    const file_entry *operator->() const noexcept { return &cur; }
+    const Entry &operator*() const noexcept { return cur; }
+    const Entry *operator->() const noexcept { return &cur; }
     iterator &operator++() {
       std::error_code ec;
       it.increment(ec);
@@ -598,14 +738,50 @@ inline bool file_exists(const Path &p) {
   return std::filesystem::exists(__cppsh_cstr(p), ec);
 }
 
-inline ls_view ls(const char *dir = ".", ls_opts opts = {}) {
+// `ls "-a"`: the flags in place of a directory.
+template <typename Entry, typename Dir>
+inline ls_view<Entry> __cppsh_ls_view(const Dir &d, ls_opts opts) {
+  const char *dir = __cppsh_cstr(d);
   if (dir && dir[0] == '-') {
     for (const char *p = dir + 1; *p; ++p)
       if (*p == 'a')
         opts.all = true;
     dir = ".";
   }
-  return ls_view(std::string(dir ? dir : "."), opts);
+  return ls_view<Entry>(std::string(dir ? dir : "."), opts);
+}
+
+// What a listing holds, by its options: files, directories, or every kind
+// -- a variant, each entry its alternative. The options are known as the
+// call is compiled (the value specialization folds these `if`s), so each
+// set of them gives its own type.
+template <typename Dir = const char *>
+inline auto ls(Dir dir = ".", ls_opts opts = {}) {
+  if (opts.files_only)
+    return __cppsh_ls_view<file_entry>(dir, opts);
+  else if (opts.dirs_only)
+    return __cppsh_ls_view<dir_entry>(dir, opts);
+  else
+    return __cppsh_ls_view<fs_entry>(dir, opts);
+}
+// `ls {.files_only = true}`: the options alone.
+template <typename = void>
+inline auto ls(ls_opts opts) {
+  if (opts.files_only)
+    return __cppsh_ls_view<file_entry>(".", opts);
+  else if (opts.dirs_only)
+    return __cppsh_ls_view<dir_entry>(".", opts);
+  else
+    return __cppsh_ls_view<fs_entry>(".", opts);
+}
+
+// Whether an entry is a directory: by its kind, or the kind a variant holds.
+template <typename E>
+constexpr bool is_dir(const E &e) noexcept {
+  if constexpr (__cppsh_is_variant<E>)
+    return std::visit([](const auto &a) { return a.is_dir(); }, e);
+  else
+    return e.is_dir();
 }
 
 template <typename Path>
@@ -707,7 +883,8 @@ inline long long wc_l(const Path &p) {
   return cnt;
 }
 
-inline ls_view glob(const char *dir = ".", ls_opts opts = {}) {
+template <typename Dir = const char *>
+inline auto glob(Dir dir = ".", ls_opts opts = {}) {
   return ls(dir, opts);
 }
 
@@ -745,7 +922,34 @@ struct formatter<std::sh::file_entry, char> {
   constexpr auto parse(format_parse_context &ctx) { return ctx.begin(); }
   template <typename FormatContext>
   auto format(const std::sh::file_entry &e, FormatContext &ctx) const {
-    return std::format_to(ctx.out(), "{}{}", e.name, e.is_dir ? "/" : "");
+    return std::format_to(ctx.out(), "{}", e.name);
+  }
+};
+
+template <>
+struct formatter<std::sh::dir_entry, char> {
+  constexpr auto parse(format_parse_context &ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const std::sh::dir_entry &e, FormatContext &ctx) const {
+    return std::format_to(ctx.out(), "{}/", e.name);
+  }
+};
+
+template <>
+struct formatter<std::sh::link_entry, char> {
+  constexpr auto parse(format_parse_context &ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const std::sh::link_entry &e, FormatContext &ctx) const {
+    return std::format_to(ctx.out(), "{} -> {}", e.name, e.target);
+  }
+};
+
+template <>
+struct formatter<std::sh::fs_entry, char> {
+  constexpr auto parse(format_parse_context &ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const std::sh::fs_entry &e, FormatContext &ctx) const {
+    return std::visit([&](const auto &a) { return std::format_to(ctx.out(), "{}", a); }, e);
   }
 };
 

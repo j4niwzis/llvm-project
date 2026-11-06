@@ -77,6 +77,16 @@
 using namespace clang;
 using namespace sema;
 
+namespace clang {
+// cppsh: a variable's value now, where a statement already run defined it --
+// read from the JIT's memory by the Interpreter, which sets this; none where
+// it cannot be read so. What the value specialization of a call takes for
+// an argument naming such a variable: the shell runs a statement before it
+// compiles the next, so every argument is known as its call is compiled,
+// read from std::cin or not.
+std::optional<APValue> (*CppshRuntimeValueOf)(const VarDecl *) = nullptr;
+} // namespace clang
+
 bool Sema::CanUseDecl(NamedDecl *D, bool TreatUnavailableAsInvalid) {
   // See if this is an auto-typed variable whose initializer we are parsing.
   if (ParsingInitForAutoVars.count(D))
@@ -7678,13 +7688,45 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
               continue;
             Expr::EvalResult EV;
             bool Ok = ArgE->EvaluateAsRValue(EV, Context);
+            // A braced list (`ls {.files_only = true}`) has no type of its
+            // own yet: initialized as the parameter it goes to -- on a copy,
+            // in a SFINAE trap -- and that evaluated.
+            if (!Ok) {
+              if (auto *ILE = dyn_cast<InitListExpr>(ArgE->IgnoreParens())) {
+                QualType PT = PatFD->getParamDecl(I)->getType();
+                if (!PT->isDependentType() && !PT->isReferenceType()) {
+                  SFINAETrap Trap(*this);
+                  auto *Copy = new (Context) InitListExpr(
+                      Context, ILE->getLBraceLoc(), ILE->inits(), ILE->getRBraceLoc());
+                  InitializedEntity Entity = InitializedEntity::InitializeTemporary(PT);
+                  InitializationKind Kind = InitializationKind::CreateCopy(
+                      Copy->getBeginLoc(), SourceLocation());
+                  Expr *ListArgs[1] = {Copy};
+                  InitializationSequence Seq(*this, Entity, Kind, ListArgs);
+                  if (Seq) {
+                    ExprResult Made = Seq.Perform(*this, Entity, Kind, ListArgs);
+                    if (Made.isUsable() && !Trap.hasErrorOccurred())
+                      Ok = Made.get()->EvaluateAsRValue(EV, Context);
+                  }
+                }
+              }
+            }
             if (!Ok) {
               if (auto *DRE = dyn_cast<DeclRefExpr>(ArgE->IgnoreParenImpCasts())) {
                 if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
-                  if (const Expr *InitE = VD->getAnyInitializer()) {
-                    if (!InitE->isValueDependent())
-                      Ok = InitE->EvaluateAsRValue(EV, Context);
-                  }
+                  // A variable a statement already run defined: its value
+                  // now, from memory -- not its initializer, which a read
+                  // from std::cin since has left behind.
+                  if (CppshRuntimeValueOf && VD->hasGlobalStorage())
+                    if (std::optional<APValue> Now = CppshRuntimeValueOf(VD)) {
+                      EV.Val = std::move(*Now);
+                      Ok = true;
+                    }
+                  if (!Ok)
+                    if (const Expr *InitE = VD->getAnyInitializer()) {
+                      if (!InitE->isValueDependent())
+                        Ok = InitE->EvaluateAsRValue(EV, Context);
+                    }
                 }
               }
             }

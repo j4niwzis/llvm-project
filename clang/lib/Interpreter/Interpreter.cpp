@@ -65,11 +65,119 @@
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h" // for CloneModule
+#include "clang/AST/APValue.h"
+#include "clang/AST/RecordLayout.h"
+#include "llvm/ADT/APInt.h"
 #include <cstdio>
 
 #define DEBUG_TYPE "clang-repl"
 
 using namespace clang;
+
+namespace clang {
+extern std::optional<APValue> (*CppshRuntimeValueOf)(const VarDecl *);
+} // namespace clang
+
+// cppsh: the value an object of type T has now, at P in this process, as a
+// constant -- integers, bool, floating point, enums, and arrays and records
+// of them; none for what is not plain data (a pointer, a std::string, a bit
+// field, a union, a virtual base). In-process execution only: the address
+// is this process's.
+static std::optional<APValue> cppshValueAt(ASTContext &Ctx, QualType T,
+                                           const unsigned char *P,
+                                           unsigned Depth = 0) {
+  if (Depth > 32)
+    return std::nullopt;
+  T = Ctx.getCanonicalType(T).getUnqualifiedType();
+  if (T->isBooleanType())
+    return APValue(Ctx.MakeIntValue(*P != 0, T));
+  if (T->isIntegralOrEnumerationType()) {
+    unsigned Bits = Ctx.getTypeSize(T);
+    llvm::APInt V(Bits, 0);
+    llvm::LoadIntFromMemory(V, P, Bits / 8);
+    return APValue(llvm::APSInt(V, !T->isSignedIntegerOrEnumerationType()));
+  }
+  if (T->isRealFloatingType()) {
+    const llvm::fltSemantics &Sem = Ctx.getFloatTypeSemantics(T);
+    unsigned Bits = llvm::APFloat::getSizeInBits(Sem);
+    llvm::APInt V(Bits, 0);
+    llvm::LoadIntFromMemory(V, P, (Bits + 7) / 8);
+    return APValue(llvm::APFloat(Sem, V));
+  }
+  if (const ConstantArrayType *AT = Ctx.getAsConstantArrayType(T)) {
+    uint64_t N = AT->getZExtSize();
+    int64_t Step = Ctx.getTypeSizeInChars(AT->getElementType()).getQuantity();
+    APValue Out(APValue::UninitArray(), N, N);
+    for (uint64_t I = 0; I < N; ++I) {
+      std::optional<APValue> E =
+          cppshValueAt(Ctx, AT->getElementType(), P + I * Step, Depth + 1);
+      if (!E)
+        return std::nullopt;
+      Out.getArrayInitializedElt(I) = std::move(*E);
+    }
+    return Out;
+  }
+  if (const CXXRecordDecl *RD = T->getAsCXXRecordDecl()) {
+    if (!RD->hasDefinition())
+      return std::nullopt;
+    RD = RD->getDefinition();
+    if (RD->isUnion() || RD->getNumVBases() || RD->isDynamicClass())
+      return std::nullopt;
+    const ASTRecordLayout &L = Ctx.getASTRecordLayout(RD);
+    unsigned NumFields = std::distance(RD->field_begin(), RD->field_end());
+    APValue Out(APValue::UninitStruct(), RD->getNumBases(), NumFields);
+    unsigned BI = 0;
+    for (const CXXBaseSpecifier &B : RD->bases()) {
+      const CXXRecordDecl *BRD = B.getType()->getAsCXXRecordDecl();
+      if (!BRD)
+        return std::nullopt;
+      std::optional<APValue> V = cppshValueAt(
+          Ctx, B.getType(), P + L.getBaseClassOffset(BRD).getQuantity(), Depth + 1);
+      if (!V)
+        return std::nullopt;
+      Out.getStructBase(BI++) = std::move(*V);
+    }
+    unsigned FI = 0;
+    for (const FieldDecl *FD : RD->fields()) {
+      if (FD->isBitField())
+        return std::nullopt;
+      int64_t Off =
+          Ctx.toCharUnitsFromBits(L.getFieldOffset(FD->getFieldIndex())).getQuantity();
+      std::optional<APValue> V = cppshValueAt(Ctx, FD->getType(), P + Off, Depth + 1);
+      if (!V)
+        return std::nullopt;
+      Out.getStructField(FI++) = std::move(*V);
+    }
+    return Out;
+  }
+  return std::nullopt;
+}
+
+// The interpreter whose JIT holds the variables a value is read of.
+static Interpreter *CppshActiveInterpreter = nullptr;
+
+// A global variable's value now: found by its symbol -- one a statement
+// already run defined; the current one's are not in the JIT yet, and are
+// not found -- and read from memory.
+static std::optional<APValue> cppshRuntimeValueOf(const VarDecl *VD) {
+  if (!CppshActiveInterpreter || !VD || VD->isInvalidDecl() ||
+      !VD->hasGlobalStorage() || VD->getType()->isReferenceType())
+    return std::nullopt;
+  ASTContext &Ctx = VD->getASTContext();
+  QualType T = VD->getType();
+  if (T->isDependentType() || T->isIncompleteType() ||
+      !T.isTriviallyCopyableType(Ctx))
+    return std::nullopt;
+  llvm::Expected<llvm::orc::ExecutorAddr> Addr =
+      CppshActiveInterpreter->getSymbolAddress(GlobalDecl(VD));
+  if (!Addr) {
+    llvm::consumeError(Addr.takeError());
+    return std::nullopt;
+  }
+  if (!*Addr)
+    return std::nullopt;
+  return cppshValueAt(Ctx, T, Addr->toPtr<const unsigned char *>());
+}
 // FIXME: Figure out how to unify with namespace init_convenience from
 //        tools/clang-import-test/clang-import-test.cpp
 namespace {
@@ -739,9 +847,19 @@ Interpreter::Interpreter(std::unique_ptr<CompilerInstance> Instance,
         return;
       }
   }
+
+  // Values of run statements' variables, for the value specialization.
+  if (IncrExecutor) {
+    CppshActiveInterpreter = this;
+    CppshRuntimeValueOf = cppshRuntimeValueOf;
+  }
 }
 
 Interpreter::~Interpreter() {
+  if (CppshActiveInterpreter == this) {
+    CppshActiveInterpreter = nullptr;
+    CppshRuntimeValueOf = nullptr;
+  }
   IncrParser.reset();
   Act->FinalizeAction();
   if (DeviceParser)

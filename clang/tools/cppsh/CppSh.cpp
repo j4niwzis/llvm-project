@@ -132,6 +132,58 @@ static std::string buildBashPrompt(bool LastFailed) {
   return P;
 }
 
+// The top-level statements of a piece of code, in order: split at each `;`
+// outside brackets, string and character literals and comments (a `'`
+// right after a letter or digit -- a digit separator, a `T'` -- opens
+// nothing).
+static std::vector<std::string> splitStatements(llvm::StringRef Code) {
+  std::vector<std::string> Out;
+  int Depth = 0;
+  size_t Start = 0;
+  for (size_t I = 0; I < Code.size(); ++I) {
+    char C = Code[I];
+    if (C == '"' ||
+        (C == '\'' && !(I > 0 && std::isalnum(static_cast<unsigned char>(Code[I - 1]))))) {
+      for (++I; I < Code.size() && Code[I] != C; ++I)
+        if (Code[I] == '\\')
+          ++I;
+      continue;
+    }
+    if (C == '/' && I + 1 < Code.size() && Code[I + 1] == '/') {
+      while (I < Code.size() && Code[I] != '\n')
+        ++I;
+      continue;
+    }
+    if (C == '/' && I + 1 < Code.size() && Code[I + 1] == '*') {
+      size_t End = Code.find("*/", I + 2);
+      I = End == llvm::StringRef::npos ? Code.size() : End + 1;
+      continue;
+    }
+    if (C == '(' || C == '[' || C == '{')
+      ++Depth;
+    else if ((C == ')' || C == ']' || C == '}') && Depth > 0)
+      --Depth;
+    else if (C == ';' && Depth == 0) {
+      Out.push_back(Code.substr(Start, I + 1 - Start).str());
+      Start = I + 1;
+    }
+  }
+  if (!Code.substr(Start).trim().empty())
+    Out.push_back(Code.substr(Start).str());
+  return Out;
+}
+
+// Code run a statement at a time: each compiled once the one before it has
+// run, so that what it reads -- a variable std::cin filled the statement
+// before -- is a value as it is compiled (the value specialization reads a
+// run statement's variables from memory). The first failure stops the rest.
+static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Code) {
+  for (const std::string &One : splitStatements(Code))
+    if (llvm::Error Err = Interp.ParseAndExecute(One))
+      return Err;
+  return llvm::Error::success();
+}
+
 static llvm::Error runFileOrCode(clang::Interpreter &Interp,
                                  llvm::StringRef Input,
                                  bool ForceFile = false) {
@@ -141,7 +193,7 @@ static llvm::Error runFileOrCode(clang::Interpreter &Interp,
                  !Trimmed.contains(';') && llvm::sys::fs::exists(Trimmed) &&
                  !llvm::sys::fs::is_directory(Trimmed));
   if (!IsFile)
-    return Interp.ParseAndExecute(Input);
+    return runStatements(Interp, Input);
 
   auto MBOrErr = llvm::MemoryBuffer::getFile(Trimmed);
   if (!MBOrErr)
@@ -153,7 +205,7 @@ static llvm::Error runFileOrCode(clang::Interpreter &Interp,
     size_t NL = Content.find('\n');
     Content = (NL == llvm::StringRef::npos) ? "" : Content.drop_front(NL + 1);
   }
-  return Interp.ParseAndExecute(Content);
+  return runStatements(Interp, Content);
 }
 
 static void LLVMErrorHandler(void *UserData, const char *Message,
@@ -1170,7 +1222,7 @@ int main(int argc, const char **argv) {
   }
 
   if (!CommandString.empty()) {
-    if (auto Err = Interp->ParseAndExecute(CommandString)) {
+    if (auto Err = runStatements(*Interp, CommandString)) {
       llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
       HasError = true;
     }
@@ -1233,7 +1285,7 @@ int main(int argc, const char **argv) {
           LastFailed = false;
         }
       } else {
-        if (auto Err = Interp->ParseAndExecute(Input)) {
+        if (auto Err = runStatements(*Interp, Input)) {
           llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
           LastFailed = true;
         } else {

@@ -11,8 +11,10 @@
 #define _LIBCPP_META
 
 #include <cstddef>
+#include <optional>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 #define _1 __cppsh_orig_placeholder_1
 #define _2 __cppsh_orig_placeholder_2
@@ -135,6 +137,78 @@ struct __cppsh_bound_member {
   }
 };
 
+template <typename T>
+inline constexpr bool __cppsh_is_variant = false;
+template <typename... Ts>
+inline constexpr bool __cppsh_is_variant<std::variant<Ts...>> = true;
+
+// A list of types, each once: what the alternatives of a variant give.
+template <typename... Ts>
+struct __cppsh_types {};
+template <typename List, typename T>
+struct __cppsh_push_unique;
+template <typename... Ts, typename T>
+struct __cppsh_push_unique<__cppsh_types<Ts...>, T> {
+  using type = std::conditional_t<(std::is_same_v<T, Ts> || ...),
+                                  __cppsh_types<Ts...>, __cppsh_types<Ts..., T>>;
+};
+
+// What a member access gives on a variant (Self: the access, which says of
+// an alternative whether it has the member and what it is):
+//   every alternative has it, of one type   -> that type
+//   every alternative has it, of several    -> std::variant of them
+//   some lack it, those that have it agree  -> std::optional of it
+//   some lack it, the others do not agree   -> std::variant<monostate, ...>
+// -- so `_.size > 10_KB` is false for a directory (an empty optional is less
+// than any value) and `_.name` on any entry is a plain string.
+template <typename Self, typename A, bool = Self::template alt_has<A>()>
+struct __cppsh_alt_member {
+  using type = void;
+};
+template <typename Self, typename A>
+struct __cppsh_alt_member<Self, A, true> {
+  using type = std::remove_cvref_t<decltype(Self::alt_member(std::declval<A &>()))>;
+};
+template <typename Self, typename List, typename... As>
+struct __cppsh_collect_members {
+  using type = List;
+};
+template <typename Self, typename List, typename A, typename... As>
+struct __cppsh_collect_members<Self, List, A, As...> {
+  using next = std::conditional_t<
+      Self::template alt_has<A>(),
+      typename __cppsh_push_unique<List, typename __cppsh_alt_member<Self, A>::type>::type,
+      List>;
+  using type = typename __cppsh_collect_members<Self, next, As...>::type;
+};
+template <bool All, typename List>
+struct __cppsh_member_result;
+template <typename T>
+struct __cppsh_member_result<true, __cppsh_types<T>> {
+  using type = T;
+};
+template <typename... Ts>
+struct __cppsh_member_result<true, __cppsh_types<Ts...>> {
+  using type = std::variant<Ts...>;
+};
+template <typename T>
+struct __cppsh_member_result<false, __cppsh_types<T>> {
+  using type = std::optional<T>;
+};
+template <typename... Ts>
+struct __cppsh_member_result<false, __cppsh_types<Ts...>> {
+  using type = std::variant<std::monostate, Ts...>;
+};
+template <typename Self, typename V>
+struct __cppsh_variant_member;
+template <typename Self, typename... As>
+struct __cppsh_variant_member<Self, std::variant<As...>> {
+  static constexpr bool any = (Self::template alt_has<As>() || ...);
+  static constexpr bool all = (Self::template alt_has<As>() && ...);
+  using type = typename __cppsh_member_result<
+      all, typename __cppsh_collect_members<Self, __cppsh_types<>, As...>::type>::type;
+};
+
 template <typename Prev, char... Cs>
 struct __cppsh_member_fn {
   Prev prev;
@@ -180,6 +254,54 @@ struct __cppsh_member_fn {
     return obj.[:mem:];
   }
 
+  // On a variant (an entry of `ls`: a file, a directory or a link): the
+  // member of whichever alternative it holds, as __cppsh_variant_member
+  // says -- the alternative is the entry's kind, stored nowhere else.
+  template <typename A>
+  static consteval bool alt_has() {
+    using B = std::remove_cvref_t<A>;
+    return meta::is_nonstatic_data_member(meta::find_member(^^B, name));
+  }
+  template <typename A>
+  static constexpr decltype(auto) alt_member(A &&a) {
+    using B = std::remove_cvref_t<A>;
+    constexpr meta::info mem = meta::find_member(^^B, name);
+    return (static_cast<A &&>(a).[:mem:]);
+  }
+  template <typename... Xs>
+  static consteval bool is_variant_member_eval() {
+    if constexpr (sizeof...(Xs) == 0) {
+      return false;
+    } else if constexpr (requires {
+                           std::declval<const Prev &>()(std::declval<Xs>()...);
+                         }) {
+      using ObjT = std::remove_cvref_t<
+          decltype(std::declval<const Prev &>()(std::declval<Xs>()...))>;
+      if constexpr (__cppsh_is_variant<ObjT>)
+        return __cppsh_variant_member<__cppsh_member_fn, ObjT>::any;
+      else
+        return false;
+    } else {
+      return false;
+    }
+  }
+  template <typename... Xs>
+    requires (is_variant_member_eval<Xs...>())
+  constexpr auto operator()(Xs &&...xs) const {
+    auto &&obj = prev(static_cast<Xs &&>(xs)...);
+    using V = std::remove_cvref_t<decltype(obj)>;
+    using R = typename __cppsh_variant_member<__cppsh_member_fn, V>::type;
+    return std::visit(
+        [](auto &&alt) -> R {
+          using A = std::remove_cvref_t<decltype(alt)>;
+          if constexpr (alt_has<A>())
+            return R(alt_member(alt));
+          else
+            return R{};
+        },
+        static_cast<decltype(obj) &&>(obj));
+  }
+
   template <typename... Xs>
     requires (is_method_eval<Xs...>())
   constexpr auto bind_obj(Xs &&...xs) const {
@@ -201,7 +323,8 @@ inline constexpr bool __cppsh_is_data_member_eval = false;
 template <typename Prev, char... Cs, typename... Args>
 inline constexpr bool
     __cppsh_is_data_member_eval<__cppsh_member_fn<Prev, Cs...>, Args...> =
-        __cppsh_member_fn<Prev, Cs...>::template is_data_member_eval<Args...>();
+        __cppsh_member_fn<Prev, Cs...>::template is_data_member_eval<Args...>() ||
+        __cppsh_member_fn<Prev, Cs...>::template is_variant_member_eval<Args...>();
 
 template <typename MemberFn, typename CallLambda>
 struct __cppsh_call_fn {
