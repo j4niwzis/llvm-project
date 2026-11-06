@@ -149,6 +149,78 @@ bool cppshMoveOnly(Sema &S, QualType T) {
   return !Copy || Copy->isDeleted();
 }
 
+// Whether an expression names a local, or a part of it (a member, an element).
+static bool cppshRefersTo(const Expr *E, const VarDecl *VD) {
+  while (E) {
+    E = E->IgnoreParenImpCasts();
+    if (auto *DRE = dyn_cast<DeclRefExpr>(E))
+      return DRE->getDecl() == VD;
+    if (auto *ME = dyn_cast<MemberExpr>(E)) {
+      E = ME->getBase();
+      continue;
+    }
+    if (auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
+      E = ASE->getBase();
+      continue;
+    }
+    if (auto *OCE = dyn_cast<CXXOperatorCallExpr>(E);
+        OCE && OCE->getOperator() == OO_Subscript) {
+      E = OCE->getArg(0);
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+// Whether code may change a local: assigned, incremented, its address taken,
+// bound to a reference to non-const (`std::cin >> v.x` included), a non-const
+// member function called on it. The cut itself (std::sh::__cppsh_*) is not.
+bool cppshMutates(const Stmt *S, const VarDecl *VD) {
+  if (!S)
+    return false;
+  if (auto *BO = dyn_cast<BinaryOperator>(S))
+    if (BO->isAssignmentOp() && cppshRefersTo(BO->getLHS(), VD))
+      return true;
+  if (auto *UO = dyn_cast<UnaryOperator>(S))
+    if ((UO->isIncrementDecrementOp() || UO->getOpcode() == UO_AddrOf) &&
+        cppshRefersTo(UO->getSubExpr(), VD))
+      return true;
+  if (auto *CE = dyn_cast<CallExpr>(S)) {
+    const FunctionDecl *FD = CE->getDirectCallee();
+    if (FD && FD->getIdentifier() && FD->getName().starts_with("__cppsh_"))
+      return false;
+    if (auto *MCE = dyn_cast<CXXMemberCallExpr>(CE))
+      if (const CXXMethodDecl *MD = MCE->getMethodDecl();
+          MD && !MD->isConst() && cppshRefersTo(MCE->getImplicitObjectArgument(), VD))
+        return true;
+    unsigned Skip = 0;
+    if (auto *OCE = dyn_cast<CXXOperatorCallExpr>(CE);
+        OCE && isa_and_nonnull<CXXMethodDecl>(FD)) {
+      if (!cast<CXXMethodDecl>(FD)->isConst() && OCE->getNumArgs() > 0 &&
+          cppshRefersTo(OCE->getArg(0), VD))
+        return true;
+      Skip = 1;
+    }
+    const FunctionProtoType *FPT =
+        FD ? FD->getType()->getAs<FunctionProtoType>() : nullptr;
+    for (unsigned I = Skip; I < CE->getNumArgs(); ++I) {
+      if (!cppshRefersTo(CE->getArg(I), VD))
+        continue;
+      unsigned P = I - Skip;
+      if (!FPT || P >= FPT->getNumParams())
+        return true; // not known: as if changed
+      QualType PT = FPT->getParamType(P);
+      if (PT->isReferenceType() && !PT->getPointeeType().isConstQualified())
+        return true;
+    }
+  }
+  for (const Stmt *C : S->children())
+    if (cppshMutates(C, VD))
+      return true;
+  return false;
+}
+
 // std::sh::<Name>, as an expression to call.
 static ExprResult cppshShCallee(Sema &S, StringRef Name, SourceLocation Loc) {
   NamespaceDecl *Std = S.getStdNamespace();
@@ -7969,6 +8041,11 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                I < PatFD->getNumParams() && I < ArgExprs.size(); ++I) {
             Expr *ArgE = ArgExprs[I];
             if (!ArgE || ArgE->isTypeDependent() || ArgE->isValueDependent())
+              continue;
+            // A parameter the body changes (`++c` in a continuation) is no
+            // constant there: its value kept, every use folded to it, would
+            // be wrong after the change.
+            if (cppshMutates(PatBody, PatFD->getParamDecl(I)))
               continue;
             Expr::EvalResult EV;
             bool Ok = ArgE->EvaluateAsRValue(EV, Context);
