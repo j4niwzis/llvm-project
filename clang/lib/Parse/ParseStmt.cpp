@@ -1161,31 +1161,6 @@ static std::vector<unsigned> CppshOpenCuts;
 static SmallVector<CXXForRangeStmt *, 4> CppshRangeFors;
 static size_t CppshRangeBase = 0;
 
-// Whether a block of code (as text) always returns: a `return` at its top
-// level, as a statement of its own -- after nothing, `;`, `{` or `}` (not the
-// body of an `if`, `else` or a loop). What follows such a block is dead, and
-// appended to it would only take part in the deduction of the type.
-static bool cppshAlwaysReturns(StringRef Code, const LangOptions &LO) {
-  Lexer L(SourceLocation(), LO, Code.begin(), Code.begin(), Code.end());
-  int Depth = 0;
-  tok::TokenKind Prev = tok::semi;
-  Token T;
-  while (!L.LexFromRawLexer(T) || T.isNot(tok::eof)) {
-    if (T.is(tok::eof))
-      break;
-    if (T.isOneOf(tok::l_brace, tok::l_paren, tok::l_square))
-      ++Depth;
-    else if (T.isOneOf(tok::r_brace, tok::r_paren, tok::r_square))
-      --Depth;
-    else if (Depth == 0 && T.is(tok::raw_identifier) &&
-             T.getRawIdentifier() == "return" &&
-             (Prev == tok::semi || Prev == tok::l_brace || Prev == tok::r_brace))
-      return true;
-    Prev = T.getKind();
-  }
-  return false;
-}
-
 // Code (as text) as tokens, each with its offset in it.
 struct CppshTok {
   Token T;
@@ -1277,6 +1252,86 @@ static std::string cppshReplaceOwnBreaks(StringRef Code, const LangOptions &LO,
 }
 
 static unsigned CppshBreakFlags = 0;
+
+// The index past the group opening at I (a bracket and its match).
+static size_t cppshPastGroup(ArrayRef<CppshTok> Toks, size_t I, size_t E) {
+  int Depth = 0;
+  for (; I < E; ++I) {
+    if (Toks[I].T.isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
+      ++Depth;
+    else if (Toks[I].T.isOneOf(tok::r_paren, tok::r_brace, tok::r_square) && --Depth <= 0)
+      return I + 1;
+  }
+  return E;
+}
+
+static bool cppshIsWord(ArrayRef<CppshTok> Toks, size_t I, size_t E, StringRef W) {
+  return I < E && Toks[I].T.is(tok::raw_identifier) && Toks[I].T.getRawIdentifier() == W;
+}
+
+// Past the statement starting at I: up to its `;`, or a block it ends with --
+// an `else` after either going on with it.
+static size_t cppshPastStmt(ArrayRef<CppshTok> Toks, size_t I, size_t E) {
+  while (I < E) {
+    if (Toks[I].T.is(tok::l_brace)) {
+      I = cppshPastGroup(Toks, I, E);
+      if (cppshIsWord(Toks, I, E, "else")) {
+        ++I;
+        continue;
+      }
+      return I;
+    }
+    if (Toks[I].T.isOneOf(tok::l_paren, tok::l_square)) {
+      I = cppshPastGroup(Toks, I, E);
+      continue;
+    }
+    if (Toks[I].T.is(tok::semi)) {
+      ++I;
+      if (cppshIsWord(Toks, I, E, "else")) {
+        ++I;
+        continue;
+      }
+      return I;
+    }
+    ++I;
+  }
+  return E;
+}
+
+// Whether the statements in [B, E) always return: a `return` among them, as
+// a statement of its own; a block, or a `do { } while (false)` with no break
+// of its own, that always returns. What follows is dead.
+static bool cppshReturnsAlwaysIn(ArrayRef<CppshTok> Toks, size_t B, size_t E) {
+  for (size_t I = B; I < E;) {
+    if (cppshIsWord(Toks, I, E, "return"))
+      return true;
+    if (Toks[I].T.is(tok::l_brace)) {
+      size_t C = cppshPastGroup(Toks, I, E);
+      if (cppshReturnsAlwaysIn(Toks, I + 1, C - 1))
+        return true;
+      I = C;
+      continue;
+    }
+    if (cppshIsWord(Toks, I, E, "do") && I + 1 < E && Toks[I + 1].T.is(tok::l_brace)) {
+      size_t C = cppshPastGroup(Toks, I + 1, E);
+      bool False = cppshIsWord(Toks, C, E, "while") && C + 3 < E &&
+                   Toks[C + 1].T.is(tok::l_paren) && cppshIsWord(Toks, C + 2, E, "false") &&
+                   Toks[C + 3].T.is(tok::r_paren);
+      ArrayRef<CppshTok> Body = Toks.slice(I + 2, C - 1 - (I + 2));
+      if (False && cppshReturnsAlwaysIn(Toks, I + 2, C - 1) &&
+          cppshOwnWords(Body, "break", true, true).empty())
+        return true;
+      I = C;
+      continue;
+    }
+    I = cppshPastStmt(Toks, I, E);
+  }
+  return false;
+}
+static bool cppshReturnsAlways(StringRef Code, const LangOptions &LO) {
+  SmallVector<CppshTok, 64> Toks = cppshLex(Code, LO);
+  return cppshReturnsAlwaysIn(Toks, 0, Toks.size());
+}
 
 // The local each cut was made for (the value it needed), or none: a staged
 // call, or needs of different locals.
@@ -1808,7 +1863,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
         std::string &Loop = CppshCutLoopRests[CppshOpenCuts[I]];
         // Made in a loop: what follows comes after the loop, run on.
         std::string &To = Loop.empty() ? Inner : Loop;
-        if (!cppshAlwaysReturns(To, getLangOpts()))
+        if (!cppshReturnsAlways(To, getLangOpts()))
           To = "{ " + To + " } " + Rest;
       }
       unsigned Id = CppshEmitCut(Rest, After, FD);

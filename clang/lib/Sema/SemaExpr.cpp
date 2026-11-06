@@ -7223,6 +7223,9 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
   if (const auto *CE = dyn_cast<CallExpr>(Call.get()))
     if (const FunctionDecl *Callee = CE->getDirectCallee();
         Callee && CppshCutFunctions.count(Callee->getCanonicalDecl()) &&
+        // Not the loop run on (__cppsh_loopK), which a continuation only
+        // ever returns: its result is the staging's, kept as it runs.
+        !(Callee->getIdentifier() && Callee->getName().starts_with("__cppsh_loop")) &&
         cppshInUserInput(*this, CE->getBeginLoc())) {
       if (FunctionDecl *Cur = getCurFunctionDecl();
           Cur && !Cur->isDependentContext()) {
