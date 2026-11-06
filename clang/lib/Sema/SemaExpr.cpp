@@ -7668,7 +7668,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             continue;
           const FunctionDecl *BodyFD = nullptr;
           Stmt *PatBody = PatFD->getBody(BodyFD);
-          if (!PatBody || !stmtHasIf(PatBody, stmtHasIf))
+          if (!PatBody || !PatFD->getReturnType()->isUndeducedType() ||
+              !stmtHasIf(PatBody, stmtHasIf))
             continue;
           for (unsigned I = 0;
                I < PatFD->getNumParams() && I < ArgExprs.size(); ++I) {

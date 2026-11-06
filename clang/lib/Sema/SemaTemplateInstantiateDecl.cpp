@@ -3212,18 +3212,17 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
                  Sema::CodeSynthesisContext::BuildingDeductionGuides) {
     // Record this function template specialization.
     ArrayRef<TemplateArgument> Innermost = TemplateArgs.getInnermost();
-    SmallVector<TemplateArgument, 4> SpecArgs(Innermost.begin(),
-                                              Innermost.end());
+    FunctionTemplateDecl *SpecTemplate = FunctionTemplate;
     if (HasCppshConstParam) {
-      static uint64_t UniqueSpecId = 0;
-      SpecArgs.push_back(TemplateArgument(
-          SemaRef.Context,
-          llvm::APSInt(llvm::APInt(64, ++UniqueSpecId), /*isUnsigned=*/true),
-          SemaRef.Context.UnsignedLongLongTy));
+      SpecTemplate = FunctionTemplateDecl::Create(
+          SemaRef.Context, DC, Function->getLocation(), Function->getDeclName(),
+          FunctionTemplate->getTemplateParameters(),
+          const_cast<FunctionDecl *>(D));
+      SpecTemplate->setLexicalDeclContext(LexicalDC);
     }
     Function->setFunctionTemplateSpecialization(
-        FunctionTemplate,
-        TemplateArgumentList::CreateCopy(SemaRef.Context, SpecArgs),
+        SpecTemplate,
+        TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost),
         /*InsertToken=*/{});
   } else if (isFriend && D->isThisDeclarationADefinition()) {
     // Do not connect the friend to the template unless it's actually a
