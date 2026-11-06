@@ -8574,16 +8574,8 @@ TreeTransform<Derived>::TransformIfStmt(IfStmt *S) {
     if (Expr *CondE = Cond.get().second) {
       if (!CondE->isValueDependent()) {
         bool CondBool = false;
-        if (CondE->EvaluateAsBooleanCondition(CondBool, getSema().Context)) {
+        if (CondE->EvaluateAsBooleanCondition(CondBool, getSema().Context))
           ConstexprConditionValue = CondBool;
-          if (!S->getConditionVariable()) {
-            Expr *BoolLit = new (getSema().Context) CXXBoolLiteralExpr(
-                CondBool, getSema().Context.BoolTy, CondE->getExprLoc());
-            Cond = getSema().ActOnCondition(
-                nullptr, S->getIfLoc(), BoolLit,
-                Sema::ConditionKind::ConstexprIf, /*MissingOK=*/false);
-          }
-        }
       }
     }
   }
@@ -8627,8 +8619,14 @@ TreeTransform<Derived>::TransformIfStmt(IfStmt *S) {
         CompoundStmt(S->getElse()->getBeginLoc(), S->getElse()->getEndLoc());
   }
 
+  if (ConstexprConditionValue.has_value() && !S->isConstexpr() &&
+      !S->isConsteval() && !Init.get() && !S->getConditionVariable()) {
+    if (*ConstexprConditionValue)
+      return Then;
+    return S->getElse() ? Else : Then;
+  }
+
   if (!getDerived().AlwaysRebuild() &&
-      !ConstexprConditionValue.has_value() &&
       Init.get() == S->getInit() &&
       Cond.get() == std::make_pair(S->getConditionVariable(), S->getCond()) &&
       Then.get() == S->getThen() &&
@@ -8636,12 +8634,8 @@ TreeTransform<Derived>::TransformIfStmt(IfStmt *S) {
     return S;
 
   return getDerived().RebuildIfStmt(
-      S->getIfLoc(),
-      (ConstexprConditionValue.has_value() && !S->isConsteval())
-          ? IfStatementKind::Constexpr
-          : S->getStatementKind(),
-      S->getLParenLoc(), Cond, S->getRParenLoc(), Init.get(), Then.get(),
-      S->getElseLoc(), Else.get());
+      S->getIfLoc(), S->getStatementKind(), S->getLParenLoc(), Cond,
+      S->getRParenLoc(), Init.get(), Then.get(), S->getElseLoc(), Else.get());
 }
 
 template<typename Derived>
