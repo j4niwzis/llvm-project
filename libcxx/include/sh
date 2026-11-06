@@ -463,16 +463,7 @@ inline constexpr __cppsh_show_stage show{};
 
 namespace sh {
 
-// Class templates (instantiated where they are used, every member emitted
-// in the statement that uses it): a plain class's inline members -- its
-// destructor -- were not emitted into a REPL statement's module, and
-// `git pull;` found no std::sh::command::~command in the JIT.
-template <typename _Dummy = void>
-struct basic_command;
-using command = basic_command<>;
-template <typename _Dummy = void>
-struct basic_pipeline;
-using pipeline = basic_pipeline<>;
+struct command;
 
 template <char... Cs>
 struct sym {
@@ -1001,7 +992,6 @@ inline pid_t __cppsh_spawn(const std::vector<std::string> &argv, int in, int out
 }
 
 // The terminal given to a foreground group while it runs, and taken back.
-template <typename _Dummy = void>
 struct __cppsh_foreground {
   bool tty = ::isatty(0);
   explicit __cppsh_foreground(pid_t group) {
@@ -1038,8 +1028,7 @@ inline int __cppsh_wait(pid_t pid) {
 }
 #endif
 
-template <typename _Dummy>
-struct basic_command {
+struct command {
   std::vector<std::string> argv;
   std::optional<std::string> in_file, out_file;
   bool append = false, err_to_out_ = false;
@@ -1048,16 +1037,16 @@ struct basic_command {
   // Run, or given over (moved, piped, consumed): not run again.
   bool done = false;
 
-  basic_command() = default;
-  explicit basic_command(std::vector<std::string> words) : argv(std::move(words)) {}
-  basic_command(const basic_command &) = delete;
-  basic_command &operator=(const basic_command &) = delete;
-  basic_command(basic_command &&o) noexcept
+  command() = default;
+  explicit command(std::vector<std::string> words) : argv(std::move(words)) {}
+  command(const command &) = delete;
+  command &operator=(const command &) = delete;
+  command(command &&o) noexcept
       : argv(std::move(o.argv)), in_file(std::move(o.in_file)), out_file(std::move(o.out_file)),
         append(o.append), err_to_out_(o.err_to_out_), input(std::move(o.input)), done(o.done) {
     o.done = true;
   }
-  basic_command &operator=(basic_command &&o) noexcept {
+  command &operator=(command &&o) noexcept {
     if (this != &o) {
       if (!done)
         run();
@@ -1073,12 +1062,12 @@ struct basic_command {
     return *this;
   }
   // Nothing used it: it runs as its full expression ends.
-  ~basic_command() {
+  ~command() {
     if (!done)
       run();
   }
 
-  basic_command &&err_to_out() && {
+  command &&err_to_out() && {
     err_to_out_ = true;
     return std::move(*this);
   }
@@ -1146,14 +1135,13 @@ command &&operator<(command &&c, const Path &p) {
 }
 
 // Commands one after another, each's stdout the next's stdin.
-template <typename _Dummy>
-struct basic_pipeline {
+struct pipeline {
   std::vector<command> stages;
   bool done = false;
-  basic_pipeline() = default;
-  basic_pipeline(const basic_pipeline &) = delete;
-  basic_pipeline(basic_pipeline &&o) noexcept : stages(std::move(o.stages)), done(o.done) { o.done = true; }
-  ~basic_pipeline() {
+  pipeline() = default;
+  pipeline(const pipeline &) = delete;
+  pipeline(pipeline &&o) noexcept : stages(std::move(o.stages)), done(o.done) { o.done = true; }
+  ~pipeline() {
     if (!done)
       run();
   }
@@ -1224,9 +1212,8 @@ command &&operator|(Rng &&rng, command &&c) {
 #if __has_include(<spawn.h>)
 // Each stage spawned, the pipes between them, the first's stdin fed where
 // a range was piped in, the last's stdout read where it is captured.
-template <typename _Dummy>
-std::pair<int, std::string> __cppsh_run_stages(std::vector<basic_command<_Dummy> *> stages,
-                                               bool capture) {
+inline std::pair<int, std::string> __cppsh_run_stages(std::vector<command *> stages,
+                                                      bool capture) {
   std::vector<int> all_fds;
   std::vector<std::pair<int, int>> pipes;
   for (std::size_t i = 0; i + 1 < stages.size(); ++i) {
@@ -1250,7 +1237,7 @@ std::pair<int, std::string> __cppsh_run_stages(std::vector<basic_command<_Dummy>
   std::vector<pid_t> pids;
   pid_t group = 0;
   for (std::size_t i = 0; i < stages.size(); ++i) {
-    basic_command<_Dummy> &c = *stages[i];
+    command &c = *stages[i];
     int in = i > 0 ? pipes[i - 1].first : feed[0];
     int out = i + 1 < stages.size() ? pipes[i].second : take[1];
     if (c.in_file) {
@@ -1300,7 +1287,7 @@ std::pair<int, std::string> __cppsh_run_stages(std::vector<basic_command<_Dummy>
   {
     // The terminal the group's while it runs, captured or not: what it
     // asks the user (a password, a pager) reaches them.
-    __cppsh_foreground<> fg(group);
+    __cppsh_foreground fg(group);
     if (take[0] >= 0) {
       char buf[4096];
       ssize_t n;
@@ -1321,23 +1308,20 @@ std::pair<int, std::string> __cppsh_run_stages(std::vector<basic_command<_Dummy>
   return {status, std::move(got)};
 }
 
-template <typename _Dummy>
-int basic_command<_Dummy>::run() {
+inline int command::run() {
   if (done)
     return last_status;
-  return __cppsh_run_stages<_Dummy>({this}, false).first;
+  return __cppsh_run_stages({this}, false).first;
 }
-template <typename _Dummy>
-std::pair<int, std::string> basic_command<_Dummy>::capture() {
+inline std::pair<int, std::string> command::capture() {
   if (done)
     return {last_status, {}};
-  return __cppsh_run_stages<_Dummy>({this}, true);
+  return __cppsh_run_stages({this}, true);
 }
-template <typename _Dummy>
-std::pair<int, std::string> basic_pipeline<_Dummy>::run_all(bool capture) {
+inline std::pair<int, std::string> pipeline::run_all(bool capture) {
   done = true;
-  std::vector<basic_command<_Dummy> *> all;
-  for (basic_command<_Dummy> &c : stages)
+  std::vector<command *> all;
+  for (command &c : stages)
     all.push_back(&c);
   if (all.empty())
     return {0, {}};
@@ -1346,8 +1330,7 @@ std::pair<int, std::string> basic_pipeline<_Dummy>::run_all(bool capture) {
 
 // Lines streamed: the command spawned as iteration begins, read a line at a
 // time, waited for at the end.
-template <typename _Dummy>
-struct basic_command<_Dummy>::state {
+struct command::state {
   FILE *in = nullptr;
   pid_t pid = -1;
   long long line_no = 0;
@@ -1358,8 +1341,7 @@ struct basic_command<_Dummy>::state {
       last_status = __cppsh_wait(pid);
   }
 };
-template <typename _Dummy>
-typename basic_command<_Dummy>::iterator basic_command<_Dummy>::begin() {
+inline command::iterator command::begin() {
   iterator it;
   if (done)
     return it;
@@ -1381,8 +1363,7 @@ typename basic_command<_Dummy>::iterator basic_command<_Dummy>::begin() {
   it.next();
   return it;
 }
-template <typename _Dummy>
-void basic_command<_Dummy>::iterator::next() {
+inline void command::iterator::next() {
   if (!st || !st->in) {
     at_end = true;
     st.reset();
@@ -1405,28 +1386,23 @@ void basic_command<_Dummy>::iterator::next() {
   cur = line_entry{++st->line_no, std::move(s), sz};
 }
 #else
-template <typename _Dummy>
-int basic_command<_Dummy>::run() {
+inline int command::run() {
   done = true;
   return last_status = 127;
 }
-template <typename _Dummy>
-std::pair<int, std::string> basic_command<_Dummy>::capture() {
+inline std::pair<int, std::string> command::capture() {
   done = true;
   return {last_status = 127, {}};
 }
-template <typename _Dummy>
-std::pair<int, std::string> basic_pipeline<_Dummy>::run_all(bool) {
+inline std::pair<int, std::string> pipeline::run_all(bool) {
   done = true;
   return {last_status = 127, {}};
 }
-template <typename _Dummy>
-typename basic_command<_Dummy>::iterator basic_command<_Dummy>::begin() {
+inline command::iterator command::begin() {
   done = true;
   return {};
 }
-template <typename _Dummy>
-void basic_command<_Dummy>::iterator::next() { at_end = true; }
+inline void command::iterator::next() { at_end = true; }
 #endif
 
 template <char... Cs>

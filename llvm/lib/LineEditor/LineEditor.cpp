@@ -175,13 +175,11 @@ void refreshHint(EditLine *EL, LineEditor::InternalData *Data) {
   for (const char *P = LI->buffer; P < LI->lastchar; ++P)
     if ((static_cast<unsigned char>(*P) & 0xC0) != 0x80)
       ++Used;
-  size_t Room = Cols > Used + 6 ? Cols - Used - 6 : 0;
+  size_t Room = Cols > Used + 4 ? Cols - Used - 4 : 0;
   if (Hint.size() > Room)
     Hint = Room > 8 ? Hint.substr(0, Room - 3) + "..." : std::string();
-  // Plain, a marker before it: libedit redraws only the cells that changed,
-  // so a colour in the right prompt was switched on again without its reset,
-  // and what was typed after came out dim.
-  Data->RPrompt = Hint.empty() ? std::string() : ": " + Hint;
+  Data->RPrompt = Hint.empty() ? std::string()
+                               : "\001\033[90m\001 " + Hint + "\001\033[0m\001";
 }
 
 // A character typed: inserted, then the hint made again.
@@ -393,7 +391,7 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
   // The hint (setHinter): at the right of the line, made again as it is
   // edited -- every printable character typed, Backspace -- and taken off
   // as it is entered.
-  ::el_set(Data->EL, EL_RPROMPT, ElGetRPromptFn);
+  ::el_set(Data->EL, EL_RPROMPT_ESC, ElGetRPromptFn, '\001');
   ::el_set(Data->EL, EL_ADDFN, "hint_insert", "Insert, then hint", ElHintInsertFn);
   ::el_set(Data->EL, EL_ADDFN, "hint_delete", "Delete back, then hint", ElHintDeleteFn);
   ::el_set(Data->EL, EL_ADDFN, "hint_enter", "Enter without the hint", ElHintEnterFn);
