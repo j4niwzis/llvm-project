@@ -1536,10 +1536,10 @@ StmtResult Parser::ParseIfStatement(SourceLocation *TrailingElseLoc) {
              !PP.getSourceManager().isInSystemHeader(IfLoc)) {
       if (Expr *CondE = Cond.get().second) {
         if (!CondE->isValueDependent()) {
-          Expr::EvalResult EV;
-          if (CondE->EvaluateAsBooleanCondition(EV, Actions.Context)) {
+          bool CondBool = false;
+          if (CondE->EvaluateAsBooleanCondition(CondBool, Actions.Context)) {
             IsConstexpr = true;
-            ConstexprCondition = EV.Val.getInt().getBoolValue();
+            ConstexprCondition = CondBool;
           }
         }
       }

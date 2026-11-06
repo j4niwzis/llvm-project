@@ -8573,9 +8573,9 @@ TreeTransform<Derived>::TransformIfStmt(IfStmt *S) {
   else if (!getSema().PP.getSourceManager().isInSystemHeader(S->getIfLoc())) {
     if (Expr *CondE = Cond.get().second) {
       if (!CondE->isValueDependent()) {
-        Expr::EvalResult EV;
-        if (CondE->EvaluateAsBooleanCondition(EV, getSema().Context))
-          ConstexprConditionValue = EV.Val.getInt().getBoolValue();
+        bool CondBool = false;
+        if (CondE->EvaluateAsBooleanCondition(CondBool, getSema().Context))
+          ConstexprConditionValue = CondBool;
       }
     }
   }
