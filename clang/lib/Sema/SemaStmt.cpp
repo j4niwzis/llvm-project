@@ -4132,6 +4132,18 @@ static bool CheckSimplerImplicitMovesMSVCWorkaround(const Sema &S,
 
 StmtResult Sema::BuildReturnStmt(SourceLocation ReturnLoc, Expr *RetValExp,
                                  bool AllowRecovery) {
+  // cppsh: `return ls;` from a function of a deduced type -- the shell calls a
+  // function or template needing no argument where a value is wanted
+  // (CheckPlaceholderExpr), and deduction would only see the overload set.
+  if (RetValExp && getLangOpts().IncrementalExtensions &&
+      RetValExp->getType() == Context.OverloadTy)
+    if (FunctionDecl *FD = getCurFunctionDecl(/*AllowLambda=*/true);
+        FD && FD->getReturnType()->getContainedAutoType()) {
+      ExprResult Called = CheckPlaceholderExpr(RetValExp);
+      if (Called.isUsable())
+        RetValExp = Called.get();
+    }
+
   // Check for unexpanded parameter packs.
   if (RetValExp && DiagnoseUnexpandedParameterPack(RetValExp))
     return StmtError();
