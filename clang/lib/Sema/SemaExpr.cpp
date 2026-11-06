@@ -3294,6 +3294,24 @@ ExprResult Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
   if (R.isAmbiguous())
     return ExprError();
 
+  // cppsh: the C functions named like the programs a shell runs (`sleep`,
+  // `kill`, `mkdir`, from <unistd.h> and the like) hidden from a name the
+  // user types unqualified: `sleep 30` runs the program. The C function is
+  // still there as `::sleep`.
+  static constexpr llvm::StringLiteral CppshCommandNamedC[] = {
+      "chmod", "chown", "chroot", "kill",  "link",   "mkdir",    "mkfifo",
+      "mknod", "nice",  "rmdir",  "sleep", "sync",   "truncate", "unlink"};
+  if (!R.empty() && SS.isEmpty() && II && cppshInUserInput(*this, NameLoc) &&
+      llvm::is_contained(CppshCommandNamedC, II->getName())) {
+    LookupResult::Filter F = R.makeFilter();
+    while (F.hasNext()) {
+      auto *FD = dyn_cast<FunctionDecl>(F.next()->getUnderlyingDecl());
+      if (FD && FD->isExternC() && SourceMgr.isInSystemHeader(FD->getLocation()))
+        F.erase();
+    }
+    F.done();
+  }
+
   // This could be an implicitly declared function reference if the language
   // mode allows it as a feature.
   if (R.empty() && HasTrailingLParen && II &&
