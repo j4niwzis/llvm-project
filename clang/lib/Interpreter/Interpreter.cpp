@@ -67,6 +67,8 @@
 #include "llvm/Transforms/Utils/Cloning.h" // for CloneModule
 #include "clang/AST/APValue.h"
 #include "clang/AST/RecordLayout.h"
+#include "clang/Sema/Initialization.h"
+#include "clang/Sema/Sema.h"
 #include "llvm/ADT/APInt.h"
 #include <cstdio>
 
@@ -76,6 +78,7 @@ using namespace clang;
 
 namespace clang {
 extern std::optional<APValue> (*CppshRuntimeValueOf)(const VarDecl *);
+extern Expr *(*CppshRuntimeRebuildOf)(Sema &, const VarDecl *);
 } // namespace clang
 
 // cppsh: the value an object of type T has now, at P in this process, as a
@@ -155,6 +158,234 @@ static std::optional<APValue> cppshValueAt(ASTContext &Ctx, QualType T,
 
 // The interpreter whose JIT holds the variables a value is read of.
 static Interpreter *CppshActiveInterpreter = nullptr;
+
+// A snapshot (std::sh::__cppsh_snapshot's format: a tag byte, then its body)
+// read a piece at a time.
+namespace {
+struct CppshSnapshot {
+  const unsigned char *At, *End;
+  bool Failed = false;
+  unsigned char byte() {
+    if (At >= End) {
+      Failed = true;
+      return 0;
+    }
+    return *At++;
+  }
+  uint64_t u64() {
+    uint64_t V = 0;
+    for (int I = 0; I < 8; ++I)
+      V |= uint64_t(byte()) << (8 * I);
+    return V;
+  }
+  llvm::StringRef bytes(uint64_t N) {
+    if (uint64_t(End - At) < N) {
+      Failed = true;
+      return {};
+    }
+    llvm::StringRef S(reinterpret_cast<const char *>(At), N);
+    At += N;
+    return S;
+  }
+};
+} // namespace
+
+// T initialized from Args -- directly, or from one braced list -- as a
+// declaration would be; none where it cannot be.
+static Expr *cppshInitialize(Sema &S, QualType T, MultiExprArg Args, bool List,
+                             SourceLocation Loc) {
+  Sema::SFINAETrap Trap(S);
+  InitializedEntity Entity = InitializedEntity::InitializeTemporary(T);
+  InitializationKind Kind = List ? InitializationKind::CreateDirectList(Loc, Loc, Loc)
+                                 : InitializationKind::CreateDirect(Loc, Loc, Loc);
+  InitializationSequence Seq(S, Entity, Kind, Args);
+  if (!Seq)
+    return nullptr;
+  ExprResult Made = Seq.Perform(S, Entity, Kind, Args);
+  if (!Made.isUsable() || Trap.hasErrorOccurred())
+    return nullptr;
+  return Made.get();
+}
+
+static Expr *cppshBraced(Sema &S, QualType T, ArrayRef<Expr *> Elems,
+                         SourceLocation Loc) {
+  ASTContext &Ctx = S.getASTContext();
+  auto *List = new (Ctx) InitListExpr(Ctx, Loc, Elems, Loc, /*isExplicit=*/false);
+  Expr *Args[1] = {List};
+  return cppshInitialize(S, T, Args, /*List=*/true, Loc);
+}
+
+// A member type of a record, as its definition names it (value_type).
+static QualType cppshMemberType(Sema &S, QualType T, llvm::StringRef Name) {
+  if (!S.isCompleteType(SourceLocation(), T))
+    return {};
+  const CXXRecordDecl *RD = T->getAsCXXRecordDecl();
+  if (!RD || !RD->hasDefinition())
+    return {};
+  for (NamedDecl *ND : RD->getDefinition()->lookup(&S.getASTContext().Idents.get(Name)))
+    if (auto *TND = dyn_cast<TypedefNameDecl>(ND->getUnderlyingDecl()))
+      return TND->getUnderlyingType();
+  return {};
+}
+
+// A class template specialization's type arguments, a pack's opened.
+static SmallVector<QualType, 4> cppshTypeArgs(QualType T) {
+  SmallVector<QualType, 4> Out;
+  const auto *Spec =
+      dyn_cast_or_null<ClassTemplateSpecializationDecl>(T->getAsCXXRecordDecl());
+  if (!Spec)
+    return Out;
+  for (const TemplateArgument &A : Spec->getTemplateArgs().asArray()) {
+    if (A.getKind() == TemplateArgument::Type)
+      Out.push_back(A.getAsType());
+    else if (A.getKind() == TemplateArgument::Pack)
+      for (const TemplateArgument &P : A.pack_elements())
+        if (P.getKind() == TemplateArgument::Type)
+          Out.push_back(P.getAsType());
+  }
+  return Out;
+}
+
+// The expression that rebuilds a value of type T from its snapshot.
+static Expr *cppshRebuild(Sema &S, QualType T, CppshSnapshot &R,
+                          SourceLocation Loc, unsigned Depth = 0) {
+  if (Depth > 64 || R.Failed)
+    return nullptr;
+  ASTContext &Ctx = S.getASTContext();
+  T = T.getNonReferenceType().getUnqualifiedType();
+  auto castTo = [&](Expr *E) -> Expr * {
+    ExprResult C = S.BuildCStyleCastExpr(Loc, Ctx.getTrivialTypeSourceInfo(T, Loc), Loc, E);
+    return C.isUsable() ? C.get() : nullptr;
+  };
+  switch (R.byte()) {
+  case 'b':
+    return castTo(CXXBoolLiteralExpr::Create(Ctx, R.byte() != 0, Ctx.BoolTy, Loc));
+  case 'i': {
+    bool Signed = R.byte() != 0;
+    uint64_t V = R.u64();
+    return castTo(IntegerLiteral::Create(Ctx, llvm::APInt(64, V),
+                                         Signed ? Ctx.LongLongTy : Ctx.UnsignedLongLongTy, Loc));
+  }
+  case 'f': {
+    llvm::APFloat V(llvm::APFloat::IEEEdouble(), llvm::APInt(64, R.u64()));
+    return castTo(FloatingLiteral::Create(Ctx, V, /*isexact=*/true, Ctx.DoubleTy, Loc));
+  }
+  case 's': {
+    uint64_t N = R.u64();
+    llvm::StringRef Text = R.bytes(N);
+    if (R.Failed)
+      return nullptr;
+    // The characters and their count: what a string's (pointer, size)
+    // constructor takes -- a NUL inside kept.
+    QualType ArrTy = Ctx.getStringLiteralArrayType(Ctx.CharTy, N);
+    Expr *Lit = StringLiteral::Create(Ctx, Text, StringLiteralKind::Ordinary,
+                                      /*Pascal=*/false, ArrTy, Loc);
+    Expr *Len = IntegerLiteral::Create(
+        Ctx, llvm::APInt(Ctx.getTypeSize(Ctx.getSizeType()), N), Ctx.getSizeType(), Loc);
+    Expr *Args[2] = {Lit, Len};
+    return cppshInitialize(S, T, Args, /*List=*/false, Loc);
+  }
+  case 'o': {
+    if (R.byte() == 0)
+      return cppshBraced(S, T, {}, Loc);
+    Expr *V = cppshRebuild(S, cppshMemberType(S, T, "value_type"), R, Loc, Depth + 1);
+    if (!V)
+      return nullptr;
+    Expr *Args[1] = {V};
+    return cppshInitialize(S, T, Args, /*List=*/false, Loc);
+  }
+  case 'v': {
+    uint64_t Index = R.u64();
+    SmallVector<QualType, 4> Alts = cppshTypeArgs(T);
+    if (Index >= Alts.size())
+      return nullptr;
+    Expr *V = cppshRebuild(S, Alts[Index], R, Loc, Depth + 1);
+    if (!V)
+      return nullptr;
+    Expr *Args[1] = {V};
+    return cppshInitialize(S, T, Args, /*List=*/false, Loc);
+  }
+  case 't': {
+    uint64_t N = R.u64();
+    SmallVector<QualType, 4> Elems = cppshTypeArgs(T);
+    if (N != Elems.size())
+      return nullptr;
+    SmallVector<Expr *, 4> Args;
+    for (QualType E : Elems) {
+      Expr *V = cppshRebuild(S, E, R, Loc, Depth + 1);
+      if (!V)
+        return nullptr;
+      Args.push_back(V);
+    }
+    return cppshInitialize(S, T, Args, /*List=*/false, Loc);
+  }
+  case 'l': {
+    uint64_t N = R.u64();
+    QualType Elem = cppshMemberType(S, T, "value_type");
+    if (Elem.isNull())
+      return nullptr;
+    SmallVector<Expr *, 8> Elems;
+    for (uint64_t I = 0; I < N; ++I) {
+      Expr *V = cppshRebuild(S, Elem, R, Loc, Depth + 1);
+      if (!V)
+        return nullptr;
+      Elems.push_back(V);
+    }
+    return cppshBraced(S, T, Elems, Loc);
+  }
+  case 'r': {
+    uint64_t N = R.u64();
+    if (!S.isCompleteType(SourceLocation(), T))
+      return nullptr;
+    const CXXRecordDecl *RD = T->getAsCXXRecordDecl();
+    if (!RD || !RD->hasDefinition() || RD->getDefinition()->getNumBases())
+      return nullptr;
+    SmallVector<Expr *, 8> Fields;
+    for (const FieldDecl *FD : RD->getDefinition()->fields()) {
+      if (Fields.size() == N)
+        break;
+      Expr *V = cppshRebuild(S, FD->getType(), R, Loc, Depth + 1);
+      if (!V)
+        return nullptr;
+      Fields.push_back(V);
+    }
+    if (Fields.size() != N)
+      return nullptr;
+    return cppshBraced(S, T, Fields, Loc);
+  }
+  default:
+    return nullptr;
+  }
+}
+
+// A run variable that is not plain data: rebuilt from the snapshot cppsh
+// took of it before this statement (std::sh::__cppsh_snapshot), read
+// through the library's __cppsh_snapshot_of. In-process execution only.
+static Expr *cppshRuntimeRebuildOf(Sema &S, const VarDecl *VD) {
+  if (!CppshActiveInterpreter || !VD || VD->isInvalidDecl() ||
+      !VD->hasGlobalStorage() || VD->getType()->isDependentType())
+    return nullptr;
+  llvm::Expected<llvm::orc::ExecutorAddr> Var =
+      CppshActiveInterpreter->getSymbolAddress(GlobalDecl(VD));
+  if (!Var) {
+    llvm::consumeError(Var.takeError());
+    return nullptr;
+  }
+  llvm::Expected<llvm::orc::ExecutorAddr> Reader =
+      CppshActiveInterpreter->getSymbolAddressFromLinkerName("__cppsh_snapshot_of");
+  if (!Reader) {
+    llvm::consumeError(Reader.takeError());
+    return nullptr;
+  }
+  using ReaderFn = const char *(*)(const void *, unsigned long long *);
+  unsigned long long Size = 0;
+  const char *Data = Reader->toPtr<ReaderFn>()(Var->toPtr<const void *>(), &Size);
+  if (!Data)
+    return nullptr;
+  CppshSnapshot R{reinterpret_cast<const unsigned char *>(Data),
+                  reinterpret_cast<const unsigned char *>(Data) + Size};
+  return cppshRebuild(S, VD->getType(), R, VD->getLocation());
+}
 
 // A global variable's value now: found by its symbol -- one a statement
 // already run defined; the current one's are not in the JIT yet, and are
@@ -852,6 +1083,7 @@ Interpreter::Interpreter(std::unique_ptr<CompilerInstance> Instance,
   if (IncrExecutor) {
     CppshActiveInterpreter = this;
     CppshRuntimeValueOf = cppshRuntimeValueOf;
+    CppshRuntimeRebuildOf = cppshRuntimeRebuildOf;
   }
 }
 
@@ -859,6 +1091,7 @@ Interpreter::~Interpreter() {
   if (CppshActiveInterpreter == this) {
     CppshActiveInterpreter = nullptr;
     CppshRuntimeValueOf = nullptr;
+    CppshRuntimeRebuildOf = nullptr;
   }
   IncrParser.reset();
   Act->FinalizeAction();

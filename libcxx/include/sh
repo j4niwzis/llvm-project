@@ -13,6 +13,7 @@
 #include "meta"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -764,17 +765,6 @@ inline auto ls(Dir dir = ".", ls_opts opts = {}) {
   else
     return __cppsh_ls_view<fs_entry>(dir, opts);
 }
-// `ls {.files_only = true}`: the options alone.
-template <typename = void>
-inline auto ls(ls_opts opts) {
-  if (opts.files_only)
-    return __cppsh_ls_view<file_entry>(".", opts);
-  else if (opts.dirs_only)
-    return __cppsh_ls_view<dir_entry>(".", opts);
-  else
-    return __cppsh_ls_view<fs_entry>(".", opts);
-}
-
 // Whether an entry is a directory: by its kind, or the kind a variant holds.
 template <typename E>
 constexpr bool is_dir(const E &e) noexcept {
@@ -913,6 +903,145 @@ inline sh_result exec(const Cmd &cmd) {
     res.out += buf;
   res.code = ::pclose(fp);
   return res;
+}
+
+
+// ---- Snapshots of run variables, for cppsh's value specialization --------
+//
+// cppsh compiles a statement only after the one before it has run, and a
+// call's arguments are values as it is compiled: a variable a run statement
+// defined is read from memory where it is plain data, and snapshotted here
+// where it is not (a string, a container, an optional...). Before compiling
+// a statement that names such a variable, cppsh runs __cppsh_snapshot(var);
+// the interpreter reads the snapshot (__cppsh_snapshot_of) and rebuilds the
+// value as an expression -- std::string("...", n), T{elements...},
+// T{fields...} -- which the constant evaluator evaluates where the
+// parameter is read.
+//
+// The format, a tag byte then its body (integers 8 bytes, little-endian):
+//   'b' bool: 1 byte              'i' integer or enum: signed byte, value
+//   'f' floating point: as double 's' string: length, bytes
+//   'o' optional: present byte [, value]
+//   'v' variant: index, value     't' pair/tuple: count, elements
+//   'l' range: count, elements    'r' aggregate: count, fields in order
+//   'x' what cannot be rebuilt (a pointer, a handle, a class with state of
+//       its own): the value specialization reports the variable
+
+template <typename T>
+inline constexpr bool __cppsh_is_tuple_like = false;
+template <typename A, typename B>
+inline constexpr bool __cppsh_is_tuple_like<std::pair<A, B>> = true;
+template <typename... Ts>
+inline constexpr bool __cppsh_is_tuple_like<std::tuple<Ts...>> = true;
+
+inline void __cppsh_put_u64(std::string &out, unsigned long long v) {
+  for (int i = 0; i < 8; ++i)
+    out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+}
+
+template <typename T>
+void __cppsh_snap(std::string &out, const T &v) {
+  using U = std::remove_cvref_t<T>;
+  if constexpr (std::is_same_v<U, bool>) {
+    out.push_back('b');
+    out.push_back(v ? 1 : 0);
+  } else if constexpr (std::is_enum_v<U>) {
+    using I = std::underlying_type_t<U>;
+    out.push_back('i');
+    out.push_back(std::is_signed_v<I> ? 1 : 0);
+    __cppsh_put_u64(out, static_cast<unsigned long long>(static_cast<I>(v)));
+  } else if constexpr (std::is_integral_v<U>) {
+    out.push_back('i');
+    out.push_back(std::is_signed_v<U> ? 1 : 0);
+    __cppsh_put_u64(out, static_cast<unsigned long long>(v));
+  } else if constexpr (std::is_floating_point_v<U>) {
+    out.push_back('f');
+    __cppsh_put_u64(out, std::bit_cast<unsigned long long>(static_cast<double>(v)));
+  } else if constexpr (requires {
+                         typename U::traits_type;
+                         v.data();
+                         v.size();
+                       }) {
+    out.push_back('s');
+    __cppsh_put_u64(out, v.size());
+    out.append(v.data(), v.size());
+  } else if constexpr (ranges::views::__cppsh_is_optional<U>) {
+    out.push_back('o');
+    out.push_back(v ? 1 : 0);
+    if (v)
+      __cppsh_snap(out, *v);
+  } else if constexpr (__cppsh_is_variant<U>) {
+    out.push_back('v');
+    __cppsh_put_u64(out, v.index());
+    std::visit([&](const auto &a) { __cppsh_snap(out, a); }, v);
+  } else if constexpr (__cppsh_is_tuple_like<U>) {
+    out.push_back('t');
+    __cppsh_put_u64(out, std::tuple_size_v<U>);
+    std::apply([&](const auto &...e) { (__cppsh_snap(out, e), ...); }, v);
+  } else if constexpr (std::ranges::range<U>) {
+    std::string body;
+    unsigned long long n = 0;
+    for (const auto &e : v) {
+      __cppsh_snap(body, e);
+      ++n;
+    }
+    out.push_back('l');
+    __cppsh_put_u64(out, n);
+    out += body;
+  } else if constexpr (std::is_class_v<U> && std::is_aggregate_v<U>) {
+    constexpr meta::info R = ^^U;
+    constexpr unsigned int N = meta::members_of(R).size();
+    std::string body;
+    unsigned long long n = 0;
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+      (([&] {
+         constexpr meta::info m = meta::members_of(R)[Is];
+         if constexpr (meta::is_nonstatic_data_member(m)) {
+           constexpr meta::info field{m.id, 2};
+           __cppsh_snap(body, v.[:field:]);
+           ++n;
+         }
+       }()),
+       ...);
+    }(std::make_index_sequence<N>{});
+    out.push_back('r');
+    __cppsh_put_u64(out, n);
+    out += body;
+  } else {
+    out.push_back('x');
+  }
+}
+
+// Every snapshot taken, by the address of the variable it is of.
+inline std::map<const void *, std::string> &__cppsh_snapshots() {
+  static std::map<const void *, std::string> all;
+  return all;
+}
+
+} // namespace sh
+} // namespace std
+
+// What the interpreter calls to read a snapshot: its bytes, or none.
+extern "C" inline const char *__cppsh_snapshot_of(const void *p,
+                                                  unsigned long long *n) {
+  auto &all = std::sh::__cppsh_snapshots();
+  auto found = all.find(p);
+  if (found == all.end())
+    return nullptr;
+  *n = found->second.size();
+  return found->second.data();
+}
+
+namespace std {
+namespace sh {
+
+template <typename T>
+void __cppsh_snapshot(const T &v) {
+  // Emitted with the snapshot: the interpreter finds it by its name.
+  (void)&::__cppsh_snapshot_of;
+  std::string s;
+  __cppsh_snap(s, v);
+  __cppsh_snapshots()[static_cast<const void *>(std::addressof(v))] = std::move(s);
 }
 
 } // namespace sh

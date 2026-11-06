@@ -177,10 +177,65 @@ static std::vector<std::string> splitStatements(llvm::StringRef Code) {
 // run, so that what it reads -- a variable std::cin filled the statement
 // before -- is a value as it is compiled (the value specialization reads a
 // run statement's variables from memory). The first failure stops the rest.
+// The run variables a statement names that are not plain data -- a
+// std::string, a container -- snapshotted before it is compiled
+// (std::sh::__cppsh_snapshot), so that the value specialization of its
+// calls rebuilds them as they are now. Plain data needs none: it is read
+// from memory. Names after `.` or `->` are members, not variables; string
+// and character literals are skipped.
+static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
+  clang::Sema &S = Interp.getCompilerInstance()->getSema();
+  clang::ASTContext &Ctx = S.getASTContext();
+  auto identChar = [](char C) {
+    unsigned char U = static_cast<unsigned char>(C);
+    return std::isalnum(U) || C == '_' || U >= 0x80;
+  };
+  std::set<std::string> Names;
+  for (size_t I = 0; I < Stmt.size();) {
+    char C = Stmt[I];
+    if (C == '"') {
+      for (++I; I < Stmt.size() && Stmt[I] != '"'; ++I)
+        if (Stmt[I] == '\\')
+          ++I;
+      ++I;
+      continue;
+    }
+    if (!identChar(C)) {
+      ++I;
+      continue;
+    }
+    size_t J = I;
+    while (J < Stmt.size() && identChar(Stmt[J]))
+      ++J;
+    bool Member = (I > 0 && Stmt[I - 1] == '.') ||
+                  (I > 1 && Stmt[I - 1] == '>' && Stmt[I - 2] == '-');
+    if (!Member && !std::isdigit(static_cast<unsigned char>(C)))
+      Names.insert(Stmt.substr(I, J - I).str());
+    I = J;
+  }
+  for (const std::string &Name : Names) {
+    clang::LookupResult R(S, &Ctx.Idents.get(Name), clang::SourceLocation(),
+                          clang::Sema::LookupOrdinaryName);
+    R.suppressDiagnostics();
+    if (!S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl()))
+      continue;
+    auto *VD = R.getAsSingle<clang::VarDecl>();
+    if (!VD || !VD->hasGlobalStorage() || VD->isInvalidDecl() ||
+        VD->getType()->isDependentType() || VD->getType()->isReferenceType() ||
+        VD->getType().isTriviallyCopyableType(Ctx))
+      continue;
+    if (llvm::Error Err =
+            Interp.ParseAndExecute("std::sh::__cppsh_snapshot(" + Name + ");"))
+      llvm::consumeError(std::move(Err));
+  }
+}
+
 static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Code) {
-  for (const std::string &One : splitStatements(Code))
+  for (const std::string &One : splitStatements(Code)) {
+    snapshotNamed(Interp, One);
     if (llvm::Error Err = Interp.ParseAndExecute(One))
       return Err;
+  }
   return llvm::Error::success();
 }
 

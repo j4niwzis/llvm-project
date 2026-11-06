@@ -28,6 +28,11 @@ export namespace std {
     using std::sh::sym;
     using std::sh::operator_unresolved;
     using std::sh::file_entry;
+    using std::sh::dir_entry;
+    using std::sh::link_entry;
+    using std::sh::fs_entry;
+    using std::sh::is_dir;
+    using std::sh::__cppsh_snapshot;
     using std::sh::ls_opts;
     using std::sh::line_entry;
     using std::sh::lines_view;

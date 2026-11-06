@@ -85,6 +85,11 @@ namespace clang {
 // compiles the next, so every argument is known as its call is compiled,
 // read from std::cin or not.
 std::optional<APValue> (*CppshRuntimeValueOf)(const VarDecl *) = nullptr;
+// And one that is not plain data (a std::string, a container): an
+// expression that rebuilds its value now, from the snapshot cppsh took
+// before compiling this statement; none where it cannot be rebuilt.
+Expr *(*CppshRuntimeRebuildOf)(Sema &, const VarDecl *) = nullptr;
+extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
 } // namespace clang
 
 bool Sema::CanUseDecl(NamedDecl *D, bool TreatUnavailableAsInvalid) {
@@ -7652,6 +7657,78 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                                 VK_PRValue, RParenLoc, CurFPFeatureOverrides());
       OverloadExpr *ovl = find.Expression;
       if (UnresolvedLookupExpr *ULE = dyn_cast<UnresolvedLookupExpr>(ovl)) {
+        // An options list given where an earlier parameter stands (`ls
+        // {.files_only = true}` for `ls(Dir dir = ".", ls_opts opts = {})`):
+        // moved to the first later parameter of a record type that has
+        // every field it names, the parameters between taking their default
+        // arguments -- where the name finds one function or template.
+        SmallVector<Expr *, 8> Rearranged;
+        if (ULE->getNumDecls() == 1) {
+          NamedDecl *OnlyD = (*ULE->decls_begin())->getUnderlyingDecl();
+          FunctionDecl *OnlyFD = dyn_cast<FunctionDecl>(OnlyD);
+          if (auto *FTD = dyn_cast<FunctionTemplateDecl>(OnlyD))
+            OnlyFD = FTD->getTemplatedDecl();
+          for (unsigned I = 0; OnlyFD && I < ArgExprs.size() &&
+                               I < OnlyFD->getNumParams();
+               ++I) {
+            auto *ILE = dyn_cast_or_null<InitListExpr>(
+                ArgExprs[I] ? ArgExprs[I]->IgnoreParens() : nullptr);
+            if (!ILE || ILE->getNumInits() == 0)
+              continue;
+            SmallVector<const IdentifierInfo *, 4> Names;
+            bool AllNamed = true;
+            for (Expr *Init : ILE->inits()) {
+              auto *DIE = dyn_cast<DesignatedInitExpr>(Init);
+              if (!DIE || DIE->size() != 1 ||
+                  !DIE->getDesignator(0)->isFieldDesignator()) {
+                AllNamed = false;
+                break;
+              }
+              Names.push_back(DIE->getDesignator(0)->getFieldName());
+            }
+            if (!AllNamed)
+              continue;
+            auto fits = [&](QualType T) {
+              if (T->isDependentType())
+                return false;
+              const CXXRecordDecl *RD = T->getAsCXXRecordDecl();
+              if (!RD || !RD->hasDefinition())
+                return false;
+              RD = RD->getDefinition();
+              return llvm::all_of(Names, [&](const IdentifierInfo *N) {
+                return llvm::any_of(RD->fields(), [&](const FieldDecl *F) {
+                  return F->getIdentifier() == N;
+                });
+              });
+            };
+            if (fits(OnlyFD->getParamDecl(I)->getType().getNonReferenceType()))
+              continue;
+            for (unsigned J = I + 1; J < OnlyFD->getNumParams(); ++J) {
+              if (!fits(OnlyFD->getParamDecl(J)->getType().getNonReferenceType()))
+                continue;
+              SmallVector<Expr *, 4> Defaults;
+              for (unsigned K = I; K < J; ++K) {
+                ParmVarDecl *PK = OnlyFD->getParamDecl(K);
+                if (!PK->hasDefaultArg() || PK->hasUninstantiatedDefaultArg() ||
+                    PK->hasUnparsedDefaultArg())
+                  break;
+                Expr *DA = PK->getDefaultArg();
+                if (!DA || DA->isValueDependent() || DA->isTypeDependent())
+                  break;
+                Defaults.push_back(DA);
+              }
+              if (Defaults.size() == J - I) {
+                Rearranged.assign(ArgExprs.begin(), ArgExprs.begin() + I);
+                Rearranged.append(Defaults.begin(), Defaults.end());
+                Rearranged.append(ArgExprs.begin() + I, ArgExprs.end());
+              }
+              break;
+            }
+            break;
+          }
+        }
+        if (!Rearranged.empty())
+          ArgExprs = Rearranged;
         auto stmtHasIf = [](const Stmt *S, auto &Self) -> bool {
           if (!S)
             return false;
@@ -7669,6 +7746,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
           APValue Val;
         };
         SmallVector<SavedParamConst, 4> SavedParams;
+        SmallVector<std::pair<ParmVarDecl *, const Expr *>, 4> SavedRebuilds;
         for (NamedDecl *ND : ULE->decls()) {
           auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
           if (!FTD)
@@ -7723,6 +7801,17 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                       EV.Val = std::move(*Now);
                       Ok = true;
                     }
+                  // Not plain data: rebuilt from its snapshot, by an
+                  // expression the parameter keeps (a parameter taken by
+                  // value: a reference would bind to the rebuilt copy).
+                  ParmVarDecl *P = PatFD->getParamDecl(I);
+                  if (!Ok && CppshRuntimeRebuildOf && VD->hasGlobalStorage() &&
+                      !P->getType()->isReferenceType())
+                    if (Expr *Rebuild = CppshRuntimeRebuildOf(*this, VD)) {
+                      SavedRebuilds.push_back({P, CppshParamRebuild.lookup(P)});
+                      CppshParamRebuild[P] = Rebuild;
+                      continue;
+                    }
                   if (!Ok)
                     if (const Expr *InitE = VD->getAnyInitializer()) {
                       if (!InitE->isValueDependent())
@@ -7741,10 +7830,37 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
               ES->Evaluated = EV.Val;
             }
           }
+          // The parameters no argument is given for: their default
+          // arguments, values too -- every argument of a call is known as it
+          // is compiled, `ls()` as much as `ls(".", {})`.
+          for (unsigned I = ArgExprs.size(); I < PatFD->getNumParams(); ++I) {
+            ParmVarDecl *P = PatFD->getParamDecl(I);
+            if (!P->hasDefaultArg() || P->hasUninstantiatedDefaultArg() ||
+                P->hasUnparsedDefaultArg() || P->getType()->isDependentType())
+              continue;
+            const Expr *DA = P->getDefaultArg();
+            if (!DA || DA->isValueDependent())
+              continue;
+            Expr::EvalResult EV;
+            if (!DA->EvaluateAsRValue(EV, Context) || !EV.Val.hasValue())
+              continue;
+            EvaluatedStmt *ES = P->ensureEvaluatedStmt();
+            SavedParams.push_back(
+                {P, ES->WasEvaluated, ES->HasConstantInitialization, ES->Evaluated});
+            ES->WasEvaluated = true;
+            ES->HasConstantInitialization = true;
+            ES->Evaluated = EV.Val;
+          }
         }
         ExprResult OvRes = BuildOverloadedCallExpr(
             Scope, Fn, ULE, LParenLoc, ArgExprs, RParenLoc, ExecConfig,
             /*AllowTypoCorrection=*/true, find.IsAddressOfOperand);
+        for (auto &[P, Was] : llvm::reverse(SavedRebuilds)) {
+          if (Was)
+            CppshParamRebuild[P] = Was;
+          else
+            CppshParamRebuild.erase(P);
+        }
         for (auto &SP : llvm::reverse(SavedParams)) {
           if (EvaluatedStmt *ES = SP.P->getEvaluatedStmt()) {
             ES->WasEvaluated = SP.WasEval;

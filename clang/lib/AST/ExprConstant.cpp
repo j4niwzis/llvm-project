@@ -80,6 +80,14 @@
 #define DEBUG_TYPE "exprconstant"
 
 using namespace clang;
+
+namespace clang {
+// cppsh: the parameters of a value specialization whose argument is not
+// plain data (a std::string, a container): an expression that rebuilds the
+// value, evaluated where the parameter is read -- into a temporary of that
+// evaluation, so what it allocates is freed as the evaluation ends.
+llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
+} // namespace clang
 using llvm::APFixedPoint;
 using llvm::APInt;
 using llvm::APSInt;
@@ -3539,6 +3547,15 @@ static bool evaluateVarDeclInit(EvalInfo &Info, const Expr *E,
   // Used to be C++20 [expr.const]p5.12.2:
   // ... its lifetime began within the evaluation of E;
   if (isa<ParmVarDecl>(VD)) {
+    if (const Expr *Rebuild = CppshParamRebuild.lookup(cast<ParmVarDecl>(VD))) {
+      LValue Where;
+      APValue &Slot = Info.CurrentCall->createTemporary(
+          Rebuild, Rebuild->getType(), ScopeKind::FullExpression, Where);
+      if (!EvaluateInPlace(Slot, Info, Where, Rebuild))
+        return false;
+      Result = &Slot;
+      return true;
+    }
     if (VD->hasConstantInitialization()) {
       if (APValue *EvalVal = const_cast<APValue *>(VD->getEvaluatedValue())) {
         if (EvalVal->hasValue()) {
