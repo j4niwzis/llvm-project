@@ -218,6 +218,13 @@ template <typename F>
 struct cppsh_proj {
   F fn;
 
+  constexpr cppsh_proj() = default;
+  constexpr explicit cppsh_proj(F f) : fn(static_cast<F &&>(f)) {}
+  constexpr cppsh_proj(const cppsh_proj &) = default;
+  constexpr cppsh_proj(cppsh_proj &&) = default;
+  constexpr cppsh_proj &operator=(const cppsh_proj &) = default;
+  constexpr cppsh_proj &operator=(cppsh_proj &&) = default;
+
   template <typename... Args>
     requires (!__cppsh_is_member_fn<F> &&
               requires { fn(std::declval<Args>()...); })

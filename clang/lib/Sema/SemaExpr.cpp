@@ -7414,8 +7414,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                     llvm::utohexstr(reinterpret_cast<uintptr_t>(RD));
                 IdentifierInfo *ArrII = &PP.getIdentifierTable().get(ArrName);
                 VarDecl *ArrVD = VarDecl::Create(
-                    Context, Context.getTranslationUnitDecl(), LParenLoc,
-                    LParenLoc, ArrII, ArrTy,
+                    Context, Context.getTranslationUnitDecl()->getFirstDecl(),
+                    LParenLoc, LParenLoc, ArrII, ArrTy,
                     Context.getTrivialTypeSourceInfo(ArrTy, LParenLoc),
                     SC_Static);
                 ArrVD->setConstexpr(true);
@@ -7435,7 +7435,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                 if (ArrInit.isUsable()) {
                   ArrVD->setInit(ArrInit.get());
                   ArrVD->setInitStyle(VarDecl::ListInit);
-                  Context.getTranslationUnitDecl()->addDecl(ArrVD);
+                  Context.getTranslationUnitDecl()->getFirstDecl()->addDecl(
+                      ArrVD);
                   MemPtrExpr =
                       BuildDeclRefExpr(ArrVD, ArrTy, VK_LValue, LParenLoc);
                 }
@@ -7472,7 +7473,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
       }
     }
 
-    if (!Fn->getType()->isRecordType() && Fn->getType() != Context.BoundMemberTy) {
+    if (CodeSynthesisContexts.empty() && !Fn->getType()->isRecordType() &&
+        Fn->getType() != Context.BoundMemberTy) {
       CXXRecordDecl *ApplyRD = nullptr;
       unsigned ApplyArgIdx = 0;
       LookupResult ApplyR(*this, &PP.getIdentifierTable().get("operator_apply"),
@@ -7522,7 +7524,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
           for (NamedDecl *RawD : Decls) {
             NamedDecl *D = RawD->getUnderlyingDecl();
             if (D->getIdentifier() &&
-                (D->getIdentifier()->isStr("operator_apply") ||
+                (D->getIdentifier()->getName().starts_with("__") ||
+                 D->getIdentifier()->isStr("operator_apply") ||
                  D->getIdentifier()->isStr("__reflect") ||
                  D->getIdentifier()->isStr("__splice_call") ||
                  D->getIdentifier()->isStr("__cppsh_wrap")))

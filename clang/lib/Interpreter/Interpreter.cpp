@@ -244,30 +244,59 @@ CreateCI(const llvm::opt::ArgStringList &Argv) {
       llvm::SmallString<256> Cur(StartPath);
       llvm::sys::fs::make_absolute(Cur);
       llvm::sys::path::remove_dots(Cur, /*remove_dot_dot=*/true);
-      bool Added = false;
+      llvm::SmallVector<std::string, 4> PrependDirs;
+      bool HasBuildLibcxx = false;
+      std::string TT = Clang->getTargetOpts().Triple;
       for (int Depth = 0; Depth < 10 && !Cur.empty(); ++Depth) {
+        if (!TT.empty()) {
+          llvm::SmallString<256> TargetCxxDir(Cur);
+          llvm::sys::path::append(TargetCxxDir, "include", TT, "c++", "v1");
+          if (llvm::sys::fs::is_directory(TargetCxxDir))
+            PrependDirs.push_back(std::string(TargetCxxDir.str()));
+        }
         llvm::SmallString<256> BuildCxxDir(Cur);
         llvm::sys::path::append(BuildCxxDir, "include", "c++", "v1");
-        llvm::SmallString<256> BuildMeta(BuildCxxDir);
-        llvm::sys::path::append(BuildMeta, "meta");
-        if (llvm::sys::fs::exists(BuildMeta)) {
-          Clang->getHeaderSearchOpts().AddPath(
-              BuildCxxDir, frontend::ExternCSystem, /*IsFramework=*/false,
-              /*IgnoreSysRoot=*/true);
-          Added = true;
+        llvm::SmallString<256> BuildIostream(BuildCxxDir);
+        llvm::sys::path::append(BuildIostream, "iostream");
+        if (llvm::sys::fs::exists(BuildIostream)) {
+          PrependDirs.push_back(std::string(BuildCxxDir.str()));
+          HasBuildLibcxx = true;
+        }
+        llvm::SmallString<256> RuntimesCxxDir(Cur);
+        llvm::sys::path::append(RuntimesCxxDir, "runtimes", "runtimes-bins",
+                                "include", "c++", "v1");
+        llvm::SmallString<256> RuntimesIostream(RuntimesCxxDir);
+        llvm::sys::path::append(RuntimesIostream, "iostream");
+        if (llvm::sys::fs::exists(RuntimesIostream)) {
+          PrependDirs.push_back(std::string(RuntimesCxxDir.str()));
+          HasBuildLibcxx = true;
         }
         llvm::SmallString<256> SrcCxxDir(Cur);
         llvm::sys::path::append(SrcCxxDir, "libcxx", "include");
         llvm::SmallString<256> SrcMeta(SrcCxxDir);
         llvm::sys::path::append(SrcMeta, "meta");
-        if (llvm::sys::fs::exists(SrcMeta)) {
-          Clang->getHeaderSearchOpts().AddPath(
-              SrcCxxDir, frontend::ExternCSystem, /*IsFramework=*/false,
-              /*IgnoreSysRoot=*/true);
-          Added = true;
-        }
-        if (Added)
+        if (llvm::sys::fs::exists(SrcMeta))
+          PrependDirs.push_back(std::string(SrcCxxDir.str()));
+        if (!PrependDirs.empty()) {
+          auto &UE = Clang->getHeaderSearchOpts().UserEntries;
+          if (HasBuildLibcxx) {
+            Clang->getHeaderSearchOpts().UseStandardCXXIncludes = false;
+            llvm::erase_if(UE, [](const HeaderSearchOptions::Entry &E) {
+              return llvm::StringRef(E.Path).contains("/include/c++/");
+            });
+            for (auto It = PrependDirs.rbegin(); It != PrependDirs.rend(); ++It)
+              UE.insert(UE.begin(),
+                        HeaderSearchOptions::Entry(*It, frontend::System,
+                                                   /*IsFramework=*/false,
+                                                   /*IgnoreSysRoot=*/true));
+          } else {
+            for (const std::string &D : PrependDirs)
+              Clang->getHeaderSearchOpts().AddPath(
+                  D, frontend::System, /*IsFramework=*/false,
+                  /*IgnoreSysRoot=*/true);
+          }
           return true;
+        }
         if (!llvm::sys::path::has_parent_path(Cur))
           break;
         llvm::sys::path::remove_filename(Cur);

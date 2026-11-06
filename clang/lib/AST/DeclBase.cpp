@@ -1789,12 +1789,13 @@ void DeclContext::removeDecl(Decl *D) {
       StoredDeclsMap *Map = DC->getPrimaryContext()->LookupPtr;
       if (Map) {
         StoredDeclsMap::iterator Pos = Map->find(ND->getDeclName());
-        assert(Pos != Map->end() && "no lookup entry for decl");
-        StoredDeclsList &List = Pos->second;
-        List.remove(ND);
-        // Clean up the entry if there are no more decls.
-        if (List.isNull())
-          Map->erase(Pos);
+        if (Pos != Map->end()) {
+          StoredDeclsList &List = Pos->second;
+          List.remove(ND);
+          // Clean up the entry if there are no more decls.
+          if (List.isNull())
+            Map->erase(Pos);
+        }
       }
     } while (DC->isTransparentContext() && (DC = DC->getParent()));
   }
