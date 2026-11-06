@@ -158,10 +158,33 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
   //   `foo a: int b: T' ? Concept<T> = expr;`
   //   `foo(a: int, b: T') ? Concept<T> = expr;`
   //   `foo() = expr;`
-  bool IsUnparenFunc =
-      NextToken().is(tok::identifier) && GetLookAheadToken(2).is(tok::colon) &&
-      !Actions.getTypeName(*Tok.getIdentifierInfo(), Tok.getLocation(),
-                           getCurScope());
+  auto isKnownCallableOrType = [&](IdentifierInfo *II, SourceLocation L) {
+    if (!II)
+      return false;
+    if (Actions.getTypeName(*II, L, getCurScope()))
+      return true;
+    LookupResult R(Actions, II, L, Sema::LookupOrdinaryName);
+    Actions.LookupName(R, getCurScope());
+    R.suppressDiagnostics();
+    return !R.empty();
+  };
+  bool IsUnparenFunc = false;
+  if (NextToken().is(tok::identifier) &&
+      !isKnownCallableOrType(Tok.getIdentifierInfo(), Tok.getLocation())) {
+    if (GetLookAheadToken(2).is(tok::colon)) {
+      IsUnparenFunc = true;
+    } else {
+      for (unsigned LookIdx = 2; LookIdx <= 8; ++LookIdx) {
+        Token LT = GetLookAheadToken(LookIdx);
+        if (LT.isOneOf(tok::equal, tok::question, tok::kw_requires, tok::arrow)) {
+          IsUnparenFunc = true;
+          break;
+        }
+        if (!LT.is(tok::identifier))
+          break;
+      }
+    }
+  }
   bool IsParenFunc =
       NextToken().is(tok::l_paren) &&
       ((GetLookAheadToken(2).is(tok::identifier) &&
@@ -281,6 +304,14 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
           ConsumeAnyToken();
         }
       }
+      if (Tok.is(tok::comma))
+        ConsumeToken();
+    } else if (!HasParens && Tok.is(tok::identifier)) {
+      Token ParamName = Tok;
+      ConsumeToken();
+      ConvertedParams.push_back(
+          makeKwTok(tok::kw_auto, "auto", ParamName.getLocation()));
+      ConvertedParams.push_back(ParamName);
       if (Tok.is(tok::comma))
         ConsumeToken();
     } else {

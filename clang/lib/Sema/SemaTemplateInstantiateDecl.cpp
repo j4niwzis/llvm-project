@@ -3159,9 +3159,22 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
   Function->setLexicalDeclContext(LexicalDC);
 
   // Attach the parameters
-  for (unsigned P = 0; P < Params.size(); ++P)
-    if (Params[P])
+  for (unsigned P = 0; P < Params.size(); ++P) {
+    if (Params[P]) {
       Params[P]->setOwningFunction(Function);
+      if (P < D->getNumParams()) {
+        const ParmVarDecl *OrigP = D->getParamDecl(P);
+        if (OrigP && OrigP->hasConstantInitialization()) {
+          if (const APValue *Val = OrigP->getEvaluatedValue()) {
+            EvaluatedStmt *ES = Params[P]->ensureEvaluatedStmt();
+            ES->WasEvaluated = true;
+            ES->HasConstantInitialization = true;
+            ES->Evaluated = *Val;
+          }
+        }
+      }
+    }
+  }
   Function->setParams(Params);
 
   if (TrailingRequiresClause)
