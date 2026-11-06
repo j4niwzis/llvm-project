@@ -989,11 +989,16 @@ struct cppsh_placeholder_root {
   }
 };
 
-inline constexpr cppsh_proj<cppsh_placeholder_root> _{cppsh_placeholder_root{}};
-
 namespace placeholders {
-using std::_;
+inline constexpr cppsh_proj<cppsh_placeholder_root> _{cppsh_placeholder_root{}};
 } // namespace placeholders
+
+template <typename T> struct __cppsh_rm_cvref { using type = T; };
+template <typename T> struct __cppsh_rm_cvref<T &> { using type = T; };
+template <typename T> struct __cppsh_rm_cvref<T &&> { using type = T; };
+template <typename T> struct __cppsh_rm_cvref<const T> { using type = T; };
+template <typename T> struct __cppsh_rm_cvref<const T &> { using type = T; };
+template <typename T> struct __cppsh_rm_cvref<const T &&> { using type = T; };
 
 template <typename T>
 struct cppsh_vec {
@@ -1051,6 +1056,239 @@ struct cppsh_vec {
   bool empty() const { return size_ == 0; }
   T &operator[](unsigned long i) { return data_[i]; }
   const T &operator[](unsigned long i) const { return data_[i]; }
+};
+
+template <typename T>
+void print(const T &v) {
+  if constexpr (requires { v.c_str(); })
+    printf("%s\n", v.c_str());
+  else if constexpr (requires { static_cast<const char *>(v); })
+    printf("%s\n", static_cast<const char *>(v));
+  else if constexpr (requires { v.dump(); })
+    v.dump();
+  else if constexpr (__cppsh_same<T, double> || __cppsh_same<T, float>)
+    printf("%g\n", (double)v);
+  else
+    printf("%lld\n", (long long)v);
+}
+
+namespace ranges {
+namespace views {
+
+template <typename Pred>
+struct cppsh_filter_stage {
+  Pred pred;
+  template <typename Rng>
+  friend auto operator|(Rng &&rng, const cppsh_filter_stage &s) {
+    using RawElem = decltype(*rng.begin());
+    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
+    cppsh_vec<ElemT> out;
+    for (auto &&item : rng)
+      if (s.pred(item))
+        out.push_back(item);
+    return out;
+  }
+};
+template <typename Pred>
+constexpr auto filter(Pred p) {
+  return cppsh_filter_stage<Pred>{p};
+}
+
+struct cppsh_take_stage {
+  unsigned long n;
+  template <typename Rng>
+  friend auto operator|(Rng &&rng, const cppsh_take_stage &s) {
+    using RawElem = decltype(*rng.begin());
+    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
+    cppsh_vec<ElemT> out;
+    unsigned long i = 0;
+    for (auto &&item : rng) {
+      if (i++ >= s.n)
+        break;
+      out.push_back(item);
+    }
+    return out;
+  }
+};
+inline constexpr auto take(unsigned long n) { return cppsh_take_stage{n}; }
+
+struct cppsh_drop_stage {
+  unsigned long n;
+  template <typename Rng>
+  friend auto operator|(Rng &&rng, const cppsh_drop_stage &s) {
+    using RawElem = decltype(*rng.begin());
+    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
+    cppsh_vec<ElemT> out;
+    unsigned long i = 0;
+    for (auto &&item : rng) {
+      if (i++ < s.n)
+        continue;
+      out.push_back(item);
+    }
+    return out;
+  }
+};
+inline constexpr auto drop(unsigned long n) { return cppsh_drop_stage{n}; }
+
+template <typename Fn>
+struct cppsh_transform_stage {
+  Fn fn;
+  template <typename Rng>
+  friend auto operator|(Rng &&rng, const cppsh_transform_stage &s) {
+    using RawElem = decltype(s.fn(*rng.begin()));
+    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
+    cppsh_vec<ElemT> out;
+    for (auto &&item : rng)
+      out.push_back(s.fn(item));
+    return out;
+  }
+};
+template <typename Fn>
+constexpr auto transform(Fn f) {
+  return cppsh_transform_stage<Fn>{f};
+}
+
+template <typename Proj>
+struct cppsh_sort_stage {
+  Proj proj;
+  template <typename Rng>
+  friend auto operator|(Rng &&rng, const cppsh_sort_stage &s) {
+    using RawElem = decltype(*rng.begin());
+    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
+    cppsh_vec<ElemT> out;
+    for (auto &&item : rng)
+      out.push_back(item);
+    for (unsigned long i = 0; i < out.size(); ++i)
+      for (unsigned long j = i + 1; j < out.size(); ++j)
+        if (s.proj(out[j]) < s.proj(out[i])) {
+          auto tmp = out[i];
+          out[i] = out[j];
+          out[j] = tmp;
+        }
+    return out;
+  }
+};
+template <typename Proj>
+constexpr auto sort_by(Proj p) {
+  return cppsh_sort_stage<Proj>{p};
+}
+
+struct cppsh_grep_stage {
+  const char *pat;
+  template <typename Rng>
+  friend auto operator|(Rng &&rng, const cppsh_grep_stage &g) {
+    using RawElem = decltype(*rng.begin());
+    using ElemT = typename __cppsh_rm_cvref<RawElem>::type;
+    cppsh_vec<ElemT> out;
+    for (auto &&item : rng) {
+      if constexpr (requires { item.text; }) {
+        if (item.text.contains(g.pat))
+          out.push_back(item);
+      } else if constexpr (requires { item.name; }) {
+        if (item.name.contains(g.pat))
+          out.push_back(item);
+      } else if constexpr (requires { item.c_str(); }) {
+        if (strstr(item.c_str(), g.pat) != nullptr)
+          out.push_back(item);
+      }
+    }
+    return out;
+  }
+};
+template <typename Pat>
+constexpr auto grep(const Pat &p) {
+  return cppsh_grep_stage{__cppsh_cstr(p)};
+}
+
+struct cppsh_print_stage {
+  template <typename Rng>
+  friend void operator|(Rng &&rng, const cppsh_print_stage &) {
+    for (const auto &item : rng) {
+      if constexpr (requires { item.dump(); })
+        item.dump();
+      else
+        std::print(item);
+    }
+  }
+};
+inline constexpr cppsh_print_stage show{};
+
+} // namespace views
+} // namespace ranges
+
+namespace views = ranges::views;
+
+namespace sh {
+
+template <char... Cs>
+struct sym {
+  static constexpr const char value[sizeof...(Cs) + 1] = {Cs..., '\0'};
+  constexpr operator const char *() const noexcept { return value; }
+  operator cppsh_str() const { return cppsh_str(value); }
+  constexpr const char *c_str() const noexcept { return value; }
+  constexpr unsigned long size() const noexcept { return sizeof...(Cs); }
+  template <char... NextCs>
+  constexpr auto operator_unresolved() const noexcept {
+    return sym<Cs..., '.', NextCs...>{};
+  }
+  constexpr auto operator-() const noexcept { return sym<'-', Cs...>{}; }
+  constexpr auto operator--() const noexcept { return sym<'-', '-', Cs...>{}; }
+  template <char... RCs>
+  constexpr auto operator-(sym<RCs...>) const noexcept {
+    return sym<Cs..., '-', RCs...>{};
+  }
+  template <char... RCs>
+  constexpr auto operator/(sym<RCs...>) const noexcept {
+    return sym<Cs..., '/', RCs...>{};
+  }
+  template <typename... Args>
+  int operator()(Args &&...args) const {
+    char cmd[2048];
+    unsigned long pos = 0;
+    auto appendStr = [&](const char *s) {
+      while (s && *s && pos + 1 < sizeof(cmd))
+        cmd[pos++] = *s++;
+      cmd[pos] = '\0';
+    };
+    appendStr(value);
+    auto appendOne = [&](const auto &a) {
+      appendStr(" ");
+      if constexpr (requires { static_cast<const char *>(a); }) {
+        appendStr(static_cast<const char *>(a));
+      } else if constexpr (requires { a.c_str(); }) {
+        appendStr(a.c_str());
+      } else {
+        char num[64];
+        snprintf(num, sizeof(num), "%lld", (long long)a);
+        appendStr(num);
+      }
+    };
+    (appendOne(args), ...);
+    return system(cmd);
+  }
+};
+
+template <char... Cs>
+constexpr auto operator_unresolved() noexcept {
+  return sym<Cs...>{};
+}
+
+struct file_entry {
+  cppsh_str name;
+  cppsh_str ext;
+  long long size = 0;
+  bool is_dir = false;
+  void dump() const {
+    printf("%s %-28s %10lld B\n", is_dir ? "[dir] " : "[file]", name.c_str(),
+           size);
+  }
+};
+
+struct ls_opts {
+  bool all = false;
+  bool recursive = false;
+  bool dirs_only = false;
+  bool files_only = false;
 };
 
 struct line_entry {
@@ -1141,217 +1379,6 @@ inline bool file_exists(const Path &p) {
   return stat(__cppsh_cstr(p), stbuf) == 0;
 }
 
-template <typename T>
-void print(const T &v) {
-  if constexpr (requires { v.c_str(); })
-    printf("%s\n", v.c_str());
-  else if constexpr (requires { static_cast<const char *>(v); })
-    printf("%s\n", static_cast<const char *>(v));
-  else if constexpr (requires { v.dump(); })
-    v.dump();
-  else if constexpr (__cppsh_same<T, double> || __cppsh_same<T, float>)
-    printf("%g\n", (double)v);
-  else
-    printf("%lld\n", (long long)v);
-}
-
-template <typename Pred>
-struct cppsh_filter_stage {
-  Pred pred;
-  template <typename Rng>
-  friend auto operator|(Rng rng, const cppsh_filter_stage &s) {
-    Rng out;
-    for (auto &&item : rng)
-      if (s.pred(item))
-        out.push_back(item);
-    return out;
-  }
-};
-template <typename Pred>
-constexpr auto filter(Pred p) {
-  return cppsh_filter_stage<Pred>{p};
-}
-
-template <typename Proj>
-struct cppsh_sort_stage {
-  Proj proj;
-  template <typename Rng>
-  friend auto operator|(Rng rng, const cppsh_sort_stage &s) {
-    for (unsigned long i = 0; i < rng.size(); ++i)
-      for (unsigned long j = i + 1; j < rng.size(); ++j)
-        if (s.proj(rng[j]) < s.proj(rng[i])) {
-          auto tmp = rng[i];
-          rng[i] = rng[j];
-          rng[j] = tmp;
-        }
-    return rng;
-  }
-};
-template <typename Proj>
-constexpr auto sort_by(Proj p) {
-  return cppsh_sort_stage<Proj>{p};
-}
-
-struct cppsh_take_stage {
-  unsigned long n;
-  template <typename Rng>
-  friend auto operator|(Rng rng, const cppsh_take_stage &s) {
-    Rng out;
-    unsigned long i = 0;
-    for (auto &&item : rng) {
-      if (i++ >= s.n)
-        break;
-      out.push_back(item);
-    }
-    return out;
-  }
-};
-inline constexpr auto take(unsigned long n) { return cppsh_take_stage{n}; }
-
-struct cppsh_drop_stage {
-  unsigned long n;
-  template <typename Rng>
-  friend auto operator|(Rng rng, const cppsh_drop_stage &s) {
-    Rng out;
-    unsigned long i = 0;
-    for (auto &&item : rng) {
-      if (i++ < s.n)
-        continue;
-      out.push_back(item);
-    }
-    return out;
-  }
-};
-inline constexpr auto drop(unsigned long n) { return cppsh_drop_stage{n}; }
-
-template <typename Fn>
-struct cppsh_transform_stage {
-  Fn fn;
-  template <typename Rng>
-  friend auto operator|(Rng rng, const cppsh_transform_stage &s) {
-    using ElemT = decltype(s.fn(*rng.begin()));
-    cppsh_vec<ElemT> out;
-    for (auto &&item : rng)
-      out.push_back(s.fn(item));
-    return out;
-  }
-};
-template <typename Fn>
-constexpr auto transform(Fn f) {
-  return cppsh_transform_stage<Fn>{f};
-}
-
-struct cppsh_grep_stage {
-  const char *pat;
-  template <typename Rng>
-  friend auto operator|(Rng rng, const cppsh_grep_stage &g) {
-    Rng out;
-    for (auto &&item : rng) {
-      if constexpr (requires { item.text; }) {
-        if (item.text.contains(g.pat))
-          out.push_back(item);
-      } else if constexpr (requires { item.name; }) {
-        if (item.name.contains(g.pat))
-          out.push_back(item);
-      } else if constexpr (requires { item.c_str(); }) {
-        if (strstr(item.c_str(), g.pat) != nullptr)
-          out.push_back(item);
-      }
-    }
-    return out;
-  }
-};
-template <typename Pat>
-constexpr auto grep(const Pat &p) {
-  return cppsh_grep_stage{__cppsh_cstr(p)};
-}
-
-struct cppsh_print_stage {
-  template <typename Rng>
-  friend void operator|(const Rng &rng, const cppsh_print_stage &) {
-    for (const auto &item : rng) {
-      if constexpr (requires { item.dump(); })
-        item.dump();
-      else
-        print(item);
-    }
-  }
-};
-inline constexpr cppsh_print_stage show{};
-
-namespace sh {
-
-template <char... Cs>
-struct sym {
-  static constexpr const char value[sizeof...(Cs) + 1] = {Cs..., '\0'};
-  constexpr operator const char *() const noexcept { return value; }
-  operator cppsh_str() const { return cppsh_str(value); }
-  constexpr const char *c_str() const noexcept { return value; }
-  constexpr unsigned long size() const noexcept { return sizeof...(Cs); }
-  template <char... NextCs>
-  constexpr auto operator_unresolved() const noexcept {
-    return sym<Cs..., '.', NextCs...>{};
-  }
-  constexpr auto operator-() const noexcept { return sym<'-', Cs...>{}; }
-  constexpr auto operator--() const noexcept { return sym<'-', '-', Cs...>{}; }
-  template <char... RCs>
-  constexpr auto operator-(sym<RCs...>) const noexcept {
-    return sym<Cs..., '-', RCs...>{};
-  }
-  template <char... RCs>
-  constexpr auto operator/(sym<RCs...>) const noexcept {
-    return sym<Cs..., '/', RCs...>{};
-  }
-  template <typename... Args>
-  int operator()(Args &&...args) const {
-    char cmd[2048];
-    unsigned long pos = 0;
-    auto appendStr = [&](const char *s) {
-      while (s && *s && pos + 1 < sizeof(cmd))
-        cmd[pos++] = *s++;
-      cmd[pos] = '\0';
-    };
-    appendStr(value);
-    auto appendOne = [&](const auto &a) {
-      appendStr(" ");
-      if constexpr (requires { static_cast<const char *>(a); }) {
-        appendStr(static_cast<const char *>(a));
-      } else if constexpr (requires { a.c_str(); }) {
-        appendStr(a.c_str());
-      } else {
-        char num[64];
-        snprintf(num, sizeof(num), "%lld", (long long)a);
-        appendStr(num);
-      }
-    };
-    (appendOne(args), ...);
-    return system(cmd);
-  }
-};
-
-template <char... Cs>
-constexpr auto operator_unresolved() noexcept {
-  return sym<Cs...>{};
-}
-
-struct file_entry {
-  cppsh_str name;
-  cppsh_str ext;
-  long long size = 0;
-  bool is_dir = false;
-  void dump() const {
-    printf("%s %-28s %10lld B\n", is_dir ? "[dir] " : "[file]", name.c_str(),
-           size);
-  }
-};
-
-struct ls_opts {
-  bool all = false;
-  bool recursive = false;
-  bool dirs_only = false;
-  bool files_only = false;
-};
-
 inline cppsh_vec<file_entry> ls(const char *dir = ".", ls_opts opts = {}) {
   if (dir && dir[0] == '-') {
     for (const char *p = dir + 1; *p; ++p)
@@ -1437,31 +1464,31 @@ constexpr unsigned long long operator""_GB(unsigned long long v) noexcept {
 static const char *const CppShStdShModulePrelude = R"CPPSH(
 #ifndef __CPPSH_STD_SH_MODULE_LOADED
 #define __CPPSH_STD_SH_MODULE_LOADED 1
-using std::_;
-using std::append_file;
-using std::drop;
-using std::file_exists;
-using std::filter;
-using std::grep;
-using std::line_entry;
-using std::lines;
 using std::print;
-using std::read_file;
-using std::read_lines;
-using std::show;
-using std::sort_by;
-using std::take;
-using std::transform;
-using std::write_file;
+using std::placeholders::_;
+using std::ranges::views::drop;
+using std::ranges::views::filter;
+using std::ranges::views::grep;
+using std::ranges::views::show;
+using std::ranges::views::sort_by;
+using std::ranges::views::take;
+using std::ranges::views::transform;
+using std::sh::append_file;
 using std::sh::cat;
 using std::sh::cd;
 using std::sh::env;
 using std::sh::file_entry;
+using std::sh::file_exists;
+using std::sh::line_entry;
+using std::sh::lines;
 using std::sh::ls;
 using std::sh::ls_opts;
 using std::sh::operator_unresolved;
 using std::sh::pwd;
+using std::sh::read_file;
+using std::sh::read_lines;
 using std::sh::sym;
+using std::sh::write_file;
 #endif
 )CPPSH";
 
