@@ -168,6 +168,18 @@ void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
   FunctionDecl *FD = S.getCurFunctionDecl();
   SourceManager &SM = S.getSourceManager();
   SourceLocation Loc = At->getBeginLoc();
+  // A continuation cut at its very start would be cut to the same
+  // continuation again, without end: what it needs could not be made a
+  // value it is compiled with (a pointer into the running program).
+  if (Statements.empty() && FD->getIdentifier() &&
+      FD->getName().starts_with("__cppsh_cont")) {
+    unsigned ID = S.getDiagnostics().getCustomDiagID(
+        DiagnosticsEngine::Error,
+        "this needs a value only running the function gives, and it cannot be "
+        "made a value the rest is compiled with: not staged");
+    S.Diag(Loc, ID);
+    return;
+  }
   StringRef Rest = Lexer::getSourceText(
       CharSourceRange::getCharRange(Loc, Body->getRBracLoc()), SM, S.getLangOpts());
   SmallVector<VarDecl *, 8> Live;
