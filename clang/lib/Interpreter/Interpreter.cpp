@@ -1419,6 +1419,24 @@ inline cppsh_str env(const Name &n) {
   return cppsh_str(v ? v : "");
 }
 
+} // namespace sh
+} // namespace std
+
+constexpr unsigned long long operator""_KB(unsigned long long v) noexcept {
+  return v * 1024ULL;
+}
+constexpr unsigned long long operator""_MB(unsigned long long v) noexcept {
+  return v * 1024ULL * 1024ULL;
+}
+constexpr unsigned long long operator""_GB(unsigned long long v) noexcept {
+  return v * 1024ULL * 1024ULL * 1024ULL;
+}
+#endif
+)CPPSH";
+
+static const char *const CppShStdShModulePrelude = R"CPPSH(
+#ifndef __CPPSH_STD_SH_MODULE_LOADED
+#define __CPPSH_STD_SH_MODULE_LOADED 1
 using std::_;
 using std::append_file;
 using std::drop;
@@ -1435,22 +1453,15 @@ using std::sort_by;
 using std::take;
 using std::transform;
 using std::write_file;
-
-} // namespace sh
-
-using sh::operator_unresolved;
-
-} // namespace std
-
-constexpr unsigned long long operator""_KB(unsigned long long v) noexcept {
-  return v * 1024ULL;
-}
-constexpr unsigned long long operator""_MB(unsigned long long v) noexcept {
-  return v * 1024ULL * 1024ULL;
-}
-constexpr unsigned long long operator""_GB(unsigned long long v) noexcept {
-  return v * 1024ULL * 1024ULL * 1024ULL;
-}
+using std::sh::cat;
+using std::sh::cd;
+using std::sh::env;
+using std::sh::file_entry;
+using std::sh::ls;
+using std::sh::ls_opts;
+using std::sh::operator_unresolved;
+using std::sh::pwd;
+using std::sh::sym;
 #endif
 )CPPSH";
 
@@ -1476,7 +1487,9 @@ static std::string expandCppshStdImports(llvm::StringRef Code) {
       if (Rest == "std.sh;" || Rest == "std.sh" ||
           Rest.starts_with("std.sh;")) {
         Out += CppShStdModulePrelude;
-        Out += "\nusing namespace std;\nusing namespace std::sh;\n";
+        Out += "\n";
+        Out += CppShStdShModulePrelude;
+        Out += "\n";
         if (Rest.starts_with("std.sh;"))
           Out += Rest.drop_front(7).str();
         Out += "\n";

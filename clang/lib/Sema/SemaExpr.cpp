@@ -2933,12 +2933,6 @@ ExprResult Sema::BuildOperatorUnresolvedCall(Scope *S, SourceLocation Loc,
   else
     LookupQualifiedName(R, Context.getTranslationUnitDecl());
   R.suppressDiagnostics();
-  if (R.empty()) {
-    if (NamespaceDecl *StdNS = getStdNamespace()) {
-      LookupQualifiedName(R, StdNS);
-      R.suppressDiagnostics();
-    }
-  }
   if (R.empty())
     return ExprEmpty();
 
