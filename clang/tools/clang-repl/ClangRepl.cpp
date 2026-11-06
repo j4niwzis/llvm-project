@@ -146,6 +146,16 @@ struct sym {
   constexpr auto operator_unresolved() const noexcept {
     return sym<Cs..., '.', NextCs...>{};
   }
+  constexpr auto operator-() const noexcept { return sym<'-', Cs...>{}; }
+  constexpr auto operator--() const noexcept { return sym<'-', '-', Cs...>{}; }
+  template <char... RCs>
+  constexpr auto operator-(sym<RCs...>) const noexcept {
+    return sym<Cs..., '-', RCs...>{};
+  }
+  template <char... RCs>
+  constexpr auto operator/(sym<RCs...>) const noexcept {
+    return sym<Cs..., '/', RCs...>{};
+  }
   template <typename... Args>
   int operator()(Args &&...args) const {
     char cmd[2048];
@@ -306,6 +316,12 @@ int stat(const char *, void *);
 }
 
 inline cppsh_vec<file_entry> ls(const char *dir = ".", ls_opts opts = {}) {
+  if (dir && dir[0] == '-') {
+    for (const char *p = dir + 1; *p; ++p)
+      if (*p == 'a')
+        opts.all = true;
+    dir = ".";
+  }
   cppsh_vec<file_entry> out;
   void *d = opendir(dir);
   if (!d)

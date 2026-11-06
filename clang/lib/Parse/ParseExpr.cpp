@@ -117,9 +117,16 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
   if (!IsCallable)
     return LHS;
 
+  auto isFlagStart = [&]() -> bool {
+    return Tok.isOneOf(tok::minus, tok::minusminus) && Tok.hasLeadingSpace() &&
+           !NextToken().hasLeadingSpace() &&
+           NextToken().isOneOf(tok::identifier, tok::numeric_constant);
+  };
   auto canStartArg = [&]() -> bool {
     if (Tok.is(tok::l_brace))
       return NextToken().is(tok::period);
+    if (isFlagStart())
+      return true;
     return Tok.isOneOf(tok::identifier, tok::numeric_constant,
                        tok::char_constant, tok::wide_char_constant,
                        tok::utf8_char_constant, tok::utf16_char_constant,
@@ -139,7 +146,19 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
       Arg = ParseBraceInitializer();
     } else {
       Arg = ParseCastExpression(CastParseKind::AnyCastExpr);
-      if (Arg.isUsable())
+      while (Arg.isUsable() && Tok.isOneOf(tok::minus, tok::slash) &&
+             !Tok.hasLeadingSpace() && !NextToken().hasLeadingSpace()) {
+        Token OpTok = Tok;
+        ConsumeToken();
+        ExprResult RHS = ParseCastExpression(CastParseKind::AnyCastExpr);
+        if (RHS.isInvalid()) {
+          Arg = ExprError();
+          break;
+        }
+        Arg = Actions.ActOnBinOp(getCurScope(), OpTok.getLocation(),
+                                 OpTok.getKind(), Arg.get(), RHS.get());
+      }
+      if (Arg.isUsable() && !isFlagStart())
         Arg = ParseRHSOfBinaryExpression(Arg, prec::ExclusiveOr);
     }
     if (Arg.isInvalid() || !Arg.isUsable())
