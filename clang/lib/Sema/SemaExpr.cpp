@@ -7838,8 +7838,44 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                 }
               }
             }
-            if (Ok && EV.Val.hasValue())
-              setValue(PatFD->getParamDecl(I), EV.Val);
+            if (Ok && EV.Val.hasValue()) {
+              ParmVarDecl *P = PatFD->getParamDecl(I);
+              QualType PT = P->getType();
+              if (PT->isReferenceType())
+                continue;
+              if (PT->isDependentType()) {
+                QualType AT = ArgE->getType();
+                if (!AT.isNull() && !AT->isArrayType() && !AT->isFunctionType())
+                  setValue(P, EV.Val);
+                continue;
+              }
+              // Of the parameter's own type (a run variable, read from
+              // memory): as it is.
+              if (Context.hasSameUnqualifiedType(ArgE->getType(), PT)) {
+                setValue(P, EV.Val);
+                continue;
+              }
+              // Converted as the parameter is initialized: an int given for
+              // a long is a long.
+              SFINAETrap Trap(*this);
+              InitializedEntity Entity = InitializedEntity::InitializeTemporary(PT);
+              InitializationKind Kind =
+                  InitializationKind::CreateCopy(ArgE->getBeginLoc(), SourceLocation());
+              Expr *ConvArgs[1] = {ArgE};
+              if (isa<InitListExpr>(ArgE->IgnoreParens())) {
+                // Already evaluated as the parameter's type, above.
+                setValue(P, EV.Val);
+                continue;
+              }
+              InitializationSequence Seq(*this, Entity, Kind, ConvArgs);
+              if (!Seq)
+                continue;
+              ExprResult Conv = Seq.Perform(*this, Entity, Kind, ConvArgs);
+              Expr::EvalResult CV;
+              if (Conv.isUsable() && !Trap.hasErrorOccurred() &&
+                  Conv.get()->EvaluateAsRValue(CV, Context) && CV.Val.hasValue())
+                setValue(P, CV.Val);
+            }
           }
           // The parameters no argument is given for: their default
           // arguments, values too -- every argument of a call is known as it
@@ -23140,6 +23176,23 @@ ExprResult Sema::CheckPlaceholderExpr(Expr *E) {
     Result = E;
     if (resolveAndFixAddressOfSingleOverloadCandidate(Result))
       return Result;
+
+    // The shell's: a function or a function template that needs no argument
+    // (`ls`), named where a value is wanted -- a statement of its own, the
+    // REPL's last expression -- called, as a command is.
+    if (getLangOpts().IncrementalExtensions)
+      if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(E->IgnoreParens()))
+        if (llvm::any_of(ULE->decls(), [](NamedDecl *ND) {
+              FunctionDecl *FD = dyn_cast<FunctionDecl>(ND->getUnderlyingDecl());
+              if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl()))
+                FD = FTD->getTemplatedDecl();
+              return FD && FD->getMinRequiredArguments() == 0;
+            })) {
+          ExprResult Called =
+              BuildCallExpr(getCurScope(), E, E->getBeginLoc(), {}, E->getEndLoc());
+          if (Called.isUsable())
+            return Called;
+        }
 
     // If that failed, try to recover with a call.
     tryToRecoverWithCall(Result, PDiag(diag::err_ovl_unresolvable),
