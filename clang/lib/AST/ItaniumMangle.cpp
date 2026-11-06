@@ -1205,7 +1205,9 @@ void CXXNameMangler::mangleUnscopedTemplateName(
     assert(AdditionalAbiTags.empty() &&
            "template template param cannot have abi tags");
     mangleTemplateParameter(TTP->getDepth(), TTP->getIndex());
-  } else if (isa<BuiltinTemplateDecl>(ND) || isa<ConceptDecl>(ND)) {
+  } else if (isa<BuiltinTemplateDecl>(ND) || isa<ConceptDecl>(ND) ||
+             (ND->getTemplatedDecl() &&
+              ND->getDeclName() != ND->getTemplatedDecl()->getDeclName())) {
     mangleUnscopedName(GD, DC, AdditionalAbiTags);
   } else {
     mangleUnscopedName(GD.getWithDecl(ND->getTemplatedDecl()), DC,
