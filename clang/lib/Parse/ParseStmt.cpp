@@ -1214,7 +1214,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
   const size_t CppshOpenAtBody = CppshOpenCuts.size();
   if (CppshBody)
     CppshBodyOpen = T.getOpenLocation();
-  auto CppshRestoreBody = llvm::make_scope_exit([&] {
+  llvm::scope_exit CppshRestoreBody([&] {
     if (CppshBody) {
       CppshBodyOpen = CppshSavedBodyOpen;
       CppshOpenCuts.resize(CppshOpenAtBody);
