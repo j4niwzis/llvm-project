@@ -238,23 +238,37 @@ CreateCI(const llvm::opt::ArgStringList &Argv) {
               /*IgnoreSysRoot=*/true);
       }
     }
-    llvm::SmallString<256> SrcFile(__FILE__);
-    llvm::sys::path::remove_filename(SrcFile); // Interpreter
-    llvm::sys::path::remove_filename(SrcFile); // lib
-    llvm::sys::path::remove_filename(SrcFile); // clang
-    llvm::sys::path::remove_filename(SrcFile); // llvm-project root
-    llvm::SmallString<256> LibcxxShDir(SrcFile);
-    llvm::sys::path::append(LibcxxShDir, "libcxx", "include", "__sh");
-    if (llvm::sys::fs::is_directory(LibcxxShDir))
-      Clang->getHeaderSearchOpts().AddPath(
-          LibcxxShDir, frontend::ExternCSystem, /*IsFramework=*/false,
-          /*IgnoreSysRoot=*/true);
-    llvm::SmallString<256> LibcxxModDir(SrcFile);
-    llvm::sys::path::append(LibcxxModDir, "libcxx", "modules");
-    if (llvm::sys::fs::is_directory(LibcxxModDir))
-      Clang->getHeaderSearchOpts().AddPath(
-          LibcxxModDir, frontend::ExternCSystem, /*IsFramework=*/false,
-          /*IgnoreSysRoot=*/true);
+    auto tryAddLibcxxDirsFrom = [&](llvm::StringRef StartPath) -> bool {
+      if (StartPath.empty())
+        return false;
+      llvm::SmallString<256> Cur(StartPath);
+      llvm::sys::fs::make_absolute(Cur);
+      for (int Depth = 0; Depth < 8 && !Cur.empty(); ++Depth) {
+        llvm::SmallString<256> ShDir(Cur);
+        llvm::sys::path::append(ShDir, "libcxx", "include", "__sh");
+        if (llvm::sys::fs::is_directory(ShDir)) {
+          Clang->getHeaderSearchOpts().AddPath(
+              ShDir, frontend::ExternCSystem, /*IsFramework=*/false,
+              /*IgnoreSysRoot=*/true);
+          llvm::SmallString<256> ModDir(Cur);
+          llvm::sys::path::append(ModDir, "libcxx", "modules");
+          if (llvm::sys::fs::is_directory(ModDir))
+            Clang->getHeaderSearchOpts().AddPath(
+                ModDir, frontend::ExternCSystem, /*IsFramework=*/false,
+                /*IgnoreSysRoot=*/true);
+          return true;
+        }
+        llvm::StringRef Parent = llvm::sys::path::parent_path(Cur);
+        if (Parent == Cur || Parent.empty())
+          break;
+        Cur = Parent;
+      }
+      return false;
+    };
+    if (!tryAddLibcxxDirsFrom(Clang->getHeaderSearchOpts().ResourceDir))
+      if (Argv.empty() || !tryAddLibcxxDirsFrom(Argv[0]))
+        if (!tryAddLibcxxDirsFrom("."))
+          tryAddLibcxxDirsFrom(__FILE__);
   }
 
   Clang->createVirtualFileSystem();
