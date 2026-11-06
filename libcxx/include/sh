@@ -765,6 +765,12 @@ inline auto ls(Dir dir = ".", ls_opts opts = {}) {
   else
     return __cppsh_ls_view<fs_entry>(dir, opts);
 }
+// The type of what the REPL shows, over it (a range shown as a table): as
+// the value printer says the type of any other value.
+inline void __cppsh_type_line(const char *type) {
+  std::printf("\033[90m(%s)\033[0m\n", type);
+}
+
 // Whether an entry is a directory: by its kind, or the kind a variant holds.
 template <typename E>
 constexpr bool is_dir(const E &e) noexcept {

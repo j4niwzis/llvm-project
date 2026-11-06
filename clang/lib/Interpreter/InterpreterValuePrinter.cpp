@@ -585,8 +585,37 @@ llvm::Expected<Expr *> Interpreter::convertExprToValue(Expr *E) {
           if (ShowFn.isUsable()) {
             ExprResult ShowCall = S.ActOnCallExpr(
                 S.getCurScope(), ShowFn.get(), E->getBeginLoc(), {E}, E->getEndLoc());
-            if (ShowCall.isUsable())
-              return S.MaybeCreateExprWithCleanups(ShowCall.get());
+            if (ShowCall.isUsable()) {
+              // Its type over the table, as the value printer says the type
+              // of any other value: `__cppsh_type_line("ls_view<...>"),
+              // show(E)`.
+              Expr *Shown = ShowCall.get();
+              LookupResult TypeR(S, &Ctx.Idents.get("__cppsh_type_line"),
+                                 E->getBeginLoc(), Sema::LookupOrdinaryName);
+              S.LookupQualifiedName(TypeR, Ctx.getTranslationUnitDecl());
+              if (!TypeR.empty()) {
+                PrintingPolicy PP(Ctx.getLangOpts());
+                PP.SuppressScope = true;
+                std::string Name =
+                    E->getType().getNonReferenceType().getUnqualifiedType().getAsString(PP);
+                QualType StrTy = Ctx.getStringLiteralArrayType(Ctx.CharTy, Name.size());
+                Expr *Lit = StringLiteral::Create(Ctx, Name, StringLiteralKind::Ordinary,
+                                                  /*Pascal=*/false, StrTy, E->getBeginLoc());
+                CXXScopeSpec TypeCSS;
+                ExprResult TypeFn = S.BuildDeclarationNameExpr(TypeCSS, TypeR, /*ADL=*/false);
+                if (TypeFn.isUsable()) {
+                  ExprResult TypeCall = S.ActOnCallExpr(S.getCurScope(), TypeFn.get(),
+                                                        E->getBeginLoc(), {Lit}, E->getEndLoc());
+                  if (TypeCall.isUsable()) {
+                    ExprResult Both = S.CreateBuiltinBinOp(E->getBeginLoc(), BO_Comma,
+                                                           TypeCall.get(), Shown);
+                    if (Both.isUsable())
+                      Shown = Both.get();
+                  }
+                }
+              }
+              return S.MaybeCreateExprWithCleanups(Shown);
+            }
           }
         }
       }
