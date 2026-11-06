@@ -7435,12 +7435,9 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                 if (ArrInit.isUsable()) {
                   ArrVD->setInit(ArrInit.get());
                   ArrVD->setInitStyle(VarDecl::ListInit);
-                  SmallVector<PartialDiagnosticAt, 8> InitNotes;
-                  ArrVD->checkForConstantInitialization(InitNotes);
-                  if (EvaluatedStmt *ES = ArrVD->ensureEvaluatedStmt()) {
-                    ES->CheckedForConstantInitialization = true;
+                  (void)ArrVD->evaluateValue();
+                  if (EvaluatedStmt *ES = ArrVD->ensureEvaluatedStmt())
                     ES->HasConstantInitialization = true;
-                  }
                   Context.getTranslationUnitDecl()->getFirstDecl()->addDecl(
                       ArrVD);
                   MemPtrExpr =
