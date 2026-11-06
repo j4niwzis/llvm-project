@@ -263,8 +263,8 @@ CreateCI(const llvm::opt::ArgStringList &Argv) {
           HasBuildLibcxx = true;
         }
         llvm::SmallString<256> RuntimesCxxDir(Cur);
-        llvm::sys::path::append(RuntimesCxxDir, "runtimes", "runtimes-bins",
-                                "include", "c++", "v1");
+        llvm::sys::path::append(RuntimesCxxDir, "runtimes", "runtimes-bins");
+        llvm::sys::path::append(RuntimesCxxDir, "include", "c++", "v1");
         llvm::SmallString<256> RuntimesIostream(RuntimesCxxDir);
         llvm::sys::path::append(RuntimesIostream, "iostream");
         if (llvm::sys::fs::exists(RuntimesIostream)) {
