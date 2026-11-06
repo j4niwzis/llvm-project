@@ -2153,6 +2153,10 @@ Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
     }
     case tok::plusplus:    // postfix-expression: postfix-expression '++'
     case tok::minusminus:  // postfix-expression: postfix-expression '--'
+      if (getLangOpts().CPlusPlus && Tok.is(tok::minusminus) &&
+          Tok.hasLeadingSpace() && !NextToken().hasLeadingSpace() &&
+          NextToken().isOneOf(tok::identifier, tok::numeric_constant))
+        return LHS;
       if (!LHS.isInvalid()) {
         Expr *Arg = LHS.get();
         LHS = Actions.ActOnPostfixUnaryOp(getCurScope(), Tok.getLocation(),
