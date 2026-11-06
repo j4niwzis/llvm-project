@@ -37,6 +37,12 @@ export namespace std {
     using std::sh::__cppsh_frame;
     using std::sh::__cppsh_cut;
     using std::sh::__cppsh_ask;
+    using std::sh::__cppsh_background;
+    using std::sh::background;
+    using std::sh::bg;
+    using std::sh::fg;
+    using std::sh::job_entry;
+    using std::sh::jobs;
     using std::sh::__cppsh_value;
     using std::sh::command;
     using std::sh::pipeline;

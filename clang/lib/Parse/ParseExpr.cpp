@@ -505,6 +505,39 @@ Parser::ParseRHSOfBinaryExpression(ExprResult LHS, prec::Level MinPrec) {
     if (NextTokPrec < MinPrec)
       return LHS;
 
+    // cppsh: `sleep 10 &` -- a trailing `&`, in what the user typed: the
+    // whole expression before it started as a job in the background
+    // (std::sh::__cppsh_background). Left to the outermost level, which has
+    // the whole expression (`a | b &`: the pipeline, not `b`).
+    if (Tok.is(tok::amp) && PP.isIncrementalProcessingEnabled() &&
+        NextToken().isOneOf(tok::semi, tok::eof, tok::r_brace) &&
+        PP.getSourceManager()
+            .getBufferName(PP.getSourceManager().getFileLoc(Tok.getLocation()))
+            .starts_with("input_line_")) {
+      if (MinPrec > prec::Assignment)
+        return LHS;
+      SourceLocation AmpLoc = ConsumeToken();
+      if (LHS.isUsable())
+        if (NamespaceDecl *Std = Actions.getStdNamespace()) {
+          LookupResult ShR(Actions, &PP.getIdentifierTable().get("sh"), AmpLoc,
+                           Sema::LookupNamespaceName);
+          Actions.LookupQualifiedName(ShR, Std);
+          if (auto *Sh = ShR.getAsSingle<NamespaceDecl>()) {
+            LookupResult R(Actions, &PP.getIdentifierTable().get("__cppsh_background"),
+                           AmpLoc, Sema::LookupOrdinaryName);
+            Actions.LookupQualifiedName(R, Sh);
+            if (!R.empty()) {
+              CXXScopeSpec SS;
+              ExprResult Bg = Actions.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
+              Expr *Arg = LHS.get();
+              if (Bg.isUsable())
+                LHS = Actions.ActOnCallExpr(getCurScope(), Bg.get(), AmpLoc, Arg, AmpLoc);
+            }
+          }
+        }
+      return LHS;
+    }
+
     // Consume the operator, saving the operator token for error reporting.
     Token OpToken = Tok;
     ConsumeToken();

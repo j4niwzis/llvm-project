@@ -1061,7 +1061,99 @@ inline int __cppsh_wait(pid_t pid) {
   }
   return 1;
 }
+
+// Jobs: what runs in the background, or was stopped (Ctrl+Z) -- each its
+// process group, the processes of it not reaped yet, what was written.
+struct __cppsh_job {
+  int id = 0;
+  pid_t group = 0;
+  std::vector<pid_t> pids;
+  std::string text;
+  bool stopped = false;
+};
+inline std::vector<__cppsh_job> __cppsh_jobs;
+inline int __cppsh_add_job(pid_t group, std::vector<pid_t> pids, std::string text,
+                           bool stopped) {
+  int id = 1;
+  for (const __cppsh_job &j : __cppsh_jobs)
+    id = std::max(id, j.id + 1);
+  __cppsh_jobs.push_back({id, group, std::move(pids), std::move(text), stopped});
+  return id;
+}
+
+// The processes of a foreground job waited for: its status (the last
+// failing one's); stopped (Ctrl+Z), the job kept in the table, the rest of
+// its processes with it.
+inline int __cppsh_wait_job(const std::vector<pid_t> &pids, pid_t group,
+                            const std::string &text) {
+  int status = 0;
+  for (std::size_t i = 0; i < pids.size(); ++i) {
+    pid_t pid = pids[i];
+    if (pid <= 0) {
+      status = 127;
+      continue;
+    }
+    int st = 0;
+    bool lost = false;
+    while (::waitpid(pid, &st, WUNTRACED) < 0)
+      if (errno != EINTR) {
+        lost = true;
+        break;
+      }
+    if (lost) {
+      status = 127;
+      continue;
+    }
+    if (WIFSTOPPED(st)) {
+      int id = __cppsh_add_job(group, std::vector<pid_t>(pids.begin() + i, pids.end()),
+                               text, true);
+      std::fprintf(stderr, "\n[%d]+  Stopped                 %s\n", id, text.c_str());
+      return 128 + WSTOPSIG(st);
+    }
+    int s = WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : 1;
+    if (s != 0)
+      status = s;
+  }
+  return status;
+}
+
+// The jobs that changed: reaped where their processes ended (`Done`), stopped
+// or continued where a signal did that.
+inline void __cppsh_reap_jobs() {
+  for (__cppsh_job &j : __cppsh_jobs)
+    std::erase_if(j.pids, [&](pid_t p) {
+      int st = 0;
+      pid_t r = ::waitpid(p, &st, WNOHANG | WUNTRACED | WCONTINUED);
+      if (r == 0)
+        return false;
+      if (r < 0)
+        return true;
+      if (WIFSTOPPED(st)) {
+        j.stopped = true;
+        return false;
+      }
+      if (WIFCONTINUED(st)) {
+        j.stopped = false;
+        return false;
+      }
+      return true;
+    });
+  std::erase_if(__cppsh_jobs, [](const __cppsh_job &j) {
+    if (!j.pids.empty())
+      return false;
+    std::fprintf(stderr, "[%d]+  Done                    %s\n", j.id, j.text.c_str());
+    return true;
+  });
+}
 #endif
+
+// A job as `jobs` lists it.
+struct job_entry {
+  int id = 0;
+  std::string state;
+  long long pgid = 0;
+  std::string command;
+};
 
 struct command {
   std::vector<std::string> argv;
@@ -1248,7 +1340,7 @@ command &&operator|(Rng &&rng, command &&c) {
 // Each stage spawned, the pipes between them, the first's stdin fed where
 // a range was piped in, the last's stdout read where it is captured.
 inline std::pair<int, std::string> __cppsh_run_stages(std::vector<command *> stages,
-                                                      bool capture) {
+                                                      bool capture, bool background = false) {
   std::vector<int> all_fds;
   std::vector<std::pair<int, int>> pipes;
   for (std::size_t i = 0; i + 1 < stages.size(); ++i) {
@@ -1317,6 +1409,24 @@ inline std::pair<int, std::string> __cppsh_run_stages(std::vector<command *> sta
       ::close(fd);
     });
   }
+  // What was written, for the job table: argv, ` | ` between stages.
+  std::string text;
+  for (command *c : stages) {
+    if (!text.empty())
+      text += " | ";
+    for (std::size_t w = 0; w < c->argv.size(); ++w)
+      text += (w ? " " : "") + c->argv[w];
+  }
+  if (background) {
+    // Started, not waited for: a job, reaped as `jobs` (or the next one)
+    // looks; the terminal stays the shell's.
+    if (feeder.joinable())
+      feeder.detach();
+    int id = __cppsh_add_job(group, pids, text, false);
+    std::fprintf(stderr, "[%d] %d\n", id, static_cast<int>(group));
+    last_status = 0;
+    return {0, {}};
+  }
   std::string got;
   int status = 0;
   {
@@ -1331,11 +1441,7 @@ inline std::pair<int, std::string> __cppsh_run_stages(std::vector<command *> sta
           got.append(buf, static_cast<std::size_t>(n));
       ::close(take[0]);
     }
-    for (pid_t pid : pids) {
-      int s = __cppsh_wait(pid);
-      if (s != 0)
-        status = s;
-    }
+    status = __cppsh_wait_job(pids, group, text);
   }
   if (feeder.joinable())
     feeder.join();
@@ -1361,6 +1467,88 @@ inline std::pair<int, std::string> pipeline::run_all(bool capture) {
   if (all.empty())
     return {0, {}};
   return __cppsh_run_stages(std::move(all), capture);
+}
+
+// `sleep 10 &` (the compiler turns a trailing `&` into this), `cmd |
+// background`: started as a job, not waited for.
+inline void __cppsh_background(command &&c) {
+  if (c.done)
+    return;
+  c.done = true;
+  __cppsh_run_stages({&c}, false, true);
+}
+inline void __cppsh_background(command &c) { __cppsh_background(std::move(c)); }
+inline void __cppsh_background(pipeline &&p) {
+  if (p.done)
+    return;
+  p.done = true;
+  std::vector<command *> all;
+  for (command &c : p.stages)
+    all.push_back(&c);
+  if (!all.empty())
+    __cppsh_run_stages(std::move(all), false, true);
+}
+inline void __cppsh_background(pipeline &p) { __cppsh_background(std::move(p)); }
+struct __cppsh_background_t {};
+inline constexpr __cppsh_background_t background{};
+inline void operator|(command &&c, __cppsh_background_t) { __cppsh_background(std::move(c)); }
+inline void operator|(pipeline &&p, __cppsh_background_t) { __cppsh_background(std::move(p)); }
+
+// The jobs: running or stopped, each its id, process group, command.
+inline std::vector<job_entry> jobs() {
+  __cppsh_reap_jobs();
+  std::vector<job_entry> out;
+  for (const __cppsh_job &j : __cppsh_jobs)
+    out.push_back({j.id, j.stopped ? "stopped" : "running",
+                   static_cast<long long>(j.group), j.text});
+  return out;
+}
+
+// The job of an id -- the last one where none is given.
+inline __cppsh_job *__cppsh_job_of(int id) {
+  __cppsh_reap_jobs();
+  if (__cppsh_jobs.empty())
+    return nullptr;
+  if (id <= 0)
+    return &__cppsh_jobs.back();
+  for (__cppsh_job &j : __cppsh_jobs)
+    if (j.id == id)
+      return &j;
+  return nullptr;
+}
+
+// A job brought to the foreground: continued where stopped, the terminal
+// its group's, waited for; its status.
+inline int fg(int id = 0) {
+  __cppsh_job *j = __cppsh_job_of(id);
+  if (!j) {
+    std::fprintf(stderr, "cppsh: fg: no such job\n");
+    return last_status = 1;
+  }
+  __cppsh_job job = *j;
+  std::erase_if(__cppsh_jobs, [&](const __cppsh_job &x) { return x.id == job.id; });
+  std::fprintf(stderr, "%s\n", job.text.c_str());
+  int status;
+  {
+    __cppsh_foreground fore(job.group);
+    if (job.stopped)
+      ::kill(-job.group, SIGCONT);
+    status = __cppsh_wait_job(job.pids, job.group, job.text);
+  }
+  return last_status = status;
+}
+
+// A stopped job continued in the background.
+inline int bg(int id = 0) {
+  __cppsh_job *j = __cppsh_job_of(id);
+  if (!j) {
+    std::fprintf(stderr, "cppsh: bg: no such job\n");
+    return last_status = 1;
+  }
+  ::kill(-j->group, SIGCONT);
+  j->stopped = false;
+  std::fprintf(stderr, "[%d]+ %s &\n", j->id, j->text.c_str());
+  return last_status = 0;
 }
 
 // Lines streamed: the command spawned as iteration begins, read a line at a
