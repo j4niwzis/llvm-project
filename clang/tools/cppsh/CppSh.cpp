@@ -418,7 +418,60 @@ static llvm::Error runFileOrCode(clang::Interpreter &Interp,
     size_t NL = Content.find('\n');
     Content = (NL == llvm::StringRef::npos) ? "" : Content.drop_front(NL + 1);
   }
-  return runStatements(Interp, Content);
+  // A line at a time, as typed at the prompt: a line ends an input where its
+  // brackets are balanced (outside strings and comments) and it does not end
+  // with a backslash -- `k()` on a line of its own is a statement, not the
+  // start of one going on into the next line. Each input run on its own: an
+  // error in one does not take the next with it.
+  llvm::Error Errs = llvm::Error::success();
+  std::string Chunk;
+  int Depth = 0;
+  bool InBlockComment = false;
+  while (!Content.empty()) {
+    auto [Line, Rest] = Content.split('\n');
+    Content = Rest;
+    for (size_t I = 0; I < Line.size(); ++I) {
+      char C = Line[I];
+      if (InBlockComment) {
+        if (C == '*' && I + 1 < Line.size() && Line[I + 1] == '/') {
+          InBlockComment = false;
+          ++I;
+        }
+        continue;
+      }
+      if (C == '/' && I + 1 < Line.size() && Line[I + 1] == '/')
+        break;
+      if (C == '/' && I + 1 < Line.size() && Line[I + 1] == '*') {
+        InBlockComment = true;
+        ++I;
+        continue;
+      }
+      if (C == '"' || (C == '\'' && !(I > 0 && std::isalnum(static_cast<unsigned char>(Line[I - 1]))))) {
+        for (++I; I < Line.size() && Line[I] != C; ++I)
+          if (Line[I] == '\\')
+            ++I;
+        continue;
+      }
+      if (C == '(' || C == '[' || C == '{')
+        ++Depth;
+      else if ((C == ')' || C == ']' || C == '}') && Depth > 0)
+        --Depth;
+    }
+    llvm::StringRef Trim = Line.rtrim();
+    bool Continued = Trim.ends_with("\\");
+    Chunk += Continued ? Trim.drop_back().str() : Line.str();
+    Chunk += '\n';
+    if (Depth > 0 || InBlockComment || Continued)
+      continue;
+    if (!llvm::StringRef(Chunk).trim().empty())
+      if (llvm::Error E = runStatements(Interp, Chunk))
+        Errs = llvm::joinErrors(std::move(Errs), std::move(E));
+    Chunk.clear();
+  }
+  if (!llvm::StringRef(Chunk).trim().empty())
+    if (llvm::Error E = runStatements(Interp, Chunk))
+      Errs = llvm::joinErrors(std::move(Errs), std::move(E));
+  return Errs;
 }
 
 static void LLVMErrorHandler(void *UserData, const char *Message,

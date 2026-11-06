@@ -1456,13 +1456,18 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
             "\n}\n";
   } else {
     // Made in a loop: the iteration finished with the values it has, as
-    // constants; the loop run on (__cppsh_loopK) with them by reference --
-    // never constants, as the next iteration changes them; its need cut again.
+    // constants; the loop run on (__cppsh_loopK, a plain function) with them
+    // -- never constants there, as the next iteration changes them; its need
+    // cut again.
     std::string RefParams, RefArgs;
     for (unsigned I = 0; I < N && I < Names.size(); ++I) {
-      RefParams += std::string(RefParams.empty() ? "" : ", ") + Tys[I] + " &" + Names[I];
-      RefArgs += std::string(RefArgs.empty() ? "" : ", ") + "const_cast<" + Tys[I] +
-                 " &>(" + Names[I] + ")";
+      // By value: a function, not a template -- no value specialization of
+      // its parameters (the next iteration changes them); the continuation
+      // locals, values it was specialized on, are copied (moved, with no copy).
+      bool Move = llvm::StringRef(Types[I]).starts_with("&&");
+      RefParams += std::string(RefParams.empty() ? "" : ", ") + Tys[I] + " " + Names[I];
+      RefArgs += std::string(RefArgs.empty() ? "" : ", ") +
+                 (Move ? "static_cast<" + Tys[I] + " &&>(" + Names[I] + ")" : Names[I]);
     }
     // The flag a `break` of the iteration sets: the loop not run on.
     std::string Flag = "__cppsh_brk" + std::to_string(Id);
