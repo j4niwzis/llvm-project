@@ -2081,6 +2081,14 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
         for (const VarDecl *VD : CppshStagedWanted)
           llvm::errs() << " " << VD->getName();
         llvm::errs() << "\n";
+        // The body it instantiated, as it stands (an outer staged
+        // statement's instantiation made it, where it is nested).
+        if (::getenv("CPPSH_TRACE_STAGING_BODY")) {
+          llvm::errs() << "cppsh-trace: its body: ";
+          SS->getBody()->printPretty(llvm::errs(), nullptr,
+                                     PrintingPolicy(Ctx.getLangOpts()));
+          llvm::errs() << "\n";
+        }
       }
       if (F) {
         Interp.cppshAddBuilt(F);
