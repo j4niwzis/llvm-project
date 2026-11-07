@@ -105,6 +105,11 @@ OrcIncrementalExecutor::getSymbolAddress(llvm::StringRef Name,
   return SymOrErr->getAddress();
 }
 
+llvm::Error
+OrcIncrementalExecutor::addObjectFile(std::unique_ptr<llvm::MemoryBuffer> Obj) {
+  return Jit->addObjectFile(std::move(Obj));
+}
+
 llvm::Error OrcIncrementalExecutor::LoadDynamicLibrary(const char *name) {
   // FIXME: Eventually we should put each library in its own JITDylib and
   //        turn off process symbols by default.

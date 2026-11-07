@@ -64,6 +64,7 @@ public:
   getSymbolAddress(llvm::StringRef Name,
                    SymbolNameKind NameKind) const override;
   llvm::Error LoadDynamicLibrary(const char *name) override;
+  llvm::Error addObjectFile(std::unique_ptr<llvm::MemoryBuffer> Obj) override;
 };
 
 } // end namespace clang

@@ -13,6 +13,7 @@
 #ifndef LLVM_CLANG_LIB_INTERPRETER_INCREMENTALEXECUTOR_H
 #define LLVM_CLANG_LIB_INTERPRETER_INCREMENTALEXECUTOR_H
 
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Error.h"
 
 #include <memory>
@@ -91,6 +92,13 @@ public:
   virtual llvm::Expected<llvm::orc::ExecutorAddr>
   getSymbolAddress(llvm::StringRef Name, SymbolNameKind NameKind) const = 0;
   virtual llvm::Error LoadDynamicLibrary(const char *name) = 0;
+  /// An object file added as it is -- code compiled by an earlier process
+  /// (cppsh: the std.sh warm-up's), linked to by later inputs. Not every
+  /// executor can.
+  virtual llvm::Error addObjectFile(std::unique_ptr<llvm::MemoryBuffer> Obj) {
+    return llvm::make_error<llvm::StringError>("object files are not supported here",
+                                               llvm::inconvertibleErrorCode());
+  }
 };
 
 } // namespace clang

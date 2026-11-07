@@ -166,6 +166,17 @@ public:
   CompilerInstance *getCompilerInstance();
   llvm::Expected<IncrementalExecutor &> getExecutionEngine();
 
+  /// cppsh: code compiled and run as any input is -- its module compiled to
+  /// an object file too, returned with the external symbols it defines, for
+  /// a later process to load instead of compiling it again.
+  llvm::Expected<std::pair<std::string, std::vector<std::string>>>
+  compileKeepingObject(llvm::StringRef Code);
+  /// cppsh: an object compileKeepingObject made, added to the JIT; the
+  /// symbols it defines known to code generation -- referenced by later
+  /// inputs, never emitted again.
+  llvm::Error loadCompiledObject(llvm::StringRef Object,
+                                 llvm::ArrayRef<std::string> Defines);
+
   llvm::Expected<PartialTranslationUnit &> Parse(llvm::StringRef Code);
   llvm::Error Execute(PartialTranslationUnit &T);
   llvm::Error ParseAndExecute(llvm::StringRef Code, Value *V = nullptr);

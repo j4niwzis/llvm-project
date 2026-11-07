@@ -171,6 +171,11 @@ namespace {
       });
     }
 
+    void MarkIncrementalExported(llvm::StringRef MangledName) {
+      if (Builder)
+        Builder->markIncrementalExported(MangledName);
+    }
+
     void Initialize(ASTContext &Context) override {
       Ctx = &Context;
 
@@ -426,6 +431,10 @@ llvm::Constant *CodeGenerator::GetAddrOfVTable(BaseSubobject base,
 llvm::Module *CodeGenerator::StartModule(llvm::StringRef ModuleName,
                                          llvm::LLVMContext &C) {
   return static_cast<CodeGeneratorImpl*>(this)->StartModule(ModuleName, C);
+}
+
+void CodeGenerator::MarkIncrementalExported(llvm::StringRef MangledName) {
+  static_cast<CodeGeneratorImpl *>(this)->MarkIncrementalExported(MangledName);
 }
 
 void CodeGenerator::DiscardIncrementalUnit(const TranslationUnitDecl *TU,

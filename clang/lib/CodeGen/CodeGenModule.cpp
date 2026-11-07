@@ -5039,7 +5039,8 @@ void CodeGenModule::EmitGlobal(GlobalDecl GD) {
     // Otherwise, remember that we saw a deferred decl with this name.  The
     // first use of the mangled name will cause it to move into
     // DeferredDeclsToEmit.
-    DeferredDecls[MangledName] = GD;
+    if (!IncrementalExported.contains(MangledName))
+      DeferredDecls[MangledName] = GD;
   }
 }
 
@@ -6432,7 +6433,8 @@ void CodeGenModule::EmitTentativeDefinition(const VarDecl *D) {
   // If we have not seen a reference to this variable yet, place it into the
   // deferred declarations table to be emitted if needed later.
   if (!MustBeEmitted(D) && !GV) {
-      DeferredDecls[MangledName] = D;
+      if (!IncrementalExported.contains(MangledName))
+        DeferredDecls[MangledName] = D;
       return;
   }
 

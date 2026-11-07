@@ -121,6 +121,10 @@ public:
   /// the module being built is thrown away and a new one started, what was
   /// to be emitted in it put back to be emitted where it is used again.
   void DiscardIncrementalUnit(const TranslationUnitDecl *TU, bool ThrowModuleAway);
+
+  /// In interactive processing, a symbol already defined for the JIT (an
+  /// object file loaded): referenced by later modules, never emitted again.
+  void MarkIncrementalExported(llvm::StringRef MangledName);
 };
 
 /// CreateLLVMCodeGen - Create a CodeGenerator instance.

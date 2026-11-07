@@ -48,6 +48,10 @@
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ModuleCache.h"
 #include "clang/Serialization/ObjectFilePCHContainerReader.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
@@ -1927,6 +1931,68 @@ llvm::Error Interpreter::Undo(unsigned N) {
     IncrParser->CleanUpPTU(PTUs.back().TUPart);
     PTUs.pop_back();
   }
+  return llvm::Error::success();
+}
+
+llvm::Expected<std::pair<std::string, std::vector<std::string>>>
+Interpreter::compileKeepingObject(llvm::StringRef Code) {
+  auto PTU = Parse(Code);
+  if (!PTU)
+    return PTU.takeError();
+  std::string Object;
+  std::vector<std::string> Defines;
+  if (PTU->TheModule) {
+    llvm::Error EmitErr = llvm::Error::success();
+    TSCtx->withContextDo([&](llvm::LLVMContext *) {
+      std::unique_ptr<llvm::Module> Copy = llvm::CloneModule(*PTU->TheModule);
+      for (llvm::GlobalValue &GV : Copy->global_values())
+        if (!GV.isDeclaration() && GV.hasExternalLinkage() && GV.hasName())
+          Defines.push_back(GV.getName().str());
+      // As the JIT compiles: the host, the -O0 backend; position-independent,
+      // for JITLink to place it anywhere.
+      auto JTMB = llvm::orc::JITTargetMachineBuilder::detectHost();
+      if (!JTMB) {
+        EmitErr = JTMB.takeError();
+        return;
+      }
+      JTMB->setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
+      JTMB->setRelocationModel(llvm::Reloc::PIC_);
+      auto TM = JTMB->createTargetMachine();
+      if (!TM) {
+        EmitErr = TM.takeError();
+        return;
+      }
+      Copy->setDataLayout((*TM)->createDataLayout());
+      llvm::SmallVector<char, 0> Buffer;
+      llvm::raw_svector_ostream OS(Buffer);
+      llvm::legacy::PassManager PM;
+      if ((*TM)->addPassesToEmitFile(PM, OS, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+        EmitErr = llvm::make_error<llvm::StringError>("cannot emit an object file",
+                                                      llvm::inconvertibleErrorCode());
+        return;
+      }
+      PM.run(*Copy);
+      Object.assign(Buffer.begin(), Buffer.end());
+    });
+    if (EmitErr)
+      return std::move(EmitErr);
+    if (llvm::Error Err = Execute(*PTU))
+      return std::move(Err);
+  }
+  return std::make_pair(std::move(Object), std::move(Defines));
+}
+
+llvm::Error Interpreter::loadCompiledObject(llvm::StringRef Object,
+                                            llvm::ArrayRef<std::string> Defines) {
+  auto EE = getExecutionEngine();
+  if (!EE)
+    return EE.takeError();
+  if (llvm::Error Err =
+          EE->addObjectFile(llvm::MemoryBuffer::getMemBufferCopy(Object, "cppsh-warm.o")))
+    return Err;
+  if (CodeGenerator *CG = Act->getCodeGen())
+    for (const std::string &Name : Defines)
+      CG->MarkIncrementalExported(Name);
   return llvm::Error::success();
 }
 

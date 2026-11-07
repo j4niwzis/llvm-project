@@ -2360,6 +2360,12 @@ CompilerInstance::loadModule(SourceLocation ImportLoc,
   return ModuleLoadResult(Module);
 }
 
+namespace clang {
+// cppsh: the std.sh module file in use (its disk cache): what was compiled
+// once beside it -- the warm-up's object -- has its name.
+std::string CppshStdShPcmPath;
+} // namespace clang
+
 void CompilerInstance::createModuleFromSource(SourceLocation ImportLoc,
                                               StringRef ModuleName,
                                               StringRef Source) {
@@ -2408,6 +2414,8 @@ void CompilerInstance::createModuleFromSource(SourceLocation ImportLoc,
     llvm::sys::path::append(CachedPcmPath,
                             (CleanModuleName + "_" + HashStr + ".pcm").str());
     DeleteBuiltModules = false;
+    if (ModuleName == "std.sh")
+      CppshStdShPcmPath = std::string(CachedPcmPath.str());
     if (llvm::sys::fs::exists(CachedPcmPath) &&
         llvm::sys::fs::exists(CachedMapPath)) {
       BuiltModules[std::string(ModuleName)] = std::string(CachedPcmPath.str());
@@ -2483,14 +2491,14 @@ void CompilerInstance::createModuleFromSource(SourceLocation ImportLoc,
         for (llvm::sys::fs::directory_iterator It(CacheDir, DirEC), End;
              It != End && !DirEC; It.increment(DirEC)) {
           StringRef Name = llvm::sys::path::filename(It->path());
-          if (!Name.starts_with(Prefix) ||
-              !(Name.ends_with(".pcm") || Name.ends_with(".map")))
+          if (!Name.starts_with(Prefix))
             continue;
-          // Not this one, nor a longer module name sharing the prefix
-          // (std_ for std_sh_): the rest is the hash alone.
-          StringRef Hash = Name.drop_front(Prefix.size()).drop_back(4);
-          if (Hash.contains('_') || It->path() == CachedPcmPath.str() ||
-              It->path() == CachedMapPath.str())
+          // The module, its map, what was compiled beside it (.pcm.warm.o):
+          // not this one's (its hash), nor a longer module name sharing the
+          // prefix (std_ for std_sh_).
+          StringRef Hash = Name.drop_front(Prefix.size()).take_until([](char C) { return C == '.'; });
+          StringRef Current = llvm::sys::path::stem(CachedPcmPath).drop_front(Prefix.size());
+          if (Hash.contains('_') || Hash == Current)
             continue;
           llvm::sys::fs::remove(It->path());
         }

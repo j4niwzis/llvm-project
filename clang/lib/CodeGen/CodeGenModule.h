@@ -1899,6 +1899,13 @@ public:
   /// mangled names free for what is parsed again in their place.
   void forgetIncrementalUnit(const TranslationUnitDecl *TU);
 
+  /// In incremental compilation, a symbol defined for the JIT elsewhere (an
+  /// object file loaded): never deferred, never emitted.
+  void markIncrementalExported(llvm::StringRef MangledName) {
+    IncrementalExported.insert(MangledName);
+    DeferredDecls.erase(MangledName);
+  }
+
   /// Emit the IR encoding to attach the CUDA launch bounds attribute to \p F.
   /// If \p MaxThreadsVal is not nullptr, the max threads value is stored in it,
   /// if a valid one was found.

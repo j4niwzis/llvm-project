@@ -209,6 +209,7 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
 }
 
 namespace clang {
+extern std::string CppshStdShPcmPath;
 extern void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef);
 extern unsigned CppshProbes;
 extern unsigned long long CppshParseNs, CppshExecuteNs;
@@ -1657,6 +1658,48 @@ int main(int argc, const char **argv) {
     if (auto Err = Interp->ParseAndExecute(CppShRuntimePrelude)) {
       llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
       HasError = true;
+    }
+  }
+  // The warm-up of std.sh (std::sh::__cppsh_warm::__uses: println of the
+  // common values, each kind of listing shown, the snapshots) compiled once,
+  // into an object beside the module file: loaded by every later process --
+  // a link, not a compile -- and its symbols known to code generation, never
+  // emitted again. Made where it is not there yet.
+  if (!NoStdSh && !clang::CppshStdShPcmPath.empty() && !HasError) {
+    Phase.emplace("warm-up object");
+    std::string ObjectPath = clang::CppshStdShPcmPath + ".warm.o";
+    std::string SymbolsPath = clang::CppshStdShPcmPath + ".warm.syms";
+    auto Object = llvm::MemoryBuffer::getFile(ObjectPath);
+    auto Symbols = llvm::MemoryBuffer::getFile(SymbolsPath);
+    if (Object && Symbols) {
+      std::vector<std::string> Defines;
+      llvm::SmallVector<llvm::StringRef, 256> Lines;
+      (*Symbols)->getBuffer().split(Lines, '\n', -1, /*KeepEmpty=*/false);
+      for (llvm::StringRef L : Lines)
+        Defines.push_back(L.str());
+      if (llvm::Error Err = Interp->loadCompiledObject((*Object)->getBuffer(), Defines))
+        llvm::consumeError(std::move(Err));
+    } else if (auto Made = Interp->compileKeepingObject(
+                   "auto *__cppsh_warm_ref = &std::sh::__cppsh_warm::__uses;")) {
+      // Written aside and renamed: another process reads it whole or not at all.
+      auto WriteAtomically = [](const std::string &Path, llvm::StringRef Data) {
+        std::string Tmp = Path + ".tmp" + std::to_string(llvm::sys::Process::getProcessId());
+        std::error_code EC;
+        {
+          llvm::raw_fd_ostream OS(Tmp, EC, llvm::sys::fs::OF_None);
+          if (EC)
+            return false;
+          OS << Data;
+        }
+        return !llvm::sys::fs::rename(Tmp, Path);
+      };
+      std::string SymbolList;
+      for (const std::string &S : Made->second)
+        SymbolList += S + "\n";
+      if (!Made->first.empty() && WriteAtomically(SymbolsPath, SymbolList))
+        WriteAtomically(ObjectPath, Made->first);
+    } else {
+      llvm::consumeError(Made.takeError());
     }
   }
   Phase.reset();
