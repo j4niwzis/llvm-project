@@ -320,6 +320,12 @@ StmtResult Sema::ActOnCppshStagedReturn(CppshStagedScope &Info,
   // The rest of a staged function's body: what it returns is kept for the
   // function's caller, of its own type -- not the function's.
   if (Info.KeepsResult) {
+    if (Value && Value->hasPlaceholderType()) {
+      ExprResult R = CheckPlaceholderExpr(Value);
+      if (!R.isUsable())
+        return StmtError();
+      Value = R.get();
+    }
     if (Value) {
       ExprResult R = ActOnFinishFullExpr(Value, Loc, /*DiscardedValue=*/false);
       if (R.isInvalid())
@@ -349,6 +355,14 @@ StmtResult Sema::ActOnCppshStagedReturn(CppshStagedScope &Info,
 StmtResult Sema::BuildCppshStagedExit(unsigned K, SourceLocation Loc,
                                       Expr *Value, unsigned Target) {
   auto Kind = static_cast<CppshStagedExitStmt::ExitKind>(K);
+  // A value of a placeholder type (an overload set: the shell's `return ls;`,
+  // a command named alone) made a value first, as a return's is.
+  if (Value && Value->hasPlaceholderType()) {
+    ExprResult R = CheckPlaceholderExpr(Value);
+    if (!R.isUsable())
+      return StmtError();
+    Value = R.get();
+  }
   // Still in a staged statement's body (an enclosing template's
   // instantiation; a nested statement's, as the one around it is
   // instantiated): leaving that one.
