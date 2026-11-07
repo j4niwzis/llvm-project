@@ -144,6 +144,9 @@ static std::string buildBashPrompt(bool LastFailed) {
 // calls rebuilds them as they are now. Plain data needs none: it is read
 // from memory. Names after `.` or `->` are members, not variables; string
 // and character literals are skipped.
+// How many snapshot compiles snapshotNamed made (CPPSH_TIME).
+static unsigned CppshSnapshotCompiles = 0;
+
 static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
   clang::Sema &S = Interp.getCompilerInstance()->getSema();
   clang::ASTContext &Ctx = S.getASTContext();
@@ -210,7 +213,6 @@ static bool cppshTiming() {
   static const bool On = std::getenv("CPPSH_TIME") != nullptr;
   return On;
 }
-static unsigned CppshSnapshotCompiles = 0;
 struct CppshPhase {
   const char *What;
   std::string Detail;
