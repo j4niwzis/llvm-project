@@ -40,6 +40,8 @@
 using namespace clang;
 
 namespace clang {
+extern llvm::DenseMap<const VarDecl *, const Expr *> CppshParamRebuild;
+extern llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
 } // namespace clang
 
 static bool isDeclWithinFunction(const Decl *D) {
