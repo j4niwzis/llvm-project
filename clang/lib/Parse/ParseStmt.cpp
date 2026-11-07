@@ -1832,10 +1832,22 @@ void Parser::ParseCppshRegionStatements(StmtVector &Stmts, unsigned Begin,
     CppshCutNeeded = false;
     CppshCutNeedExprs.clear();
     CppshCutStagedCalls.clear();
-    StmtResult R = ParseStatementOrDeclaration(Stmts, ParsedStmtContext::Compound);
+    const CppshPending Pending = CppshPendingNow();
+    StmtResult R;
+    // The last statement of an input, its `;` not written (its value shown at
+    // the top level): an expression statement all the same.
+    if (std::optional<unsigned> At = cppshTokenIndex(StmtBegin);
+        At && CppshEndsWithoutSemi(*At, End)) {
+      ExprResult E = ParseExpression();
+      R = E.isUsable() ? Actions.ActOnExprStmt(E, /*DiscardedValue=*/true)
+                       : StmtError();
+    } else {
+      R = ParseStatementOrDeclaration(Stmts, ParsedStmtContext::Compound);
+    }
     cppshEndNeedDiagnostics(Actions);
     if (CppshCutNeeded) {
       CppshCutNeeded = false;
+      CppshDropPendingSince(Pending);
       if (CppshEmitRegion(Stmts, R, StmtBegin))
         continue;
       CppshRegionError(StmtBegin);
@@ -1870,6 +1882,32 @@ void Parser::CppshRewind(unsigned Begin, unsigned End) {
   PP.EnterTokenStream(std::move(Buf), Toks.size() + 1,
                       /*DisableMacroExpansion=*/true, /*IsReinject=*/true);
   ConsumeAnyToken(/*ConsumeCodeCompletionTok=*/true);
+}
+
+Parser::CppshPending Parser::CppshPendingNow() {
+  return {Actions.PendingInstantiations.size(),
+          Actions.PendingLocalImplicitInstantiations.size()};
+}
+
+void Parser::CppshDropPendingSince(const CppshPending &Since) {
+  if (Actions.PendingInstantiations.size() > Since.Global)
+    Actions.PendingInstantiations.resize(Since.Global);
+  if (Actions.PendingLocalImplicitInstantiations.size() > Since.Local)
+    Actions.PendingLocalImplicitInstantiations.resize(Since.Local);
+}
+
+bool Parser::CppshEndsWithoutSemi(unsigned From, unsigned End) {
+  int Depth = 0;
+  for (unsigned I = From; I < End && I < CppshInputTokens.size(); ++I) {
+    const Token &T = CppshInputTokens[I];
+    if (Depth == 0 && T.isOneOf(tok::semi, tok::l_brace))
+      return false;
+    if (T.isOneOf(tok::l_paren, tok::l_square, tok::l_brace))
+      ++Depth;
+    else if (T.isOneOf(tok::r_paren, tok::r_square, tok::r_brace))
+      --Depth;
+  }
+  return From < End;
 }
 
 void Parser::CppshRegionError(SourceLocation Loc) {
@@ -1970,6 +2008,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
 
     StmtResult R;
     SourceLocation CppshStmtBegin = Tok.getLocation();
+    const CppshPending CppshPendingBefore = CppshPendingNow();
     if (CppshCuts) {
       CppshCutNeeded = false;
       CppshCutNeedExprs.clear();
@@ -2026,6 +2065,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
       cppshEndNeedDiagnostics(Actions);
     if (CppshCuts && CppshCutNeeded) {
       CppshCutNeeded = false;
+      CppshDropPendingSince(CppshPendingBefore);
       if (CppshEmitRegion(Stmts, R, CppshStmtBegin, CppshBody)) {
         LastIsError = false;
         continue;

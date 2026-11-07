@@ -5948,10 +5948,12 @@ Parser::DeclGroupPtrTy Parser::ParseTopLevelStmtDecl() {
   CppshCutNeeded = false;
   CppshCutNeedExprs.clear();
   CppshCutStagedCalls.clear();
+  const CppshPending CppshPendingBefore = CppshPendingNow();
   StmtResult R = ParseStatementOrDeclaration(Stmts, SubStmtCtx);
   cppshEndNeedDiagnostics(Actions);
   if (CppshCutNeeded) {
     CppshCutNeeded = false;
+    CppshDropPendingSince(CppshPendingBefore);
     StmtVector Region;
     if (CppshEmitRegion(Region, R, CppshStmtBegin) && Region.size() == 1)
       R = Region.front();

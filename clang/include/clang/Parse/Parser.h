@@ -8746,14 +8746,20 @@ private:
   void ParseCppshRegionStatements(StmtVector &Stmts, unsigned Begin,
                                   unsigned End);
   void CppshRegionError(SourceLocation Loc);
+  /// cppsh: the instantiations Sema has pending, as a statement begins --
+  /// those its first parse added dropped where it becomes a staged region
+  /// (that parse is not kept).
+  struct CppshPending {
+    size_t Global = 0, Local = 0;
+  };
+  CppshPending CppshPendingNow();
+  void CppshDropPendingSince(const CppshPending &Since);
+  /// cppsh: whether the recorded tokens [From, End) hold no `;` nor `{` of
+  /// their own: an expression statement without its `;` (the last of an
+  /// input, its value shown).
+  bool CppshEndsWithoutSemi(unsigned From, unsigned End);
 public:
   // cppsh: used by the interpreter (Interpreter::cppshStageDecl).
-  /// cppsh: what supplies an expression at a location as it is parsed: in a
-  /// region, a run-time template argument or a staged call of its first
-  /// statement (its parameter); in a top-level declaration parsed again, a
-  /// staged call's result, a run-time template argument's value
-  /// (Interpreter::cppshStageDecl).
-  llvm::DenseMap<SourceLocation::UIntTy, Expr *> CppshSuppliedExprs;
   /// cppsh: an expression parsed from the recorded tokens [Begin, End).
   ExprResult CppshParseTokens(unsigned Begin, unsigned End);
   /// cppsh: the recorded tokens [Begin, End) parsed again, before the

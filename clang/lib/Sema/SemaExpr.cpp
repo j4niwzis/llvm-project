@@ -109,6 +109,8 @@ SourceLocation CppshStageAt;
 // instantiated with the values as the function runs (Parser::
 // CppshEmitRegion).
 bool CppshCutNeeded = false;
+llvm::DenseMap<SourceLocation::UIntTy, Expr *> CppshSuppliedExprs;
+
 // Whether the diagnostics of the statement a need was met in are being held
 // back, and whether they were before.
 static bool CppshNeedHolding = false;

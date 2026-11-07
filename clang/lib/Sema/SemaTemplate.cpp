@@ -33,6 +33,7 @@
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Initialization.h"
+#include "clang/Sema/CppshStaging.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Overload.h"
 #include "clang/Sema/ParsedTemplate.h"
@@ -5451,8 +5452,19 @@ static bool SubstDefaultTemplateArgument(
   Sema::ContextRAII SavedContext(SemaRef, Template->getDeclContext());
   EnterExpressionEvaluationContext ConstantEvaluated(
       SemaRef, Sema::ExpressionEvaluationContext::ConstantEvaluated);
-  return SemaRef.SubstTemplateArgument(Param->getDefaultArgument(),
-                                       TemplateArgLists, Output);
+  if (SemaRef.SubstTemplateArgument(Param->getDefaultArgument(),
+                                    TemplateArgLists, Output))
+    return true;
+  // cppsh: a default read at run time, supplied where it is used -- a staged
+  // region's parameter for it, or its value (CppshSuppliedExprs).
+  if (!CppshSuppliedExprs.empty() &&
+      Output.getArgument().getKind() == TemplateArgument::Expression)
+    if (Expr *Default = Output.getSourceExpression())
+      if (Expr *Supplied =
+              CppshSuppliedExprs.lookup(Default->getBeginLoc().getRawEncoding()))
+        Output = TemplateArgumentLoc(
+            TemplateArgument(Supplied, /*IsCanonical=*/false), Supplied);
+  return false;
 }
 
 /// Substitute template arguments into the default template argument for

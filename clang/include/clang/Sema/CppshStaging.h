@@ -17,6 +17,7 @@
 
 #include "clang/AST/Type.h"
 #include "clang/Lex/Token.h"
+#include "llvm/ADT/DenseMap.h"
 #include <optional>
 #include <vector>
 
@@ -62,6 +63,13 @@ bool cppshIsRegion(const FunctionDecl *FD);
 /// (a need, met as the body is parsed). None elsewhere: Sema meets those
 /// as the argument is checked.
 const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E);
+
+/// What supplies an expression written (or a default substituted) at a
+/// location: in a staged region, a run-time template argument or a staged
+/// call of its first statement -- the region's parameter for it; in a
+/// top-level declaration parsed again, a staged call's result, a run-time
+/// template argument's value (Interpreter::cppshStageDecl).
+extern llvm::DenseMap<SourceLocation::UIntTy, Expr *> CppshSuppliedExprs;
 
 /// A need met in the statement being parsed (CppshCutNeeded): what the rest
 /// of that statement's analysis says is held back -- it is parsed again,

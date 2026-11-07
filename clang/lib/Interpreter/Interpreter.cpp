@@ -1427,6 +1427,7 @@ extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
 bool cppshMutates(const Stmt *S, const VarDecl *VD);
 extern bool CppshTopNeed;
 extern bool CppshCutNeeded;
+extern std::vector<Expr *> CppshCutStagedCalls;
 extern std::vector<SourceRange> CppshTopNeedExprs;
 extern SourceLocation CppshHoistBegin, CppshHoistEnd;
 extern bool CppshInHoist;
@@ -1635,8 +1636,18 @@ static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
           break;
         }
       }
-  if (!Spec || Spec->getTemplateArgs().size() != 2)
+  auto Fail = [](llvm::StringRef Why) {
+    llvm::errs() << "error: cppsh: a staged region cannot run: " << Why << "\n";
+  };
+  if (!Spec) {
+    Fail("its closure type is not known (no __cppsh_region_tag specialization "
+         "at its address)");
     return;
+  }
+  if (Spec->getTemplateArgs().size() != 2) {
+    Fail("its tag names no closure and arguments");
+    return;
+  }
   const QualType ClosureType = Spec->getTemplateArgs()[0].getAsType();
   ArrayRef<TemplateArgument> ArgTypes =
       Spec->getTemplateArgs()[1].getPackAsArray();
@@ -1644,8 +1655,14 @@ static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
   FunctionTemplateDecl *CallTemplate =
       RD ? RD->getDependentLambdaCallOperator() : nullptr;
   FunctionDecl *Pattern = CallTemplate ? CallTemplate->getTemplatedDecl() : nullptr;
-  if (!Pattern || Pattern->getNumParams() != N || ArgTypes.size() != N)
+  if (!Pattern) {
+    Fail("its closure has no call operator template");
     return;
+  }
+  if (Pattern->getNumParams() != N || ArgTypes.size() != N) {
+    Fail("its call operator does not take what it is handed");
+    return;
+  }
 
   const std::string Unit = std::to_string(CppshContinuations++);
   CppshFrameState State;
@@ -1662,8 +1679,10 @@ static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
   std::vector<APValue> Needs;
   CppshGlobals Globals;
   if (!cppshFrameGlobals(Interp, S, Unit, Locals, Addresses.data(), Needs, Globals) ||
-      Globals.size() != N + 1)
+      Globals.size() != N + 1) {
+    Fail("its frame could not be laid out");
     return;
+  }
   // A staged function's call it was handed (a std::sh::staged): the result
   // that call left, its value, in its place.
   for (unsigned I = 0; I < N; ++I) {
@@ -1675,8 +1694,10 @@ static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
                            S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl())
                        ? R.getAsSingle<VarDecl>()
                        : nullptr;
-    if (!Result)
+    if (!Result) {
+      Fail("the staged call it was handed left no result");
       return;
+    }
     Locals[I].Type = Result->getType().getNonReferenceType();
     Globals[I].second = Result;
   }
@@ -1797,6 +1818,8 @@ static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
 
 extern "C" void __cppsh_region_run(const void *Tag, void *Closure,
                                    void *const *Frame, unsigned N) {
+  if (!CppshActiveInterpreter)
+    llvm::errs() << "error: cppsh: a staged region cannot run: no interpreter\n";
   cppshRunRegion(Tag, Closure, Frame, N, /*Keep=*/false);
 }
 
@@ -1824,6 +1847,10 @@ static VarDecl *cppshRunTokens(Interpreter &Interp, unsigned Begin, unsigned End
   {
     TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(S.TUScope);
     E = Interp.cppshParser().CppshParseTokens(Begin, End);
+    // A staged call in it is run here, as it is: no need of anything.
+    CppshCutNeeded = false;
+    CppshCutStagedCalls.clear();
+    cppshEndNeedDiagnostics(S);
     ExprResult Full = E.isUsable() && !Keep
                           ? S.ActOnFinishFullExpr(E.get(), /*DiscardedValue=*/true)
                           : ExprError();
@@ -1881,7 +1908,7 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
                        : nullptr;
     if (!Result)
       return Fail("cppsh: the staged call left no result");
-    P.CppshSuppliedExprs[At.getRawEncoding()] = S.BuildDeclRefExpr(
+    CppshSuppliedExprs[At.getRawEncoding()] = S.BuildDeclRefExpr(
         Result, Result->getType().getNonReferenceType(), VK_LValue, At);
   } else {
     for (SourceRange Need : CppshTopNeedExprs) {
@@ -1895,7 +1922,7 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
       if (!Now || !Now->isInt())
         return Fail("cppsh: the run-time template argument gave no integer");
       const QualType T = Value->getType();
-      P.CppshSuppliedExprs[Need.getBegin().getRawEncoding()] =
+      CppshSuppliedExprs[Need.getBegin().getRawEncoding()] =
           IntegerLiteral::Create(Ctx, Now->getInt(), T, Need.getBegin());
     }
   }
@@ -1982,7 +2009,7 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
       continue;
     }
     Redos = 0;
-    P.CppshSuppliedExprs.clear();
+    CppshSuppliedExprs.clear();
     if (!TU) {
       IncrParser->SkipInput();
       return TU.takeError();
