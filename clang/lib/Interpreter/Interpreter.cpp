@@ -1426,6 +1426,7 @@ extern llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
 extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
 bool cppshMutates(const Stmt *S, const VarDecl *VD);
 extern bool CppshTopNeed;
+extern bool CppshCutNeeded;
 extern std::vector<SourceRange> CppshTopNeedExprs;
 extern SourceLocation CppshHoistBegin, CppshHoistEnd;
 extern bool CppshInHoist;

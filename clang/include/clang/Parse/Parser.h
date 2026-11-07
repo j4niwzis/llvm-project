@@ -8746,6 +8746,8 @@ private:
   void ParseCppshRegionStatements(StmtVector &Stmts, unsigned Begin,
                                   unsigned End);
   void CppshRegionError(SourceLocation Loc);
+public:
+  // cppsh: used by the interpreter (Interpreter::cppshStageDecl).
   /// cppsh: what supplies an expression at a location as it is parsed: in a
   /// region, a run-time template argument or a staged call of its first
   /// statement (its parameter); in a top-level declaration parsed again, a
@@ -8757,6 +8759,8 @@ private:
   /// cppsh: the recorded tokens [Begin, End) parsed again, before the
   /// current one.
   void CppshRewind(unsigned Begin, unsigned End);
+
+private:
   /// cppsh: where the block a need may be met in opens (ParseStmt.cpp's), for
   /// a top-level statement's.
   static SourceLocation &CppshTopBodyOpen();
