@@ -8397,7 +8397,21 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
           return PatFD && PatFD->getBody() &&
                  PatFD->getReturnType()->getContainedAutoType();
         };
-        const bool AnyValueCandidate = llvm::any_of(ovl->decls(), ValueCandidate);
+        // Where calls are: the user's code, or the shell's library (std::sh:
+        // `ls`, written to be specialized so) -- never another library's
+        // insides (a call in std::visit's machinery is C++ as written).
+        auto InShellLibrary = [](const DeclContext *DC) {
+          for (; DC; DC = DC->getParent())
+            if (const auto *NS = dyn_cast<NamespaceDecl>(DC);
+                NS && NS->getIdentifier() && NS->getName() == "sh" &&
+                NS->getParent()->isStdNamespace())
+              return true;
+          return false;
+        };
+        const bool ValueSite = cppshInUserInput(*this, Fn->getBeginLoc()) ||
+                               InShellLibrary(CurContext);
+        const bool AnyValueCandidate =
+            ValueSite && llvm::any_of(ovl->decls(), ValueCandidate);
         if (cppshTraceStaging() && cppshInUserInput(*this, Fn->getBeginLoc()))
           for (NamedDecl *ND : ovl->decls()) {
             auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
@@ -8485,6 +8499,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         // others it takes at run time, one specialization for every value of
         // them.
         for (NamedDecl *ND : ovl->decls()) {
+          if (!ValueSite)
+            break;
           auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
           if (!FTD)
             continue;
