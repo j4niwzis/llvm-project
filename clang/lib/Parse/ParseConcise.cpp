@@ -70,8 +70,44 @@ bool Parser::isConciseTypeStart(unsigned K) {
     return true;
   if (!T.is(tok::identifier))
     return false;
-  if (T.isCppshPrime() || GetLookAheadToken(K + 1).is(tok::coloncolon))
+  if (T.isCppshPrime())
     return true;
+  // A qualified name: a type where what it names is one -- `retry: std::cin
+  // >> n;` is a label, `x: std::string = e;` a variable. Looked up through
+  // its namespaces; past a class or a template's arguments, not judged (a
+  // type taken: a member of a class named so here is almost always one).
+  if (GetLookAheadToken(K + 1).is(tok::coloncolon)) {
+    DeclContext *In = nullptr;
+    for (unsigned I = K;; I += 2) {
+      const Token N = GetLookAheadToken(I);
+      if (!N.is(tok::identifier))
+        return true;
+      const bool Qualifies = GetLookAheadToken(I + 1).is(tok::coloncolon);
+      LookupResult R(Actions, N.getIdentifierInfo(), N.getLocation(),
+                     Qualifies ? Sema::LookupNestedNameSpecifierName
+                               : Sema::LookupOrdinaryName);
+      R.suppressDiagnostics();
+      if (In)
+        Actions.LookupQualifiedName(R, In);
+      else
+        Actions.LookupName(R, getCurScope());
+      if (Qualifies) {
+        if (auto *NS = R.getAsSingle<NamespaceDecl>())
+          In = NS;
+        else if (auto *NA = R.getAsSingle<NamespaceAliasDecl>())
+          In = NA->getNamespace();
+        else
+          return true;
+        continue;
+      }
+      if (R.empty())
+        return true;
+      return llvm::any_of(R, [](NamedDecl *D) {
+        return isa<TypeDecl, ClassTemplateDecl, TypeAliasTemplateDecl,
+                   TemplateTemplateParmDecl>(D->getUnderlyingDecl());
+      });
+    }
+  }
   IdentifierInfo *II = T.getIdentifierInfo();
   if (Actions.getTypeName(*II, T.getLocation(), getCurScope()))
     return true;
