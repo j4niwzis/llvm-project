@@ -422,6 +422,28 @@ static FunctionDecl *cppshNeedFunction(Sema &S) {
   return Cur;
 }
 
+const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E) {
+  FunctionDecl *Cur = S.getCurFunctionDecl(/*AllowLambda=*/true);
+  if (!E || !Cur || !E->isValueDependent() || !Cur->isDependentContext() ||
+      (isLambdaCallOperator(Cur) && !cppshIsRegion(Cur)) ||
+      !cppshInUserInput(S, Cur->getLocation()))
+    return nullptr;
+  auto Find = [&](const Stmt *X, auto &Self) -> const VarDecl * {
+    if (!X)
+      return nullptr;
+    if (auto *DRE = dyn_cast<DeclRefExpr>(X))
+      if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+          VD && !isa<ParmVarDecl>(VD) && VD->hasLocalStorage() &&
+          !VD->isConstexpr() && VD->getParentFunctionOrMethod() == Cur)
+        return VD;
+    for (const Stmt *C : X->children())
+      if (const VarDecl *VD = Self(C, Self))
+        return VD;
+    return nullptr;
+  };
+  return Find(E, Find);
+}
+
 const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
   FunctionDecl *Cur = cppshNeedFunction(S);
   if (!E || !Cur || !cppshInUserInput(S, Cur->getLocation()))
@@ -7555,7 +7577,11 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
   // A call of a staged function (cppsh): its result only known as it runs.
   if (const auto *CE = dyn_cast<CallExpr>(Call.get()))
     if (const FunctionDecl *Callee = CE->getDirectCallee();
-        Callee && CppshCutFunctions.count(Callee->getCanonicalDecl()) &&
+        Callee &&
+        (CppshCutFunctions.count(Callee->getCanonicalDecl()) ||
+         (Callee->getTemplateInstantiationPattern() &&
+          CppshCutFunctions.count(
+              Callee->getTemplateInstantiationPattern()->getCanonicalDecl()))) &&
         // Not the loop run on (__cppsh_loopK), which a continuation only
         // ever returns: its result is the staging's, kept as it runs.
         !(Callee->getIdentifier() && Callee->getName().starts_with("__cppsh_loop")) &&

@@ -1,4 +1,4 @@
-// RUN: printf '3\n4\n5\n6\n7\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '3\n4\n5\n6\n7\n8\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
 
 // A statement that needs a value read as its function runs, and declares
 // nothing: compiled with the value when it runs, against the function's own
@@ -42,3 +42,8 @@ std::println("s {}", s().size());
 t() = { auto a = s(); return a.size(); };
 std::println("t {}", t());
 // CHECK: t 7
+
+// In a generic function: the region made as its body is parsed.
+u a = { int n = 0; std::cin >> n; auto m = n + a; std::array<int, m> b{}; return b.size(); };
+std::println("u {}", u(1));
+// CHECK: u 9

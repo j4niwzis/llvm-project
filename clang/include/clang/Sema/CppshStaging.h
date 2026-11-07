@@ -22,6 +22,9 @@
 
 namespace clang {
 class FunctionDecl;
+class Expr;
+class Sema;
+class VarDecl;
 class IdentifierInfo;
 class SourceManager;
 
@@ -54,6 +57,13 @@ std::optional<unsigned> cppshTokenIndex(SourceLocation Loc);
 /// CppshEmitRegion): code whose types may depend on values that exist only as
 /// its function runs, a need met in it a region of its own.
 bool cppshIsRegion(const FunctionDecl *FD);
+
+/// In a template's body the user wrote, the local a value-dependent template
+/// argument names -- not a parameter, not a constant: a value that exists
+/// only as the function runs, whatever the template is instantiated with
+/// (a need, met as the body is parsed). None elsewhere: Sema meets those
+/// as the argument is checked.
+const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E);
 } // namespace clang
 
 #endif // LLVM_CLANG_SEMA_CPPSHSTAGING_H

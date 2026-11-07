@@ -18,9 +18,15 @@
 #include "clang/Parse/RAIIObjectsForParser.h"
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
+#include "clang/Sema/CppshStaging.h"
 #include "clang/Sema/ParsedTemplate.h"
 #include "clang/Sema/Scope.h"
 using namespace clang;
+
+namespace clang {
+extern bool CppshCutNeeded;
+extern const VarDecl *CppshCutNeedVar;
+} // namespace clang
 
 unsigned Parser::ReenterTemplateScopes(MultiParseScope &S, Decl *D) {
   return Actions.ActOnReenterTemplateScope(D, [&] {
@@ -1386,6 +1392,13 @@ ParsedTemplateArgument Parser::ParseTemplateArgument() {
             ExprArg.get()->getBeginLoc().getRawEncoding()))
       ExprArg = Actions.BuildDeclRefExpr(P, P->getType().getNonReferenceType(),
                                          VK_LValue, Loc);
+  // cppsh: in a template's body, an argument naming a local whose value
+  // exists only as the function runs: a need now, whatever it is
+  // instantiated with (the statement made a staged region).
+  if (const VarDecl *Local = cppshTemplateLocalIn(Actions, ExprArg.get())) {
+    CppshCutNeeded = true;
+    CppshCutNeedVar = Local;
+  }
 
   return ParsedTemplateArgument(ParsedTemplateArgument::NonType,
                                 ExprArg.get(), Loc);
