@@ -2422,6 +2422,15 @@ CppshStagedDecl *CppshStagedDecl::CreateDeserialized(ASTContext &C,
   return new (C, ID) CppshStagedDecl(nullptr, SourceLocation());
 }
 
+void CppshStagedDecl::setSupplies(
+    ASTContext &C, ArrayRef<std::pair<SourceLocation, unsigned>> S) {
+  NumSupplies = S.size();
+  Supplies = NumSupplies
+                 ? new (C) std::pair<SourceLocation, unsigned>[NumSupplies]
+                 : nullptr;
+  llvm::copy(S, Supplies);
+}
+
 void CppshStagedDecl::setParameters(ASTContext &C,
                                     ArrayRef<ImplicitParamDecl *> Ps) {
   NumParams = Ps.size();

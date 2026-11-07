@@ -1493,6 +1493,7 @@ StmtResult Parser::CppshParseStaged(
     ImplicitParamDecl *P = Params[It - Locals.begin()];
     CppshSuppliedExprs[Loc.getRawEncoding()] = Actions.BuildDeclRefExpr(
         P, P->getType().getNonReferenceType(), VK_LValue, Loc);
+    Actions.ActOnCppshStagedSupply(SD, Loc, VD);
   }
   if (StagedCall && Params.size() > Locals.size()) {
     ImplicitParamDecl *P = Params.back();

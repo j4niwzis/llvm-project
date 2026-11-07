@@ -20,6 +20,7 @@
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/StmtCXX.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Sema/CppshStaging.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/ScopeInfo.h"
@@ -100,6 +101,19 @@ CppshStagedDecl *Sema::ActOnStartCppshStaged(Scope *BodyScope,
   return SD;
 }
 
+void Sema::ActOnCppshStagedSupply(CppshStagedDecl *SD, SourceLocation Loc,
+                                  VarDecl *Local) {
+  if (CppshStagedScopes.empty() || CppshStagedScopes.back().Decl != SD)
+    return;
+  CppshStagedScope &Info = CppshStagedScopes.back();
+  const auto *It = llvm::find(Info.Locals, Local);
+  if (It == Info.Locals.end())
+    return;
+  SmallVector<std::pair<SourceLocation, unsigned>, 2> All(SD->supplies());
+  All.push_back({Loc, static_cast<unsigned>(It - Info.Locals.begin())});
+  SD->setSupplies(Context, All);
+}
+
 StmtResult Sema::ActOnFinishCppshStaged(CppshStagedDecl *SD, Stmt *Body,
                                         SourceLocation EndLoc) {
   if (CppshStagedScopes.empty() || CppshStagedScopes.back().Decl != SD)
@@ -115,17 +129,27 @@ StmtResult Sema::ActOnFinishCppshStaged(CppshStagedDecl *SD, Stmt *Body,
   ArrayRef<ImplicitParamDecl *> All = SD->parameters();
   SmallVector<ImplicitParamDecl *, 8> Kept;
   SmallVector<VarDecl *, 8> KeptLocals;
+  SmallVector<unsigned, 8> NewIndex(All.size(), ~0u);
   for (unsigned I = 0; I < All.size(); ++I) {
     const bool IsLocal = I < Info.Locals.size();
-    if (IsLocal && !Uses.Used.count(All[I])) {
+    // A supplied argument's value is used where the default is, unseen.
+    const bool Supplied = llvm::any_of(
+        SD->supplies(), [&](const auto &S) { return S.second == I; });
+    if (IsLocal && !Supplied && !Uses.Used.count(All[I])) {
       SD->removeDecl(All[I]);
       continue;
     }
+    NewIndex[I] = Kept.size();
     Kept.push_back(All[I]);
     if (IsLocal)
       KeptLocals.push_back(Info.Locals[I]);
   }
   SD->setParameters(Context, Kept);
+  SmallVector<std::pair<SourceLocation, unsigned>, 2> Supplies;
+  for (const auto &[Loc, Index] : SD->supplies())
+    if (Index < NewIndex.size() && NewIndex[Index] != ~0u)
+      Supplies.push_back({Loc, NewIndex[Index]});
+  SD->setSupplies(Context, Supplies);
   Info.Locals = std::move(KeptLocals);
   // Its frame: each local, as the function around it names it; the staged
   // call; `this`, where it uses it.
@@ -361,6 +385,16 @@ StmtResult Sema::InstantiateCppshStaged(CppshStagedStmt *S,
   Scope.InstantiatedLocal(SD, cast<Decl>(CurContext));
   for (unsigned I = 0; I < Params.size(); ++I)
     Scope.InstantiatedLocal(Params[I], Locals[I]);
+  // Each run-time template argument the body uses implicitly (a default):
+  // the local holding its value.
+  auto SavedSupplies = CppshSuppliedExprs;
+  auto RestoreSupplies =
+      llvm::scope_exit([&] { CppshSuppliedExprs = std::move(SavedSupplies); });
+  for (const auto &[Loc, Index] : SD->supplies())
+    if (Index < Locals.size())
+      CppshSuppliedExprs[Loc.getRawEncoding()] = BuildDeclRefExpr(
+          Locals[Index], Locals[Index]->getType().getNonReferenceType(),
+          VK_LValue, Loc);
   NonSFINAEContext NonSFINAE(*this);
   InstantiatingTemplate Inst(*this, S->getBeginLoc(), S, S->getSourceRange());
   if (Inst.isInvalid())

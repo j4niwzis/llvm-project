@@ -2258,6 +2258,11 @@ void ASTDeclWriter::VisitCppshStagedDecl(CppshStagedDecl *D) {
     Record.AddDeclRef(P);
   Record.AddDeclRef(D->getResultTypeParm());
   Record.push_back(D->usesThis());
+  Record.push_back(D->supplies().size());
+  for (const auto &[Loc, Index] : D->supplies()) {
+    Record.AddSourceLocation(Loc);
+    Record.push_back(Index);
+  }
   Record.AddStmt(D->getStagedStmt());
   Code = serialization::DECL_CPPSH_STAGED;
 }

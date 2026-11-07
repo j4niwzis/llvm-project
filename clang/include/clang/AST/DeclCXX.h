@@ -2166,6 +2166,8 @@ class CppshStagedDecl : public Decl, public DeclContext {
   unsigned NumParams = 0;
   TemplateTypeParmDecl *ResultType = nullptr;
   bool UsesThis = false;
+  std::pair<SourceLocation, unsigned> *Supplies = nullptr;
+  unsigned NumSupplies = 0;
 
   CppshStagedDecl(DeclContext *DC, SourceLocation Loc)
       : Decl(CppshStaged, DC, Loc), DeclContext(CppshStaged) {}
@@ -2196,6 +2198,16 @@ public:
   /// Whether the statement uses `this`: its frame's last entry then.
   bool usesThis() const { return UsesThis; }
   void setUsesThis(bool V) { UsesThis = V; }
+
+  /// The run-time template arguments the body uses: where each is (a
+  /// default template argument's location, met implicitly as a template is
+  /// used) and the index of the staged parameter holding its value -- what
+  /// that default is, each time the body is instantiated.
+  ArrayRef<std::pair<SourceLocation, unsigned>> supplies() const {
+    return {Supplies, NumSupplies};
+  }
+  void setSupplies(ASTContext &C,
+                   ArrayRef<std::pair<SourceLocation, unsigned>> S);
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) { return classofKind(D->getKind()); }

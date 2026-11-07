@@ -16118,6 +16118,10 @@ public:
                                          Expr *StagedCall,
                                          unsigned TemplateDepth,
                                          bool KeepsResult);
+  /// The value of the run-time template argument at Loc: the staged
+  /// parameter of Local (one of the statement's locals).
+  void ActOnCppshStagedSupply(CppshStagedDecl *D, SourceLocation Loc,
+                              VarDecl *Local);
   StmtResult ActOnFinishCppshStaged(CppshStagedDecl *D, Stmt *Body,
                                     SourceLocation EndLoc);
   void ActOnCppshStagedError(CppshStagedDecl *D);
