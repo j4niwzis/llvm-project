@@ -2513,7 +2513,12 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
     for (const auto &[Loc, Supplied] : CppshHoistSupplies)
       CppshSuppliedExprs[Loc.getRawEncoding()] = Supplied;
   } else {
-    for (SourceRange Need : CppshTopNeedExprs) {
+    // Run in builds of their own: the declaration's need not theirs (their
+    // FinishPTU would take them back for it), nor what they meet added to
+    // the list walked.
+    const std::vector<SourceRange> Needs = std::exchange(CppshTopNeedExprs, {});
+    CppshTopNeed = false;
+    for (SourceRange Need : Needs) {
       std::optional<unsigned> B = cppshTokenIndex(Need.getBegin());
       std::optional<unsigned> E = cppshTokenIndex(Need.getEnd());
       if (!B || !E)
