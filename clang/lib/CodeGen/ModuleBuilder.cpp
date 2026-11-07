@@ -337,7 +337,7 @@ namespace {
           // Incremental: the top-level statements' function in flight
           // finished while its module is still there, and what was taken
           // out of the deferred decls for this module put back.
-          if (Ctx->getLangOpts().IncrementalExtensions)
+          if (Ctx.getLangOpts().IncrementalExtensions)
             Builder->discardIncrementalModule();
           Builder->clear();
         }
