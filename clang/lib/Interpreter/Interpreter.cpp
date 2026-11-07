@@ -51,6 +51,7 @@
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/ScopeExit.h"
+#include <mutex>
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/bit.h"
 #include "clang/Serialization/ASTReader.h"
@@ -1759,7 +1760,13 @@ struct CppshRunInFlight {
   unsigned KeptBefore = 0;
   int Entry = 0;
 };
-static std::vector<CppshRunInFlight> CppshRunsInFlight;
+static thread_local std::vector<CppshRunInFlight> CppshRunsInFlight;
+// The interpreter -- its Sema, its JIT, the staging's state -- used by one
+// thread at a time: staged code reached on two threads at once is compiled
+// one after the other (what is compiled may run code reaching staged code
+// again on the same thread: recursive). The staged code itself runs outside
+// it, called by the code that reached it.
+static std::recursive_mutex CppshInterpreterLock;
 
 static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
                           void *Slot, int Entry, void *OuterPromise = nullptr,
@@ -2260,6 +2267,7 @@ extern "C" void *__cppsh_staged_coro_start(const void *Node, void *const *Frame,
                                            void *OuterPromise, int Entry) {
   if (!CppshActiveInterpreter)
     return nullptr;
+  std::lock_guard<std::recursive_mutex> Lock(CppshInterpreterLock);
   void *Handle = nullptr;
   cppshRunStaged(static_cast<const CppshStagedStmt *>(Node), Frame, nullptr,
                  Entry, OuterPromise, &Handle);
@@ -2275,6 +2283,7 @@ extern "C" void *__cppsh_staged_prepare(const void *Node, void *const *Frame,
     llvm::errs() << "error: cppsh: a staged statement cannot run: no interpreter\n";
     return nullptr;
   }
+  std::lock_guard<std::recursive_mutex> Lock(CppshInterpreterLock);
   void *Fn = nullptr;
   *SlotOut = nullptr;
   cppshRunStaged(static_cast<const CppshStagedStmt *>(Node), Frame, Slot, Entry,
@@ -2285,6 +2294,7 @@ extern "C" void *__cppsh_staged_prepare(const void *Node, void *const *Frame,
 // What follows the call of a prepared run: how it left, given back; the
 // result it kept named (a staged function's rest).
 extern "C" int __cppsh_staged_done(const void *Node, int Left) {
+  std::lock_guard<std::recursive_mutex> Lock(CppshInterpreterLock);
   auto It = std::find_if(CppshRunsInFlight.rbegin(), CppshRunsInFlight.rend(),
                          [&](const CppshRunInFlight &R) { return R.Staged == Node; });
   if (It == CppshRunsInFlight.rend())
@@ -2318,6 +2328,7 @@ extern "C" int __cppsh_staged_run(const void *Node, void *const *Frame,
     llvm::errs() << "error: cppsh: a staged statement cannot run: no interpreter\n";
     return 0;
   }
+  std::lock_guard<std::recursive_mutex> Lock(CppshInterpreterLock);
   return cppshRunStaged(static_cast<const CppshStagedStmt *>(Node), Frame, Slot,
                         Entry);
 }
@@ -2514,8 +2525,12 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
       return Ns;
     };
     bool Done = false;
-    llvm::Expected<TranslationUnitDecl *> TU =
-        IncrParser->ParseNextTopLevel(First, Done);
+    // Parsed with the interpreter to itself (staged code on another thread
+    // compiles meanwhile through the same Sema); run without it.
+    llvm::Expected<TranslationUnitDecl *> TU = [&] {
+      std::lock_guard<std::recursive_mutex> Lock(CppshInterpreterLock);
+      return IncrParser->ParseNextTopLevel(First, Done);
+    }();
     First = false;
     cppshEndNeedDiagnostics(getCompilerInstance()->getSema());
     CppshParseNs += Since();
