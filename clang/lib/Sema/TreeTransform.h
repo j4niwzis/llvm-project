@@ -47,6 +47,7 @@
 #include "clang/Sema/SemaPseudoObject.h"
 #include "clang/Sema/SemaSYCL.h"
 #include "clang/Sema/Template.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <algorithm>
@@ -8385,6 +8386,18 @@ TreeTransform<Derived>::TransformCompoundStmt(CompoundStmt *S,
   // The need of what is being parsed around this instantiation (a call of
   // the function in a body the parser may cut), kept across it.
   const bool CppshOuterNeed = CppshBody && CppshCutNeeded;
+  // And its run-time template arguments (a call's default met before the
+  // callee's body is instantiated: `f()`, `template <auto N = input()>`):
+  // kept across it too, whichever way it ends.
+  std::vector<Expr *> CppshOuterNeedExprs;
+  if (CppshBody)
+    CppshOuterNeedExprs = std::move(CppshCutNeedExprs);
+  auto CppshRestoreOuter = llvm::scope_exit([&] {
+    if (CppshBody) {
+      CppshCutNeeded = CppshOuterNeed;
+      CppshCutNeedExprs = std::move(CppshOuterNeedExprs);
+    }
+  });
   for (auto *B : S->body()) {
     if (CppshBody) {
       CppshCutNeeded = false;
@@ -8414,9 +8427,6 @@ TreeTransform<Derived>::TransformCompoundStmt(CompoundStmt *S,
     SubStmtChanged = SubStmtChanged || Result.get() != B;
     Statements.push_back(Result.getAs<Stmt>());
   }
-  if (CppshBody)
-    CppshCutNeeded = CppshOuterNeed;
-
   if (SubStmtInvalid)
     return StmtError();
 
