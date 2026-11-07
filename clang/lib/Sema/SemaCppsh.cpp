@@ -586,6 +586,26 @@ StmtResult Sema::InstantiateCppshStaged(CppshStagedStmt *S,
   // context, the function the body is compiled into.
   LocalInstantiationScope Scope(*this);
   Scope.InstantiatedLocal(SD, cast<Decl>(CurContext));
+  // In a coroutine: the outer coroutine's promise, on which what the body
+  // awaits and yields was built (`__promise.yield_value(e)`, as the parser
+  // makes a co_yield), is this code's own coroutine's promise -- whose
+  // yield_value and await_transform hand each to the outer one
+  // (std::sh::__cppsh_staged_coro).
+  if (Run.Coroutine) {
+    auto *Outer = dyn_cast<FunctionDecl>(
+        SD->getDeclContext()->getEnclosingNonExpansionStatementContext());
+    auto *OuterBody =
+        Outer ? dyn_cast_or_null<CoroutineBodyStmt>(Outer->getBody()) : nullptr;
+    sema::FunctionScopeInfo *FSI = getCurFunction();
+    if (!OuterBody || !OuterBody->getPromiseDecl() || !FSI)
+      return StmtError();
+    if (!FSI->CoroutinePromise &&
+        !ActOnCoroutineBodyStart(getCurScope(), S->getBeginLoc(), "co_await"))
+      return StmtError();
+    if (!FSI->CoroutinePromise)
+      return StmtError();
+    Scope.InstantiatedLocal(OuterBody->getPromiseDecl(), FSI->CoroutinePromise);
+  }
   for (unsigned I = 0; I < Params.size(); ++I)
     Scope.InstantiatedLocal(Params[I], Locals[I]);
   // Each run-time template argument the body uses implicitly (a default):
