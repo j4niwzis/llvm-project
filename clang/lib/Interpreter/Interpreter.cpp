@@ -1845,7 +1845,7 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     // The interpreter's value printing, for a body whose last statement's
     // value is shown.
     auto PrintValueFn = [&](Expr *E) -> Expr * {
-      llvm::Expected<Expr *> Shown = Interp.convertExprToValue(E);
+      llvm::Expected<Expr *> Shown = Interp.cppshPrintValue(E);
       if (!Shown) {
         llvm::consumeError(Shown.takeError());
         return nullptr;

@@ -195,6 +195,11 @@ public:
   /// __cppsh_snapshot), in a unit Sema builds -- safe between two top-level
   /// declarations of an input.
   llvm::Error cppshSnapshot(ArrayRef<VarDecl *> Vars);
+  /// cppsh: the interpreter's value printing of this expression (the last
+  /// statement of a staged body whose value is shown).
+  llvm::Expected<Expr *> cppshPrintValue(Expr *E) {
+    return convertExprToValue(E);
+  }
 
   llvm::Expected<PartialTranslationUnit &> Parse(llvm::StringRef Code);
   llvm::Error Execute(PartialTranslationUnit &T);
