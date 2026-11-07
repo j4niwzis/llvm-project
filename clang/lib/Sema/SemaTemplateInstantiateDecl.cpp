@@ -3163,12 +3163,6 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
 
   DeclarationNameInfo NameInfo
     = SemaRef.SubstDeclarationNameInfo(D->getNameInfo(), TemplateArgs);
-  if (HasCppshConstParam && NameInfo.getName().isIdentifier()) {
-    static unsigned CppshSpecCounter = 0;
-    std::string SpecName = NameInfo.getName().getAsString() +
-                           "__cppsh_val_" + std::to_string(++CppshSpecCounter);
-    NameInfo.setName(&SemaRef.PP.getIdentifierTable().get(SpecName));
-  }
 
   if (FunctionRewriteKind != RewriteKind::None)
     adjustForRewrite(FunctionRewriteKind, D, T, TInfo, NameInfo);
@@ -3196,6 +3190,18 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
 
   if (D->isInlined())
     Function->setImplicitlyInline();
+
+  // cppsh: a specialization on argument values keeps the function's own name
+  // (diagnostics, printing, lookup see `f`) and is told apart from the other
+  // specializations with the same template arguments by an ABI tag -- the
+  // mangling's own way of naming variants of one declaration.
+  if (HasCppshConstParam) {
+    static unsigned CppshSpecCounter = 0;
+    std::string Tag = "cppsh_v" + std::to_string(++CppshSpecCounter);
+    StringRef Tags[] = {Tag};
+    Function->addAttr(AbiTagAttr::CreateImplicit(SemaRef.Context, Tags, 1,
+                                                 D->getLocation()));
+  }
 
   if (QualifierLoc)
     Function->setQualifierInfo(QualifierLoc);
