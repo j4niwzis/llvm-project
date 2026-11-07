@@ -1335,6 +1335,17 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
       if (Sc->getFlags() & Scope::FnScope)
         break;
     }
+    // And the cases it made of the switches around it (`case 0: T a;`): off
+    // their lists -- the staged statement's own are the switch's entries
+    // into it, a first parse's left there a duplicate of each.
+    if (sema::FunctionScopeInfo *FSI = Actions.getCurFunction())
+      for (auto &Around : FSI->SwitchStack) {
+        SwitchStmt *Switch = Around.getPointer();
+        SwitchCase *First = Switch->getSwitchCaseList();
+        while (First && !SM.isBeforeInTranslationUnit(First->getKeywordLoc(), Begin))
+          First = First->getNextSwitchCase();
+        Switch->setSwitchCaseList(First);
+      }
   }
   // Its frame: the live locals (those its body does not name dropped by
   // Sema); a run-time template argument's value, a local made for it here.
