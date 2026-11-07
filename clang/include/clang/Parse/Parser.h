@@ -8729,7 +8729,7 @@ private:
   CppshParseStaged(SourceLocation Begin, SourceLocation End,
                    ArrayRef<VarDecl *> Locals,
                    ArrayRef<std::pair<SourceLocation, VarDecl *>> Needs,
-                   Expr *StagedCall, bool Keeps,
+                   ArrayRef<Expr *> StagedCalls, bool Keeps,
                    std::optional<unsigned> RegionBegin,
                    llvm::function_ref<void(StmtVector &)> ParseBody);
   /// cppsh: the rest of a staged function's body a staged statement whose
@@ -8737,7 +8737,8 @@ private:
   bool CppshStageRest(SmallVectorImpl<Stmt *> &Stmts, SourceLocation Begin,
                       SourceLocation End, ArrayRef<VarDecl *> Locals,
                       ArrayRef<std::pair<SourceLocation, VarDecl *>> Needs,
-                      Expr *StagedCall, std::optional<unsigned> RegionBegin,
+                      ArrayRef<Expr *> StagedCalls,
+                      std::optional<unsigned> RegionBegin,
                       llvm::function_ref<void(StmtVector &)> ParseBody);
   /// cppsh: a staged statement returned the function's result from inside a
   /// block of its body: the rest of the body after the statement holding

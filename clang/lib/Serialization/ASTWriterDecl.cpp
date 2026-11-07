@@ -2256,7 +2256,9 @@ void ASTDeclWriter::VisitCppshStagedDecl(CppshStagedDecl *D) {
   Record.push_back(D->parameters().size());
   for (ImplicitParamDecl *P : D->parameters())
     Record.AddDeclRef(P);
-  Record.AddDeclRef(D->getResultTypeParm());
+  Record.push_back(D->resultTypeParms().size());
+  for (TemplateTypeParmDecl *P : D->resultTypeParms())
+    Record.AddDeclRef(P);
   Record.push_back(D->usesThis());
   Record.push_back(D->suspends());
   Record.push_back(D->supplies().size());

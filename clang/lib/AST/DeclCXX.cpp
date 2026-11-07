@@ -2431,6 +2431,14 @@ void CppshStagedDecl::setSupplies(
   llvm::copy(S, Supplies);
 }
 
+void CppshStagedDecl::setResultTypeParms(ASTContext &C,
+                                         ArrayRef<TemplateTypeParmDecl *> Ps) {
+  NumResultTypes = Ps.size();
+  ResultTypes =
+      NumResultTypes ? new (C) TemplateTypeParmDecl *[NumResultTypes] : nullptr;
+  llvm::copy(Ps, ResultTypes);
+}
+
 void CppshStagedDecl::setParameters(ASTContext &C,
                                     ArrayRef<ImplicitParamDecl *> Ps) {
   NumParams = Ps.size();

@@ -16092,7 +16092,7 @@ public:
     bool KeepsResult = false;
     unsigned Leaves = 0;
     SmallVector<VarDecl *, 8> Locals;
-    Expr *StagedCall = nullptr;
+    SmallVector<Expr *, 2> StagedCalls;
     DeclContext *Outer = nullptr;
     /// Whether its code suspends the coroutine it is in.
     bool Suspends = false;
@@ -16137,11 +16137,11 @@ public:
 
   /// Begin a staged statement at Loc, its body to be parsed in BodyScope: its
   /// context entered, a staged parameter declared there for each of Locals
-  /// (and for the result of StagedCall, a staged function's, whose type is a
-  /// type parameter at TemplateDepth).
+  /// (and for the result of each of StagedCalls, staged functions', whose
+  /// types are type parameters at TemplateDepth).
   CppshStagedDecl *ActOnStartCppshStaged(Scope *BodyScope, SourceLocation Loc,
                                          ArrayRef<VarDecl *> Locals,
-                                         Expr *StagedCall,
+                                         ArrayRef<Expr *> StagedCalls,
                                          unsigned TemplateDepth,
                                          bool KeepsResult);
   /// The value of the run-time template argument at Loc: the staged
@@ -16176,10 +16176,11 @@ public:
 
   /// A staged statement's body instantiated, as it runs, into the function
   /// being defined (CurContext): each staged parameter the corresponding one
-  /// of Locals, the staged result of type ResultType.
+  /// of Locals, the staged results of types ResultTypes.
   StmtResult InstantiateCppshStaged(CppshStagedStmt *S,
                                     ArrayRef<VarDecl *> Locals,
-                                    QualType ResultType, CppshStagedRun &Run);
+                                    ArrayRef<QualType> ResultTypes,
+                                    CppshStagedRun &Run);
 
   /// `this`, in a staged statement's body compiled as it runs.
   Expr *CppshStagedThis(SourceLocation Loc);

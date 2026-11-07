@@ -1276,10 +1276,8 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
                    << "\n";
     return false;
   };
-  // What it needs: a local's value, a run-time template argument's, or a
-  // staged function's result -- one, the last a staged call leaves.
-  if (CppshCutStagedCalls.size() > 1)
-    return Refuse("more than one staged call");
+  // What it needs: a local's value, a run-time template argument's, or the
+  // results of staged functions -- each staged call's, in the order made.
   if (!CppshCutNeedVar && CppshCutNeedExprs.empty() && CppshCutStagedCalls.empty())
     return Refuse("nothing it needs is known");
   // Its first parse may be invalid (what the need left unresolved): a
@@ -1359,13 +1357,13 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     Locals.push_back(V);
     Needs.push_back({NE->getBeginLoc(), V});
   }
-  Expr *StagedCall =
-      CppshCutStagedCalls.empty() ? nullptr : CppshCutStagedCalls.front();
+  const SmallVector<Expr *, 2> StagedCalls(CppshCutStagedCalls.begin(),
+                                           CppshCutStagedCalls.end());
   CppshCutNeedExprs.clear();
   CppshCutStagedCalls.clear();
   const unsigned From = *B, To = *E;
   StmtResult S = CppshParseStaged(
-      Begin, CppshInputTokens[To - 1].getEndLoc(), Locals, Needs, StagedCall,
+      Begin, CppshInputTokens[To - 1].getEndLoc(), Locals, Needs, StagedCalls,
       /*Keeps=*/false, From,
       [&](StmtVector &Body) { ParseCppshRegionStatements(Body, From, To); });
   if (!S.isUsable())
@@ -1388,7 +1386,12 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     llvm::errs() << "cppsh-trace: staged at "
                  << Begin.printToString(PP.getSourceManager())
                  << (Staged ? " (a staged function's rest)" : "")
-                 << (StagedCall ? " (with a staged call)" : "") << "\n";
+                 << (StagedCalls.empty()
+                         ? std::string()
+                         : " (with " + std::to_string(StagedCalls.size()) +
+                               " staged call" +
+                               (StagedCalls.size() > 1 ? "s)" : ")"))
+                 << "\n";
   Stmts.append(Before.begin(), Before.end());
   Stmts.push_back(S.get());
   SmallVector<Stmt *, 4> Made(Before.begin(), Before.end());
@@ -1442,18 +1445,18 @@ VarDecl *Parser::CppshNeedVar(Expr *NE, unsigned I,
 // parsed by ParseBody; the statement made.
 StmtResult Parser::CppshParseStaged(
     SourceLocation Begin, SourceLocation End, ArrayRef<VarDecl *> Locals,
-    ArrayRef<std::pair<SourceLocation, VarDecl *>> Needs, Expr *StagedCall,
-    bool Keeps, std::optional<unsigned> RegionBegin,
+    ArrayRef<std::pair<SourceLocation, VarDecl *>> Needs,
+    ArrayRef<Expr *> StagedCalls, bool Keeps, std::optional<unsigned> RegionBegin,
     llvm::function_ref<void(StmtVector &)> ParseBody) {
   ParseScope StagedScope(this, Scope::DeclScope | Scope::CompoundStmtScope);
   // The staged result's type: a type parameter of it, one level deeper than
   // the templates around it.
   TemplateParameterDepthRAII Depth(TemplateParameterDepth);
   const unsigned ResultDepth = Depth.getDepth();
-  if (StagedCall)
+  if (!StagedCalls.empty())
     ++Depth;
   CppshStagedDecl *SD = Actions.ActOnStartCppshStaged(
-      getCurScope(), Begin, Locals, StagedCall, ResultDepth, Keeps);
+      getCurScope(), Begin, Locals, StagedCalls, ResultDepth, Keeps);
   ArrayRef<ImplicitParamDecl *> Params = SD->parameters();
   auto SavedArgs = std::exchange(CppshSuppliedExprs, {});
   for (const auto &[Loc, VD] : Needs) {
@@ -1465,9 +1468,12 @@ StmtResult Parser::CppshParseStaged(
         P, P->getType().getNonReferenceType(), VK_LValue, Loc);
     Actions.ActOnCppshStagedSupply(SD, Loc, VD);
   }
-  if (StagedCall && Params.size() > Locals.size()) {
-    ImplicitParamDecl *P = Params.back();
-    const SourceLocation Loc = StagedCall->getBeginLoc();
+  // Each staged call, by the staged parameter of its result (those after
+  // the locals', in the calls' order), where it is written.
+  for (size_t I = 0; I < StagedCalls.size() && Locals.size() + I < Params.size();
+       ++I) {
+    ImplicitParamDecl *P = Params[Locals.size() + I];
+    const SourceLocation Loc = StagedCalls[I]->getBeginLoc();
     CppshSuppliedExprs[Loc.getRawEncoding()] = Actions.BuildDeclRefExpr(
         P, P->getType().getNonReferenceType(), VK_LValue, Loc);
   }
@@ -1544,12 +1550,13 @@ bool Parser::CppshStageRest(SmallVectorImpl<Stmt *> &Stmts,
                             SourceLocation Begin, SourceLocation End,
                             ArrayRef<VarDecl *> Locals,
                             ArrayRef<std::pair<SourceLocation, VarDecl *>> Needs,
-                            Expr *StagedCall, std::optional<unsigned> RegionBegin,
+                            ArrayRef<Expr *> StagedCalls,
+                            std::optional<unsigned> RegionBegin,
                             llvm::function_ref<void(StmtVector &)> ParseBody) {
   FunctionDecl *Function = Actions.getCurFunctionDecl(/*AllowLambda=*/true);
   if (!Function || !Actions.CppshStagedScopes.empty())
     return false;
-  StmtResult S = CppshParseStaged(Begin, End, Locals, Needs, StagedCall,
+  StmtResult S = CppshParseStaged(Begin, End, Locals, Needs, StagedCalls,
                                   /*Keeps=*/true, RegionBegin, ParseBody);
   if (!S.isUsable())
     return false;
@@ -3403,8 +3410,7 @@ void Parser::CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
     // function a staged one.
     CppshCutNeeded = false;
     bool Made = false;
-    if (Begin < End && FD->getReturnType()->isUndeducedType() &&
-        CppshCutStagedCalls.size() <= 1) {
+    if (Begin < End && FD->getReturnType()->isUndeducedType()) {
       // The expression a staged statement's, its value the kept result --
       // the function a staged one.
       SmallVector<VarDecl *, 8> Locals = CppshLiveLocals(Loc);
@@ -3419,13 +3425,13 @@ void Parser::CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
         Locals.push_back(V);
         Needs.push_back({NE->getBeginLoc(), V});
       }
-      Expr *StagedCall =
-          CppshCutStagedCalls.empty() ? nullptr : CppshCutStagedCalls.front();
+      const SmallVector<Expr *, 2> StagedCalls(CppshCutStagedCalls.begin(),
+                                               CppshCutStagedCalls.end());
       CppshCutNeedExprs.clear();
       CppshCutStagedCalls.clear();
       Made = Ok && CppshStageRest(
                        Stmts, Loc, CppshInputTokens[End - 1].getEndLoc(), Locals,
-                       Needs, StagedCall, Begin, [&](StmtVector &Body) {
+                       Needs, StagedCalls, Begin, [&](StmtVector &Body) {
                          ExprResult V = CppshParseTokens(Begin, End);
                          StmtResult R = V.isUsable()
                                             ? Actions.ActOnReturnStmt(

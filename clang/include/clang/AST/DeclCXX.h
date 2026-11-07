@@ -2164,7 +2164,8 @@ class CppshStagedDecl : public Decl, public DeclContext {
   CppshStagedStmt *Statement = nullptr;
   ImplicitParamDecl **Params = nullptr;
   unsigned NumParams = 0;
-  TemplateTypeParmDecl *ResultType = nullptr;
+  TemplateTypeParmDecl **ResultTypes = nullptr;
+  unsigned NumResultTypes = 0;
   bool UsesThis = false;
   bool Suspends = false;
   std::pair<SourceLocation, unsigned> *Supplies = nullptr;
@@ -2192,9 +2193,17 @@ public:
   }
   void setParameters(ASTContext &C, ArrayRef<ImplicitParamDecl *> Ps);
 
-  /// The type of a staged function's result the statement uses, if any.
-  TemplateTypeParmDecl *getResultTypeParm() const { return ResultType; }
-  void setResultTypeParm(TemplateTypeParmDecl *P) { ResultType = P; }
+  /// The types of the staged functions' results the statement uses, one for
+  /// each staged call in it, in the order they are made (index I of the same
+  /// depth): type parameters of the context.
+  ArrayRef<TemplateTypeParmDecl *> resultTypeParms() const {
+    return {ResultTypes, NumResultTypes};
+  }
+  void setResultTypeParms(ASTContext &C, ArrayRef<TemplateTypeParmDecl *> Ps);
+  /// The first of them, if any (their depth the context's).
+  TemplateTypeParmDecl *getResultTypeParm() const {
+    return NumResultTypes ? ResultTypes[0] : nullptr;
+  }
 
   /// Whether the statement uses `this`: its frame's last entry then.
   bool usesThis() const { return UsesThis; }

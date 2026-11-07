@@ -117,28 +117,27 @@ struct CppshUses : RecursiveASTVisitor<CppshUses> {
 CppshStagedDecl *Sema::ActOnStartCppshStaged(Scope *BodyScope,
                                              SourceLocation Loc,
                                              ArrayRef<VarDecl *> Locals,
-                                             Expr *StagedCall,
+                                             ArrayRef<Expr *> StagedCalls,
                                              unsigned TemplateDepth,
                                              bool KeepsResult) {
   auto *SD = CppshStagedDecl::Create(Context, CurContext, Loc);
   CurContext->addDecl(SD);
   if (sema::FunctionScopeInfo *FSI = getCurFunction())
     FSI->HasCppshStaged = true;
-  // The type of the staged function's result it uses: a type parameter of
-  // it, given as the statement runs.
-  TemplateTypeParmDecl *ResultT = nullptr;
-  if (StagedCall) {
-    ResultT = TemplateTypeParmDecl::Create(
+  // The types of the staged functions' results it uses: type parameters of
+  // it, given as the statement runs -- one for each call, in its order.
+  SmallVector<TemplateTypeParmDecl *, 2> ResultTs;
+  for (unsigned I = 0; I < StagedCalls.size(); ++I)
+    ResultTs.push_back(TemplateTypeParmDecl::Create(
         Context, Context.getTranslationUnitDecl(), Loc, Loc, TemplateDepth,
-        /*P=*/0, /*Id=*/nullptr, /*Typename=*/true, /*ParameterPack=*/false);
-    SD->setResultTypeParm(ResultT);
-  }
+        /*P=*/I, /*Id=*/nullptr, /*Typename=*/true, /*ParameterPack=*/false));
+  SD->setResultTypeParms(Context, ResultTs);
   CppshStagedScope Info;
   Info.Decl = SD;
   Info.BodyScope = BodyScope;
   Info.KeepsResult = KeepsResult;
   Info.Locals.assign(Locals.begin(), Locals.end());
-  Info.StagedCall = StagedCall;
+  Info.StagedCalls.assign(StagedCalls.begin(), StagedCalls.end());
   Info.Outer = CurContext;
   PushDeclContext(BodyScope, SD);
   // A staged parameter for each local it names, found in its place.
@@ -150,12 +149,13 @@ CppshStagedDecl *Sema::ActOnStartCppshStaged(Scope *BodyScope,
     PushOnScopeChains(P, BodyScope);
     Params.push_back(P);
   }
-  if (ResultT) {
-    QualType T = Context.getTemplateTypeParmType(TemplateDepth, 0,
+  for (unsigned I = 0; I < ResultTs.size(); ++I) {
+    QualType T = Context.getTemplateTypeParmType(TemplateDepth, I,
                                                  /*ParameterPack=*/false,
-                                                 ResultT);
+                                                 ResultTs[I]);
     auto *P = ImplicitParamDecl::Create(
-        Context, SD, Loc, &PP.getIdentifierTable().get("__cppsh_result"), T,
+        Context, SD, StagedCalls[I]->getBeginLoc(),
+        &PP.getIdentifierTable().get("__cppsh_result" + std::to_string(I)), T,
         ImplicitParamKind::CppshStaged);
     SD->addDecl(P);
     Params.push_back(P);
@@ -222,8 +222,8 @@ StmtResult Sema::ActOnFinishCppshStaged(CppshStagedDecl *SD, Stmt *Body,
   for (VarDecl *VD : Info.Locals)
     Frame.push_back(BuildDeclRefExpr(VD, VD->getType().getNonReferenceType(),
                                      VK_LValue, Loc));
-  if (Info.StagedCall)
-    Frame.push_back(Info.StagedCall);
+  for (Expr *Call : Info.StagedCalls)
+    Frame.push_back(Call);
   CppshFindThis Finder;
   Finder.TraverseStmt(Body);
   if (Finder.Found) {
@@ -497,13 +497,18 @@ Sema::ActOnStartCppshStagedInstantiation(CppshStagedDecl *Old,
   CurContext->addDecl(SD);
   SD->setUsesThis(Old->usesThis());
   ArrayRef<ImplicitParamDecl *> OldParams = Old->parameters();
-  // The result's type, its depth as the instantiation leaves it.
-  if (Old->getResultTypeParm() && !Types.empty())
-    if (const auto *TT = Types.back()->getAs<TemplateTypeParmType>())
-      SD->setResultTypeParm(TemplateTypeParmDecl::Create(
+  // The results' types (the last parameters'), their depth as the
+  // instantiation leaves it.
+  const size_t NumResults = Old->resultTypeParms().size();
+  SmallVector<TemplateTypeParmDecl *, 2> ResultTs;
+  for (size_t I = 0; I < NumResults && NumResults <= Types.size(); ++I)
+    if (const auto *TT =
+            Types[Types.size() - NumResults + I]->getAs<TemplateTypeParmType>())
+      ResultTs.push_back(TemplateTypeParmDecl::Create(
           Context, Context.getTranslationUnitDecl(), Old->getLocation(),
           Old->getLocation(), TT->getDepth(), TT->getIndex(), /*Id=*/nullptr,
           /*Typename=*/true, /*ParameterPack=*/false));
+  SD->setResultTypeParms(Context, ResultTs);
   SmallVector<ImplicitParamDecl *, 8> Params;
   for (unsigned I = 0; I < OldParams.size() && I < Types.size(); ++I) {
     auto *P = ImplicitParamDecl::Create(
@@ -563,7 +568,7 @@ StmtResult Sema::ActOnFinishCppshStagedInstantiation(
 
 StmtResult Sema::InstantiateCppshStaged(CppshStagedStmt *S,
                                         ArrayRef<VarDecl *> Locals,
-                                        QualType ResultType,
+                                        ArrayRef<QualType> ResultTypes,
                                         CppshStagedRun &Run) {
   CppshStagedDecl *SD = S ? S->getStagedDecl() : nullptr;
   if (!SD || Locals.size() != SD->parameters().size())
@@ -576,13 +581,17 @@ StmtResult Sema::InstantiateCppshStaged(CppshStagedStmt *S,
     CurrentCppshStagedRun = SavedRun;
     CppshStagedScopes = std::move(SavedScopes);
   });
-  // The type of the staged function's result, now known.
+  // The types of the staged functions' results, now known: the context's
+  // template arguments, kept as long as the instantiation uses them.
+  SmallVector<TemplateArgument, 2> ResultArgs;
   MultiLevelTemplateArgumentList Args;
   if (TemplateTypeParmDecl *T = SD->getResultTypeParm()) {
-    if (ResultType.isNull())
+    if (ResultTypes.size() != SD->resultTypeParms().size() ||
+        llvm::any_of(ResultTypes, [](QualType RT) { return RT.isNull(); }))
       return StmtError();
-    TemplateArgument Arg(ResultType);
-    Args = MultiLevelTemplateArgumentList(SD, Arg, /*Final=*/true);
+    for (QualType RT : ResultTypes)
+      ResultArgs.push_back(TemplateArgument(RT));
+    Args = MultiLevelTemplateArgumentList(SD, ResultArgs, /*Final=*/true);
     Args.addOuterRetainedLevels(T->getDepth());
   }
   // Each staged parameter, the local it stands for (its value known); the

@@ -1442,6 +1442,10 @@ extern bool CppshInHoist;
 // The global holding the last continuation's result: what a hoisted call is
 // replaced by.
 static std::string CppshLastResult;
+// Every result kept, in the order kept: a statement using several staged
+// calls' results takes the last as many (its calls made in order, just
+// before it).
+static std::vector<std::string> CppshResultHistory;
 static unsigned CppshContinuations = 0;
 
 // std::sh::<Name>, as an expression to call.
@@ -1696,7 +1700,7 @@ struct CppshStagedCompiled {
   // wanted constant -- and those values; the staged result's type.
   SmallVector<unsigned, 4> Wanted;
   SmallVector<llvm::FoldingSetNodeID, 4> Profiles;
-  QualType Input;
+  SmallVector<QualType, 2> Input;
   FunctionDecl *Function = nullptr;
   void *Address = nullptr;
   // A staged function's rest: the type of the result its returns give.
@@ -1802,12 +1806,20 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
   // Each entry's type and object; the staged result's, the last result kept.
   SmallVector<QualType, 8> Types;
   SmallVector<void *, 8> Objects(Frame, Frame + N);
-  QualType ResultType;
+  SmallVector<QualType, 2> ResultTypes;
+  const size_t NumResults = SD->resultTypeParms().size();
+  if (NumResults > N || NumResults > CppshResultHistory.size())
+    return Fail("the staged calls it uses left no results");
   for (unsigned I = 0; I < N; ++I) {
     QualType T = Params[I]->getType().getNonReferenceType();
-    if (SD->getResultTypeParm() && I + 1 == N && T->isDependentType()) {
-      LookupResult R(S, &Idents.get(CppshLastResult), Loc, Sema::LookupOrdinaryName);
-      auto *Result = !CppshLastResult.empty() &&
+    if (I + NumResults >= N && T->isDependentType()) {
+      // The result of the J-th staged call of the K it uses: the K-J-th kept
+      // last.
+      const std::string &Name =
+          CppshResultHistory[CppshResultHistory.size() - NumResults +
+                             (I - (N - NumResults))];
+      LookupResult R(S, &Idents.get(Name), Loc, Sema::LookupOrdinaryName);
+      auto *Result = !Name.empty() &&
                              S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl())
                          ? R.getAsSingle<VarDecl>()
                          : nullptr;
@@ -1819,8 +1831,8 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
         llvm::consumeError(Addr.takeError());
         return Fail("the staged call's result is not found");
       }
-      ResultType = Result->getType().getNonReferenceType();
-      T = ResultType;
+      T = Result->getType().getNonReferenceType();
+      ResultTypes.push_back(T);
       Objects[I] = Addr->toPtr<void *>();
       // A reference naming the storage the result was constructed in (a
       // staged function's kept result): that storage.
@@ -1877,8 +1889,9 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
       CppshCompiled;
   static unsigned Count = 0;
   std::vector<CppshStagedCompiled> &Instances = Compiled[Staged];
-  const QualType Input =
-      ResultType.isNull() ? QualType() : Ctx.getCanonicalType(ResultType);
+  SmallVector<QualType, 2> Input;
+  for (QualType RT : ResultTypes)
+    Input.push_back(Ctx.getCanonicalType(RT));
   CppshStagedCompiled *Found = nullptr;
   for (CppshStagedCompiled &C : Instances) {
     if (C.Input != Input)
@@ -2065,7 +2078,7 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
             const bool WasLive = std::exchange(CppshStagedLive, true);
             const unsigned ErrorsBefore = Diags.getNumErrors();
             StmtResult Inst =
-                S.InstantiateCppshStaged(SS, Locals, ResultType, Run);
+                S.InstantiateCppshStaged(SS, Locals, ResultTypes, Run);
             CppshStagedLive = WasLive;
             cppshEndNeedDiagnostics(S);
             if (!Inst.isUsable() || Diags.getNumErrors() != ErrorsBefore)
@@ -2256,6 +2269,7 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
   // code's result kept already).
   if (Keep && Left == 3 && !ResultName.empty() && CppshKeptResults == KeptBefore) {
     CppshLastResult = ResultName;
+    CppshResultHistory.push_back(ResultName);
     ++CppshKeptResults;
   }
   return Left;
@@ -2317,6 +2331,7 @@ extern "C" int __cppsh_staged_done(const void *Node, int Left) {
   if (Run.Keep && Left == 3 && !Run.ResultName.empty() &&
       CppshKeptResults == Run.KeptBefore) {
     CppshLastResult = Run.ResultName;
+    CppshResultHistory.push_back(Run.ResultName);
     ++CppshKeptResults;
   }
   return Left;

@@ -2878,7 +2878,10 @@ void ASTDeclReader::VisitCppshStagedDecl(CppshStagedDecl *D) {
   for (unsigned I = 0; I < N; ++I)
     Params.push_back(cast_or_null<ImplicitParamDecl>(Record.readDeclRef()));
   D->setParameters(Reader.getContext(), Params);
-  D->ResultType = cast_or_null<TemplateTypeParmDecl>(Record.readDeclRef());
+  SmallVector<TemplateTypeParmDecl *, 2> ResultTypes;
+  for (unsigned I = 0, E = Record.readInt(); I < E; ++I)
+    ResultTypes.push_back(cast_or_null<TemplateTypeParmDecl>(Record.readDeclRef()));
+  D->setResultTypeParms(Reader.getContext(), ResultTypes);
   D->UsesThis = Record.readInt();
   D->Suspends = Record.readInt();
   SmallVector<std::pair<SourceLocation, unsigned>, 2> Supplies;
