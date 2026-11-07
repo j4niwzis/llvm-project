@@ -457,37 +457,6 @@ const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E) {
   return Find(E, Find);
 }
 
-// Whether a function template's body has a plain `if` whose condition reads
-// its parameter I -- what a call is specialized on that argument's value for
-// (BuildCallExpr's value specialization).
-static bool cppshFoldsOn(const FunctionDecl *FD, unsigned I) {
-  const Stmt *Body = FD ? FD->getBody() : nullptr;
-  if (!Body || I >= FD->getNumParams() || !FD->getReturnType()->getContainedAutoType())
-    return false;
-  const ParmVarDecl *P = FD->getParamDecl(I);
-  auto Reads = [&](const Stmt *X, auto &Self) -> bool {
-    if (!X)
-      return false;
-    if (auto *DRE = dyn_cast<DeclRefExpr>(X))
-      return DRE->getDecl() == P;
-    for (const Stmt *C : X->children())
-      if (Self(C, Self))
-        return true;
-    return false;
-  };
-  auto HasIf = [&](const Stmt *X, auto &Self) -> bool {
-    if (!X)
-      return false;
-    if (auto *If = dyn_cast<IfStmt>(X); If && !If->isConstexpr() && Reads(If->getCond(), Reads))
-      return true;
-    for (const Stmt *C : X->children())
-      if (Self(C, Self))
-        return true;
-    return false;
-  };
-  return HasIf(Body, HasIf);
-}
-
 // In a template's body the user wrote, a call one of whose candidates may be
 // specialized on the value of a local the call hands it (not a parameter,
 // not a constant): a value that exists only as the function runs, whatever
@@ -507,7 +476,10 @@ void cppshNeedForTemplateCall(Sema &S, Expr *Fn, ArrayRef<Expr *> Args) {
       continue;
     for (NamedDecl *ND : ULE->decls())
       if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
-          FTD && cppshFoldsOn(FTD->getTemplatedDecl(), I)) {
+          // A template whose return type is deduced: what its instantiation
+          // gives may depend on the value (no guess at which do).
+          FTD && FTD->getTemplatedDecl()->getBody() &&
+          FTD->getTemplatedDecl()->getReturnType()->getContainedAutoType()) {
         cppshMeetNeed(S);
         CppshCutNeedVar = VD;
         return;
@@ -8313,36 +8285,17 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         }
         if (!Rearranged.empty())
           ArgExprs = Rearranged;
-        // What a specialization on the arguments' values gains anything
-        // from: a plain `if` whose condition reads one of the parameters
-        // (folded, so that its branches may differ in type). An `if
-        // constexpr`, or an `if` on anything else, gains nothing -- and
-        // every call specialized made a new instantiation of its own
-        // (std::println: an if constexpr, its every call ~90 ms).
-        auto readsParam = [](const Stmt *S, const FunctionDecl *FD, auto &Self) -> bool {
-          if (!S)
-            return false;
-          if (auto *DRE = dyn_cast<DeclRefExpr>(S))
-            if (auto *P = dyn_cast<ParmVarDecl>(DRE->getDecl()))
-              return llvm::is_contained(FD->parameters(), P);
-          for (const Stmt *C : S->children())
-            if (Self(C, FD, Self))
-              return true;
-          return false;
+        // The candidates a call may be specialized on its arguments' values
+        // for: function templates whose return type is deduced -- what their
+        // instantiation gives may depend on those values (one read as a
+        // constant; a return of the type an `if` on a parameter picks).
+        auto ValueCandidate = [](NamedDecl *ND) -> bool {
+          auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
+          FunctionDecl *PatFD = FTD ? FTD->getTemplatedDecl() : nullptr;
+          return PatFD && PatFD->getBody() &&
+                 PatFD->getReturnType()->getContainedAutoType();
         };
-        const FunctionDecl *IfOwner = nullptr;
-        auto stmtHasIf = [&](const Stmt *S, auto &Self) -> bool {
-          if (!S)
-            return false;
-          if (auto *If = dyn_cast<IfStmt>(S);
-              If && !If->isConstexpr() && IfOwner &&
-              readsParam(If->getCond(), IfOwner, readsParam))
-            return true;
-          for (const Stmt *C : S->children())
-            if (C && Self(C, Self))
-              return true;
-          return false;
-        };
+        const bool AnyValueCandidate = llvm::any_of(ULE->decls(), ValueCandidate);
         // What each parameter had before this call set its value: put back
         // once the call is built.
         SmallVector<std::pair<ParmVarDecl *, std::optional<APValue>>, 4> SavedValues;
@@ -8380,21 +8333,33 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                     return CallExpr::Create(Context, Fn, ArgExprs,
                                             Context.DependentTy, VK_PRValue,
                                             RParenLoc, CurFPFeatureOverrides());
-        if (CurContext->isDependentContext()) {
-          for (NamedDecl *ND : ULE->decls()) {
-            auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
-            FunctionDecl *PatFD = FTD ? FTD->getTemplatedDecl() : nullptr;
-            Stmt *PatBody = PatFD ? PatFD->getBody() : nullptr;
-            IfOwner = PatFD;
-            if (!PatBody || !PatFD->getReturnType()->getContainedAutoType() ||
-                !stmtHasIf(PatBody, stmtHasIf))
-              continue;
-            for (Expr *ArgE : ArgExprs)
-              if (ArgE && ArgE->isValueDependent())
-                return CallExpr::Create(Context, Fn, ArgExprs,
-                                        Context.DependentTy, VK_PRValue,
-                                        RParenLoc, CurFPFeatureOverrides());
-          }
+        if (CurContext->isDependentContext() && AnyValueCandidate)
+          for (Expr *ArgE : ArgExprs)
+            if (ArgE && ArgE->isValueDependent())
+              return CallExpr::Create(Context, Fn, ArgExprs, Context.DependentTy,
+                                      VK_PRValue, RParenLoc,
+                                      CurFPFeatureOverrides());
+        // On demand: built as any call first (its diagnostics held back);
+        // only where that fails -- an instantiation needing a value its
+        // arguments have -- built again, with those values bound.
+        if (AnyValueCandidate && !CurContext->isDependentContext()) {
+          DiagnosticsEngine &Diags = getDiagnostics();
+          const bool WasSuppressed = Diags.getSuppressAllDiagnostics();
+          Diags.setSuppressAllDiagnostics(true);
+          ExprResult Plain = BuildOverloadedCallExpr(
+              Scope, Fn, ULE, LParenLoc, ArgExprs, RParenLoc, ExecConfig,
+              /*AllowTypoCorrection=*/false, find.IsAddressOfOperand);
+          Diags.setSuppressAllDiagnostics(WasSuppressed);
+          bool Fine = Plain.isUsable() && !Plain.get()->containsErrors();
+          if (Fine)
+            if (auto *CE = dyn_cast<CallExpr>(Plain.get()))
+              if (const FunctionDecl *Callee = CE->getDirectCallee())
+                Fine = !Callee->isInvalidDecl();
+          if (Fine)
+            return BuildOverloadedCallExpr(Scope, Fn, ULE, LParenLoc, ArgExprs,
+                                           RParenLoc, ExecConfig,
+                                           /*AllowTypoCorrection=*/true,
+                                           find.IsAddressOfOperand);
         }
         for (NamedDecl *ND : ULE->decls()) {
           auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
@@ -8405,9 +8370,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             continue;
           const FunctionDecl *BodyFD = nullptr;
           Stmt *PatBody = PatFD->getBody(BodyFD);
-          IfOwner = PatFD;
-          if (!PatBody || !PatFD->getReturnType()->getContainedAutoType() ||
-              !stmtHasIf(PatBody, stmtHasIf))
+          if (!PatBody || !PatFD->getReturnType()->getContainedAutoType())
             continue;
           for (unsigned I = 0;
                I < PatFD->getNumParams() && I < ArgExprs.size(); ++I) {
