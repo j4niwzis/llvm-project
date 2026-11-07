@@ -8754,6 +8754,12 @@ private:
   };
   CppshPending CppshPendingNow();
   void CppshDropPendingSince(const CppshPending &Since);
+  /// cppsh: the instantiations the last CppshDropPendingSince dropped (of
+  /// the local list where first is true).
+  using CppshDroppedPending = std::pair<bool, Sema::PendingImplicitInstantiation>;
+  std::vector<CppshDroppedPending> CppshDropped;
+  void CppshRequeueReferenced(ArrayRef<Stmt *> Made,
+                              ArrayRef<CppshDroppedPending> Dropped);
   /// cppsh: whether the recorded tokens [From, End) hold no `;` nor `{` of
   /// their own: an expression statement without its `;` (the last of an
   /// input, its value shown).

@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/PrettyDeclStackTrace.h"
 #include "clang/Basic/Attributes.h"
 #include "clang/Basic/PrettyStackTrace.h"
@@ -1380,6 +1381,25 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   if (Returns && !Staged &&
       (!Function || Nested || Function->getReturnType()->isUndeducedType()))
     return false;
+  // The instantiations the first parse queued, dropped by the caller: those
+  // the staged statement references queued again, once it is made.
+  auto Dropped = std::move(CppshDropped);
+  CppshDropped.clear();
+  // What the first parse declared (`a` of `a = std::array<int, n>{}`):
+  // out of scope -- the staged statement declares its own.
+  {
+    SourceManager &SM = PP.getSourceManager();
+    SmallVector<NamedDecl *, 4> FirstParse;
+    for (Decl *D : getCurScope()->decls())
+      if (auto *ND = dyn_cast<NamedDecl>(D);
+          ND && ND->getIdentifier() &&
+          !SM.isBeforeInTranslationUnit(ND->getLocation(), Begin))
+        FirstParse.push_back(ND);
+    for (NamedDecl *ND : FirstParse) {
+      getCurScope()->RemoveDecl(ND);
+      Actions.IdResolver.RemoveDecl(ND);
+    }
+  }
   // Its frame: the live locals (those its body does not name dropped by
   // Sema); a run-time template argument's value, a local made for it here.
   SmallVector<VarDecl *, 8> Locals = CppshLiveLocals(Begin);
@@ -1405,6 +1425,9 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     return false;
   Stmts.append(Before.begin(), Before.end());
   Stmts.push_back(S.get());
+  SmallVector<Stmt *, 4> Made(Before.begin(), Before.end());
+  Made.push_back(S.get());
+  CppshRequeueReferenced(Made, Dropped);
   if (Staged) {
     // A staged function: nothing returned of its own -- after the result is
     // kept, it returns.
@@ -1636,10 +1659,57 @@ Parser::CppshPending Parser::CppshPendingNow() {
 }
 
 void Parser::CppshDropPendingSince(const CppshPending &Since) {
+  CppshDropped.clear();
+  for (size_t I = Since.Global; I < Actions.PendingInstantiations.size(); ++I)
+    CppshDropped.push_back({false, Actions.PendingInstantiations[I]});
+  for (size_t I = Since.Local; I < Actions.PendingLocalImplicitInstantiations.size();
+       ++I)
+    CppshDropped.push_back({true, Actions.PendingLocalImplicitInstantiations[I]});
   if (Actions.PendingInstantiations.size() > Since.Global)
     Actions.PendingInstantiations.resize(Since.Global);
   if (Actions.PendingLocalImplicitInstantiations.size() > Since.Local)
     Actions.PendingLocalImplicitInstantiations.resize(Since.Local);
+}
+
+namespace {
+// The declarations code references: named, called, constructed with.
+struct CppshReferenced : RecursiveASTVisitor<CppshReferenced> {
+  llvm::SmallPtrSet<const Decl *, 32> Decls;
+  bool VisitDeclRefExpr(DeclRefExpr *E) {
+    Decls.insert(E->getDecl());
+    return true;
+  }
+  bool VisitMemberExpr(MemberExpr *E) {
+    Decls.insert(E->getMemberDecl());
+    return true;
+  }
+  bool VisitCXXConstructExpr(CXXConstructExpr *E) {
+    Decls.insert(E->getConstructor());
+    return true;
+  }
+  bool VisitCallExpr(CallExpr *E) {
+    if (const FunctionDecl *FD = E->getDirectCallee())
+      Decls.insert(FD);
+    return true;
+  }
+};
+} // namespace
+
+// A first parse's instantiations (CppshDropPendingSince) that what was made
+// from its statement references -- the same specializations, whose point of
+// instantiation that parse set, so that they are not queued again by their
+// use: queued again here. The others (made with values the first parse did
+// not have) stay dropped.
+void Parser::CppshRequeueReferenced(ArrayRef<Stmt *> Made,
+                                    ArrayRef<CppshDroppedPending> Dropped) {
+  CppshReferenced R;
+  for (Stmt *S : Made)
+    R.TraverseStmt(S);
+  for (const CppshDroppedPending &D : Dropped)
+    if (R.Decls.count(D.second.first))
+      (D.first ? Actions.PendingLocalImplicitInstantiations
+               : Actions.PendingInstantiations)
+          .push_back(D.second);
 }
 
 bool Parser::CppshEndsWithoutSemi(unsigned From, unsigned End) {

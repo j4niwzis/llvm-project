@@ -8333,6 +8333,27 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         // This call needs what only running its function gives (cppsh): the
         // body is cut at its statement, so the call is not built.
         bool CppshCutHere = false;
+        // An argument whose value is not known yet (a template parameter's,
+        // a staged parameter's in a staged statement) for a candidate that
+        // would be specialized on it: the call's type may depend on that
+        // value -- the call is dependent, resolved as its context is
+        // instantiated.
+        if (CurContext->isDependentContext()) {
+          for (NamedDecl *ND : ULE->decls()) {
+            auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
+            FunctionDecl *PatFD = FTD ? FTD->getTemplatedDecl() : nullptr;
+            Stmt *PatBody = PatFD ? PatFD->getBody() : nullptr;
+            IfOwner = PatFD;
+            if (!PatBody || !PatFD->getReturnType()->getContainedAutoType() ||
+                !stmtHasIf(PatBody, stmtHasIf))
+              continue;
+            for (Expr *ArgE : ArgExprs)
+              if (ArgE && ArgE->isValueDependent())
+                return CallExpr::Create(Context, Fn, ArgExprs,
+                                        Context.DependentTy, VK_PRValue,
+                                        RParenLoc, CurFPFeatureOverrides());
+          }
+        }
         for (NamedDecl *ND : ULE->decls()) {
           auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
           if (!FTD)
