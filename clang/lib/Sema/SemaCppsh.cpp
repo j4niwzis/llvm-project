@@ -295,9 +295,15 @@ StmtResult Sema::ActOnCppshStagedReturn(CppshStagedScope &Info,
   // A value whose type is known only as the function runs, returned from a
   // function whose type is deduced from it: the function is a staged one --
   // this code its rest, its result kept for its caller.
+  //
+  // (In a template, a return of a type-dependent value deduces the type as
+  // dependent -- the statement's first parse may have done so: not deduced
+  // all the same.)
   if (!Info.KeepsResult && Value && Value->isTypeDependent())
     if (FunctionDecl *FD = getCurFunctionDecl(/*AllowLambda=*/true);
-        FD && FD->getReturnType()->isUndeducedType())
+        FD && (FD->getReturnType()->isUndeducedType() ||
+               (FD->getDeclaredReturnType()->getContainedAutoType() &&
+                FD->getReturnType()->isDependentType())))
       Info.KeepsResult = true;
   // The function a staged one -- found so as it is parsed, or as a template
   // is instantiated (a value its returns depend on known only then): its
