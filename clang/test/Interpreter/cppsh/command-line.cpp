@@ -8,3 +8,11 @@ $ printf '%s\n' "spaced too"
 // CHECK: spaced too
 std::println("status {}", std::sh::last_status);
 // CHECK: status 0
+
+// `$( )` inside C++: a shell command as an expression -- captured into a
+// string, piped as any command is.
+std::string got = $(echo captured | tr a-z A-Z); std::println("got {}", got);
+// CHECK: got CAPTURED
+for (l : $(printf 'a\nb\n')) std::println("line {}", l.text);
+// CHECK: line a
+// CHECK: line b
