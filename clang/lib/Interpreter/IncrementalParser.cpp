@@ -30,6 +30,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/Signals.h"
 
 #include <sstream>
 
@@ -70,7 +71,16 @@ IncrementalParser::IncrementalParser(CompilerInstance &Instance,
 
 IncrementalParser::~IncrementalParser() { P.reset(); }
 
+// cppsh: a top-level declaration being parsed (ParseNextTopLevel): a unit
+// started meanwhile shown in the trace, with how it came to be.
+static bool CppshParsingTopLevel = false;
+
 void IncrementalParser::StartPTU() {
+  if (CppshParsingTopLevel && cppshTraceStaging()) {
+    llvm::errs() << "cppsh-trace: a unit started while a top-level declaration "
+                    "is parsed, from:\n";
+    llvm::sys::PrintStackTrace(llvm::errs(), 40);
+  }
   // Add a new PTU.
   ASTContext &C = S.getASTContext();
   C.addTranslationUnitDecl();
@@ -293,8 +303,10 @@ IncrementalParser::ParseNextTopLevel(bool First, bool &Done) {
   Sema::ModuleImportState ImportState;
   CppshTopLevelStarts.clear();
   CppshTopLevelStarts.push_back(P->getCurToken().getLocation());
+  CppshParsingTopLevel = true;
   const bool AtEOF = First ? P->ParseFirstTopLevelDecl(ADecl, ImportState)
                            : P->ParseTopLevelDecl(ADecl, ImportState);
+  CppshParsingTopLevel = false;
   (void)AtEOF;
   // One to be taken back for its staging (FinishPTU): not handed to code
   // generation -- what it declares is not what it will be (a staged call's
