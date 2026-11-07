@@ -1235,7 +1235,8 @@ void CodeGenModule::Release() {
   for (const auto &[Name, GD] : EmittedLinkOnceDecls)
     if (llvm::GlobalValue *GV = GetGlobalValue(Name);
         GV && !GV->isDeclaration() &&
-        (GV->hasLinkOnceLinkage() || GV->hasWeakLinkage())) {
+        (GV->hasLinkOnceLinkage() || GV->hasWeakLinkage()) &&
+        IncrementalExported.insert(Name).second) {
       GV->setLinkage(llvm::GlobalValue::ExternalLinkage);
       GV->setVisibility(llvm::GlobalValue::DefaultVisibility);
       GV->setDSOLocal(false);
@@ -5919,7 +5920,8 @@ llvm::Constant *CodeGenModule::GetOrCreateLLVMFunction(
       //
       // We also don't emit a definition for a function if it's going to be an
       // entry in a vtable, unless it's already marked as used.
-    } else if (getLangOpts().CPlusPlus && D) {
+    } else if (getLangOpts().CPlusPlus && D &&
+               !IncrementalExported.contains(MangledName)) {
       // Look for a declaration that's lexically in a record.
       for (const auto *FD = cast<FunctionDecl>(D)->getMostRecentDecl(); FD;
            FD = FD->getPreviousDecl()) {
@@ -9041,6 +9043,7 @@ void CodeGenModule::moveLazyEmissionStates(CodeGenModule *NewBuilder) {
   assert(NewBuilder->Manglings.empty() &&
          "Newly created module should not have manglings");
   NewBuilder->Manglings = std::move(Manglings);
+  NewBuilder->IncrementalExported = std::move(IncrementalExported);
 
   NewBuilder->WeakRefReferences = std::move(WeakRefReferences);
 

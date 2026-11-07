@@ -436,6 +436,12 @@ private:
   /// time). Put back only where the module is thrown away.
   llvm::DenseMap<llvm::StringRef, GlobalDecl> EmittedLinkOnceDecls;
 
+  /// In incremental compilation, the mangled names of what an earlier module
+  /// defined and exports (EmittedLinkOnceDecls, made external): referenced
+  /// from a later module, never emitted there again -- a class's inline
+  /// member was, on every first reference in a module, a second definition.
+  llvm::StringSet<> IncrementalExported;
+
   void addEmittedDeferredDecl(GlobalDecl GD) {
     // Reemission is only needed in incremental mode.
     if (!Context.getLangOpts().IncrementalExtensions)
