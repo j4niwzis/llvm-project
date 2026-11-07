@@ -39,6 +39,7 @@ class HeaderSearchOptions;
 class LangOptions;
 class PreprocessorOptions;
 class CompilerInstance;
+class TranslationUnitDecl;
 
 namespace CodeGen {
   class CodeGenModule;
@@ -113,6 +114,13 @@ public:
   /// Create a new \c llvm::Module after calling HandleTranslationUnit. This
   /// enable codegen in interactive processing environments.
   llvm::Module* StartModule(llvm::StringRef ModuleName, llvm::LLVMContext &C);
+
+  /// In interactive processing, a translation unit taken back. Its decls are
+  /// forgotten (no longer deferred, their mangled names free); where
+  /// \p ThrowModuleAway (its input failed, before its module was released),
+  /// the module being built is thrown away and a new one started, what was
+  /// to be emitted in it put back to be emitted where it is used again.
+  void DiscardIncrementalUnit(const TranslationUnitDecl *TU, bool ThrowModuleAway);
 };
 
 /// CreateLLVMCodeGen - Create a CodeGenerator instance.

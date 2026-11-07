@@ -62,6 +62,7 @@ namespace {
     };
 
     CoverageSourceInfo *CoverageInfo;
+    llvm::LLVMContext *LLVMCtx;
     std::unique_ptr<llvm::Module> M;
     std::unique_ptr<CodeGen::CodeGenModule> Builder;
     SmallVector<FunctionDecl *, 8> DeferredInlineMemberFuncDefs;
@@ -82,7 +83,7 @@ namespace {
                       CoverageSourceInfo *CoverageInfo = nullptr)
         : Diags(diags), Ctx(nullptr), FS(std::move(FS)), HeaderSearchOpts(HSO),
           PreprocessorOpts(PPO), CodeGenOpts(CGO), HandlingTopLevelDecls(0),
-          CoverageInfo(CoverageInfo),
+          CoverageInfo(CoverageInfo), LLVMCtx(&C),
           M(new llvm::Module(ExpandModuleName(ModuleName, CGO), C)) {
       C.setDiscardValueNames(CGO.DiscardValueNames);
     }
@@ -153,6 +154,21 @@ namespace {
         OldBuilder->moveLazyEmissionStates(Builder.get());
 
       return M.get();
+    }
+
+    void DiscardIncrementalUnit(const TranslationUnitDecl *TU, bool ThrowModuleAway) {
+      if (!Builder)
+        return;
+      if (ThrowModuleAway) {
+        Builder->discardIncrementalModule();
+        std::string Name = M ? M->getName().str() : std::string("incr_module_discarded");
+        M.reset();
+        StartModule(Name, *LLVMCtx);
+      }
+      Builder->forgetIncrementalUnit(TU);
+      llvm::erase_if(DeferredInlineMemberFuncDefs, [&](FunctionDecl *FD) {
+        return FD->getTranslationUnitDecl() == TU;
+      });
     }
 
     void Initialize(ASTContext &Context) override {
@@ -317,8 +333,14 @@ namespace {
       // If there are errors before or when releasing the Builder, reset
       // the module to stop here before invoking the backend.
       if (Diags.hasErrorOccurred()) {
-        if (Builder)
+        if (Builder) {
+          // Incremental: the top-level statements' function in flight
+          // finished while its module is still there, and what was taken
+          // out of the deferred decls for this module put back.
+          if (Ctx->getLangOpts().IncrementalExtensions)
+            Builder->discardIncrementalModule();
           Builder->clear();
+        }
         M.reset();
       }
 
@@ -392,6 +414,11 @@ llvm::Constant *CodeGenerator::GetAddrOfVTable(BaseSubobject base,
 llvm::Module *CodeGenerator::StartModule(llvm::StringRef ModuleName,
                                          llvm::LLVMContext &C) {
   return static_cast<CodeGeneratorImpl*>(this)->StartModule(ModuleName, C);
+}
+
+void CodeGenerator::DiscardIncrementalUnit(const TranslationUnitDecl *TU,
+                                           bool ThrowModuleAway) {
+  static_cast<CodeGeneratorImpl *>(this)->DiscardIncrementalUnit(TU, ThrowModuleAway);
 }
 
 std::unique_ptr<CodeGenerator>

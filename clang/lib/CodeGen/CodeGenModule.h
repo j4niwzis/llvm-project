@@ -480,6 +480,10 @@ private:
   /// by moveLazyEmissionStates() so later PTUs skip re-defining them.
   llvm::SmallPtrSet<const CXXRecordDecl *, 8> EmittedVTables;
 
+  /// In incremental compilation, EmittedVTables as this module began: what
+  /// a module thrown away (its input failed) puts back.
+  llvm::SmallPtrSet<const CXXRecordDecl *, 8> EmittedVTablesBefore;
+
   /// A queue of (optional) vtables that may be emitted opportunistically.
   std::vector<const CXXRecordDecl *> OpportunisticVTables;
 
@@ -1867,6 +1871,18 @@ public:
   /// essential for the incremental parsing environment like Clang Interpreter,
   /// because we'll lose all important information after each repl.
   void moveLazyEmissionStates(CodeGenModule *NewBuilder);
+
+  /// In incremental compilation, the module being built thrown away -- its
+  /// input failed: the top-level statements' function in flight finished
+  /// with it, the deferred decls a reference took out for it put back (the
+  /// next module emits them again where they are used), the vtables emitted
+  /// before it as they were. Called before the module is replaced.
+  void discardIncrementalModule();
+
+  /// In incremental compilation, the decls of a translation unit taken back
+  /// (an input undone, or failed) forgotten: no longer deferred, their
+  /// mangled names free for what is parsed again in their place.
+  void forgetIncrementalUnit(const TranslationUnitDecl *TU);
 
   /// Emit the IR encoding to attach the CUDA launch bounds attribute to \p F.
   /// If \p MaxThreadsVal is not nullptr, the max threads value is stored in it,

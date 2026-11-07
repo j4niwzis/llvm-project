@@ -22,6 +22,8 @@
 #include "llvm/Support/ErrorHandling.h"
 
 namespace clang {
+extern std::vector<Decl *> CppshDroppedDecls;
+
 IncrementalAction::IncrementalAction(CompilerInstance &Instance,
                                      llvm::LLVMContext &LLVMCtx,
                                      llvm::Error &Err, Interpreter &I,
@@ -139,8 +141,15 @@ bool InProcessPrintingASTConsumer::HandleTopLevelDecl(DeclGroupRef DGR) {
 
   CompilerInstance *CI = Interp.getCompilerInstance();
   DiagnosticsEngine &Diags = CI->getDiagnostics();
-  if (Diags.hasErrorOccurred())
+  // Not code generated while the input has an error -- but kept: what Sema
+  // instantiated meanwhile (a template's specialization, used later too)
+  // is handed over once only, and is given to code generation again once
+  // the failed input is taken back (IncrementalParser).
+  if (Diags.hasErrorOccurred()) {
+    for (Decl *D : DGR)
+      CppshDroppedDecls.push_back(D);
     return true;
+  }
 
   for (Decl *D : DGR)
     if (auto *TLSD = llvm::dyn_cast<TopLevelStmtDecl>(D))

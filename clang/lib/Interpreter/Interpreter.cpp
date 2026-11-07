@@ -1744,6 +1744,11 @@ llvm::Error Interpreter::Undo(unsigned N) {
         return Err;
     }
 
+    // Its module is out of the JIT already; code generation forgets its decls
+    // (deferred ones, mangled names), so what is parsed again in their place
+    // is not a second definition of the same name.
+    if (CodeGenerator *CG = Act->getCodeGen())
+      CG->DiscardIncrementalUnit(PTUs.back().TUPart, /*ThrowModuleAway=*/false);
     IncrParser->CleanUpPTU(PTUs.back().TUPart);
     PTUs.pop_back();
   }

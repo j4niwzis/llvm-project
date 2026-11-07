@@ -1080,6 +1080,12 @@ void CodeGenModule::checkAliases() {
 }
 
 void CodeGenModule::clear() {
+  // In incremental mode, what a reference took out of the deferred decls
+  // goes back to them: the module it was to be emitted in is dropped, and a
+  // later module must emit it again where it is used -- dropped here, its
+  // every later reference was left undefined (Symbols not found).
+  if (Context.getLangOpts().IncrementalExtensions)
+    DeferredDecls.insert_range(EmittedDeferredDecls);
   DeferredDeclsToEmit.clear();
   EmittedDeferredDecls.clear();
   DeferredAnnotations.clear();
@@ -9007,6 +9013,7 @@ void CodeGenModule::moveLazyEmissionStates(CodeGenModule *NewBuilder) {
   assert(NewBuilder->EmittedVTables.empty() &&
          "Newly created module should not have defined vtables");
   NewBuilder->EmittedVTables = std::move(EmittedVTables);
+  NewBuilder->EmittedVTablesBefore = NewBuilder->EmittedVTables;
 
   assert(NewBuilder->MangledDeclNames.empty() &&
          "Newly created module should not have mangled decl names");
@@ -9017,6 +9024,43 @@ void CodeGenModule::moveLazyEmissionStates(CodeGenModule *NewBuilder) {
   NewBuilder->WeakRefReferences = std::move(WeakRefReferences);
 
   NewBuilder->ABI->MangleCtx = std::move(ABI->MangleCtx);
+}
+
+void CodeGenModule::discardIncrementalModule() {
+  if (GlobalTopLevelStmtBlockInFlight.first) {
+    const TopLevelStmtDecl *TLSD = GlobalTopLevelStmtBlockInFlight.second;
+    GlobalTopLevelStmtBlockInFlight.first->FinishFunction(TLSD->getEndLoc());
+    GlobalTopLevelStmtBlockInFlight = {nullptr, nullptr};
+  }
+  DeferredDecls.insert_range(EmittedDeferredDecls);
+  EmittedDeferredDecls.clear();
+  DeferredDeclsToEmit.clear();
+  EmittedVTables = EmittedVTablesBefore;
+}
+
+void CodeGenModule::forgetIncrementalUnit(const TranslationUnitDecl *TU) {
+  auto InUnit = [&](const Decl *D) { return D && D->getTranslationUnitDecl() == TU; };
+  llvm::SmallVector<StringRef, 8> Deferred;
+  for (const auto &[Name, GD] : DeferredDecls)
+    if (InUnit(GD.getDecl()))
+      Deferred.push_back(Name);
+  for (StringRef Name : Deferred)
+    DeferredDecls.erase(Name);
+  llvm::SmallVector<llvm::StringMapEntry<GlobalDecl> *, 8> Names;
+  for (auto &Entry : Manglings)
+    if (InUnit(Entry.getValue().getDecl()))
+      Names.push_back(&Entry);
+  for (auto *Entry : Names)
+    Manglings.remove(Entry);
+  llvm::erase_if(DeferredVTables, [&](const CXXRecordDecl *RD) { return InUnit(RD); });
+  llvm::SmallVector<const CXXRecordDecl *, 4> VTables;
+  for (const CXXRecordDecl *RD : EmittedVTables)
+    if (InUnit(RD))
+      VTables.push_back(RD);
+  for (const CXXRecordDecl *RD : VTables) {
+    EmittedVTables.erase(RD);
+    EmittedVTablesBefore.erase(RD);
+  }
 }
 
 std::string CodeGenModule::getPFPFieldName(const FieldDecl *FD) {
