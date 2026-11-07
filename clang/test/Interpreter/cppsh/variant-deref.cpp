@@ -9,11 +9,11 @@ std::variant<int, std::string> v = std::string("hi");
 std::string s = *v;
 std::println("s {}", s);
 // CHECK: s hi
-auto show(std::variant<int, double> x) {
+auto print_held(std::variant<int, double> x) {
   auto y = *x;
   std::println("{}", y);
 }
-show(3);
+print_held(3);
 // CHECK: 3
-show(1.5);
+print_held(1.5);
 // CHECK: 1.5

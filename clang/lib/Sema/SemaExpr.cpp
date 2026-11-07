@@ -115,6 +115,10 @@ SourceLocation CppshStageAt;
 // CppshEmitRegion).
 bool CppshCutNeeded = false;
 llvm::DenseMap<SourceLocation::UIntTy, Expr *> CppshSuppliedExprs;
+// cppsh: a `*v` at the top level whose index is read at run time: where its
+// variant begins (the tokens run, then .index() of their value), mapped to
+// where its `*` is (the index supplied there: cppshStageDecl).
+llvm::DenseMap<SourceLocation::UIntTy, SourceLocation> CppshVariantIndexNeeds;
 
 bool cppshTraceStaging() {
   static const bool On = ::getenv("CPPSH_TRACE_STAGING") != nullptr;
@@ -376,21 +380,29 @@ ExprResult cppshVariantDeref(Sema &S, SourceLocation OpLoc, Expr *Input) {
   if (!Std)
     return ExprEmpty();
   Preprocessor &PP = S.getPreprocessor();
-  // (Supplied where the index expression begins: the variant's own start.)
-  Expr *Index = CppshSuppliedExprs.lookup(Input->getBeginLoc().getRawEncoding());
+  // (Supplied where the `*` is -- a top-level declaration compiled again --
+  // or where the index expression begins, the variant's own start -- a
+  // staged region's parameter.)
+  Expr *Index = CppshSuppliedExprs.lookup(OpLoc.getRawEncoding());
+  if (!Index)
+    Index = CppshSuppliedExprs.lookup(Input->getBeginLoc().getRawEncoding());
   if (!Index) {
+    // v.index(), of the variant's own source range: the tokens a top-level
+    // declaration runs for it are the variant's (CppshVariantIndexNeeds).
+    const SourceLocation End = Input->getEndLoc();
     CXXScopeSpec SS;
-    DeclarationNameInfo IndexName(&PP.getIdentifierTable().get("index"), OpLoc);
+    DeclarationNameInfo IndexName(&PP.getIdentifierTable().get("index"), End);
     ExprResult Member = S.BuildMemberReferenceExpr(
-        Input, Input->getType(), OpLoc, /*IsArrow=*/false, SS, SourceLocation(),
+        Input, Input->getType(), End, /*IsArrow=*/false, SS, SourceLocation(),
         /*FirstQualifierInScope=*/nullptr, IndexName, /*TemplateArgs=*/nullptr,
         /*S=*/nullptr);
     ExprResult Call = Member.isUsable()
-                          ? S.BuildCallExpr(nullptr, Member.get(), OpLoc, {}, OpLoc)
+                          ? S.BuildCallExpr(nullptr, Member.get(), End, {}, End)
                           : ExprError();
     if (!Call.isUsable())
       return ExprEmpty();
     Index = Call.get();
+    CppshVariantIndexNeeds[Input->getBeginLoc().getRawEncoding()] = OpLoc;
   }
   LookupResult R(S, &PP.getIdentifierTable().get("get"), OpLoc,
                  Sema::LookupOrdinaryName);

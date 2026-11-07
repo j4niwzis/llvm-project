@@ -1436,6 +1436,8 @@ extern bool CppshTopNeed;
 extern bool CppshCutNeeded;
 extern std::vector<Expr *> CppshCutStagedCalls;
 extern std::vector<SourceRange> CppshTopNeedExprs;
+extern llvm::DenseMap<SourceLocation::UIntTy, SourceLocation>
+    CppshVariantIndexNeeds;
 extern SourceLocation CppshHoistBegin, CppshHoistEnd;
 extern bool CppshInHoist;
 
@@ -2404,7 +2406,7 @@ extern "C" int __cppsh_staged_run(const void *Node, void *const *Frame,
 // where Keep (a run-time template argument's), or discarded (a staged call,
 // which leaves its own result).
 static VarDecl *cppshRunTokens(Interpreter &Interp, unsigned Begin, unsigned End,
-                               bool Keep, bool &Ok) {
+                               bool Keep, bool &Ok, bool IndexOf = false) {
   static unsigned Values = 0;
   Sema &S = Interp.getCompilerInstance()->getSema();
   ASTContext &Ctx = S.Context;
@@ -2423,6 +2425,19 @@ static VarDecl *cppshRunTokens(Interpreter &Interp, unsigned Begin, unsigned End
     P.EnterScope(Scope::FnScope | Scope::DeclScope | Scope::CompoundStmtScope);
     TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(P.getCurScope());
     E = P.CppshParseTokens(Begin, End);
+    // The index of the variant they make (a `*v`'s): E.index().
+    if (IndexOf && E.isUsable()) {
+      CXXScopeSpec SS;
+      DeclarationNameInfo IndexName(
+          &S.getPreprocessor().getIdentifierTable().get("index"), Loc);
+      ExprResult Member = S.BuildMemberReferenceExpr(
+          E.get(), E.get()->getType(), Loc, /*IsArrow=*/false, SS,
+          SourceLocation(), /*FirstQualifierInScope=*/nullptr, IndexName,
+          /*TemplateArgs=*/nullptr, /*S=*/nullptr);
+      E = Member.isUsable()
+              ? S.BuildCallExpr(nullptr, Member.get(), Loc, {}, Loc)
+              : ExprError();
+    }
     // A staged call in it is run here, as it is: no need of anything.
     CppshCutNeeded = false;
     CppshCutStagedCalls.clear();
@@ -2504,12 +2519,18 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
       if (!B || !E)
         return Fail("cppsh: the run-time template argument's tokens are not known");
       bool Ok = false;
-      VarDecl *Value = cppshRunTokens(*this, *B, *E + 1, /*Keep=*/true, Ok);
+      // A `*v`'s index: the variant's tokens run, its index kept, supplied
+      // where the `*` is.
+      const auto IndexOf =
+          CppshVariantIndexNeeds.find(Need.getBegin().getRawEncoding());
+      const bool IsIndex = IndexOf != CppshVariantIndexNeeds.end();
+      VarDecl *Value =
+          cppshRunTokens(*this, *B, *E + 1, /*Keep=*/true, Ok, IsIndex);
       std::optional<APValue> Now = Value ? cppshRuntimeValueOf(Value) : std::nullopt;
       if (!Now)
         return Fail("cppsh: the run-time template argument's value is not known");
       const QualType T = Value->getType();
-      const SourceLocation At = Need.getBegin();
+      const SourceLocation At = IsIndex ? IndexOf->second : Need.getBegin();
       // Its value, as a constant: a literal of an integer or a floating
       // type; otherwise the variable holding it, its value attached
       // (ConstantExpr) -- what a template argument of any type can be.
@@ -2696,6 +2717,7 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
     Hoisted.clear();
     CppshHoistSupplies.clear();
     CppshSuppliedExprs.clear();
+    CppshVariantIndexNeeds.clear();
     if (!TU)
       return Failed(TU.takeError());
     PartialTranslationUnit &PTU = IncrParser->RegisterPTU(*TU);
