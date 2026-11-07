@@ -2366,6 +2366,10 @@ extern "C" void *__cppsh_staged_prepare(const void *Node, void *const *Frame,
 // What follows the call of a prepared run: how it left, given back; the
 // result it kept named (a staged function's rest).
 extern "C" int __cppsh_staged_done(const void *Node, int Left) {
+  // Nothing in flight on this thread (a run that took the fast path): how it
+  // left, as it is -- the in-flight runs this thread's own, no lock needed.
+  if (CppshRunsInFlight.empty())
+    return Left;
   std::lock_guard<std::recursive_mutex> Lock(CppshInterpreterLock);
   auto It = std::find_if(CppshRunsInFlight.rbegin(), CppshRunsInFlight.rend(),
                          [&](const CppshRunInFlight &R) { return R.Staged == Node; });
