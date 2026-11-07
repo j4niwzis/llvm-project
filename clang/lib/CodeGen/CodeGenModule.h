@@ -424,8 +424,17 @@ private:
     addEmittedDeferredDecl(GD);
   }
 
-  /// Decls that were DeferredDecls and have now been emitted.
+  /// Decls that were DeferredDecls and have now been emitted, with internal
+  /// linkage: emitted again in each module that uses them (another module
+  /// cannot reach them).
   llvm::DenseMap<llvm::StringRef, GlobalDecl> EmittedDeferredDecls;
+
+  /// Decls that were DeferredDecls and have now been emitted, linkonce or
+  /// weak: once the module is released, exported by the JIT for every later
+  /// module to link to -- not emitted again (each input re-emitted, and the
+  /// JIT compiled again, all the inline code it used: std::format's every
+  /// time). Put back only where the module is thrown away.
+  llvm::DenseMap<llvm::StringRef, GlobalDecl> EmittedLinkOnceDecls;
 
   void addEmittedDeferredDecl(GlobalDecl GD) {
     // Reemission is only needed in incremental mode.
@@ -439,11 +448,11 @@ private:
     else if (auto *VD = llvm::dyn_cast<VarDecl>(GD.getDecl()))
       L = getLLVMLinkageVarDefinition(VD);
 
-    if (llvm::GlobalValue::isInternalLinkage(L) ||
-        llvm::GlobalValue::isLinkOnceLinkage(L) ||
-        llvm::GlobalValue::isWeakLinkage(L)) {
+    if (llvm::GlobalValue::isInternalLinkage(L))
       EmittedDeferredDecls[getMangledName(GD)] = GD;
-    }
+    else if (llvm::GlobalValue::isLinkOnceLinkage(L) ||
+             llvm::GlobalValue::isWeakLinkage(L))
+      EmittedLinkOnceDecls[getMangledName(GD)] = GD;
   }
 
   /// List of alias we have emitted. Used to make sure that what they point to

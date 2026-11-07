@@ -1084,10 +1084,13 @@ void CodeGenModule::clear() {
   // goes back to them: the module it was to be emitted in is dropped, and a
   // later module must emit it again where it is used -- dropped here, its
   // every later reference was left undefined (Symbols not found).
-  if (Context.getLangOpts().IncrementalExtensions)
+  if (Context.getLangOpts().IncrementalExtensions) {
     DeferredDecls.insert_range(EmittedDeferredDecls);
+    DeferredDecls.insert_range(EmittedLinkOnceDecls);
+  }
   DeferredDeclsToEmit.clear();
   EmittedDeferredDecls.clear();
+  EmittedLinkOnceDecls.clear();
   DeferredAnnotations.clear();
   if (OpenMPRuntime)
     OpenMPRuntime->clear();
@@ -1220,8 +1223,11 @@ void CodeGenModule::Release() {
   if (CXX20ModuleInits && Primary && !Primary->isHeaderLikeModule())
     EmitModuleInitializers(Primary);
   EmitDeferred();
+  // Internal ones emitted again where used; linkonce ones linked to from
+  // here on (EmittedLinkOnceDecls).
   DeferredDecls.insert_range(EmittedDeferredDecls);
   EmittedDeferredDecls.clear();
+  EmittedLinkOnceDecls.clear();
   EmitVTablesOpportunistically();
   applyGlobalValReplacements();
   applyReplacements();
@@ -9033,7 +9039,9 @@ void CodeGenModule::discardIncrementalModule() {
     GlobalTopLevelStmtBlockInFlight = {nullptr, nullptr};
   }
   DeferredDecls.insert_range(EmittedDeferredDecls);
+  DeferredDecls.insert_range(EmittedLinkOnceDecls);
   EmittedDeferredDecls.clear();
+  EmittedLinkOnceDecls.clear();
   DeferredDeclsToEmit.clear();
   EmittedVTables = EmittedVTablesBefore;
 }
