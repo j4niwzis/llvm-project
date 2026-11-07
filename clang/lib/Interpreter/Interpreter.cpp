@@ -1451,9 +1451,12 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   }
   const std::string &LoopRest =
       Id < CppshCutLoopRests.size() ? CppshCutLoopRests[Id] : std::string();
+  // After the text taken from the user's input (its #line marks, ParseStmt),
+  // what is generated here said to be so.
+  const std::string Generated = "\n#line 1 \"<cppsh continuation>\"\n";
   if (LoopRest.empty()) {
     Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {\n" + CppshCutRemainders[Id] +
-            "\n}\n";
+            Generated + "}\n";
   } else {
     // Made in a loop: the iteration finished with the values it has, as
     // constants; the loop run on (__cppsh_loopK, a plain function) with them
@@ -1473,10 +1476,11 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
     std::string Flag = "__cppsh_brk" + std::to_string(Id);
     RefParams += std::string(RefParams.empty() ? "" : ", ") + "bool " + Flag;
     RefArgs += std::string(RefArgs.empty() ? "" : ", ") + Flag;
-    Code += "auto __cppsh_loop" + Tag + "(" + RefParams + ") {\n" + LoopRest + "\n}\n";
+    Code += "auto __cppsh_loop" + Tag + "(" + RefParams + ") {\n" + LoopRest + Generated +
+            "}\n";
     Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {\nbool " + Flag +
-            " = false;\ndo { " + CppshCutRemainders[Id] +
-            "\n} while (false);\nreturn __cppsh_loop" + Tag + "(" + RefArgs + ");\n}\n";
+            " = false;\ndo { " + CppshCutRemainders[Id] + Generated +
+            "} while (false);\nreturn __cppsh_loop" + Tag + "(" + RefArgs + ");\n}\n";
   }
   Code += "auto __cppsh_res" + Tag +
           " = ::std::sh::__cppsh_value([] { return __cppsh_cont" + Tag + "(" + Args +

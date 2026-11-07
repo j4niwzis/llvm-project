@@ -1151,6 +1151,25 @@ extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTy
 // The next compound statement parsed is a function's body (cppsh: the block a
 // cut is made in).
 static bool CppshNextCompoundIsBody = false;
+
+// Where text taken from what the user typed came from, for the continuation it
+// goes into (cppsh): a #line naming its buffer and line, and spaces to its
+// column -- so that an error in the continuation points at the line typed,
+// not at the generated text. (Only what a location presumes: the staging
+// itself reads the real buffers' offsets.)
+static std::string cppshLineMark(SourceManager &SM, SourceLocation Loc) {
+  PresumedLoc P = SM.getPresumedLoc(SM.getFileLoc(Loc));
+  if (P.isInvalid())
+    return "";
+  std::string File;
+  for (char C : llvm::StringRef(P.getFilename())) {
+    if (C == '"' || C == '\\')
+      File += '\\';
+    File += C;
+  }
+  return "\n#line " + std::to_string(P.getLine()) + " \"" + File + "\"\n" +
+         std::string(P.getColumn() > 0 ? P.getColumn() - 1 : 0, ' ');
+}
 // Where the body of the function being parsed opens (cppsh), and the cuts made
 // in blocks nested in it whose remainders still wait for what follows those
 // blocks in the blocks around them.
@@ -1383,13 +1402,15 @@ static void cppshWrapLoop(Sema &S, Preprocessor &PP, size_t OpenBefore,
     return;
   std::string Restart;
   if (auto *W = dyn_cast<WhileStmt>(Loop))
-    Restart = text(W);
+    Restart = cppshLineMark(SM, W->getBeginLoc()) + text(W);
   else if (auto *D = dyn_cast<DoStmt>(Loop))
-    Restart = "while (" + text(D->getCond()) + ") " + text(D->getBody());
+    Restart = "while (" + text(D->getCond()) + ") " +
+              cppshLineMark(SM, D->getBody()->getBeginLoc()) + text(D->getBody());
   else if (auto *F = dyn_cast<ForStmt>(Loop); F && !F->getConditionVariable()) {
     std::string Inc = text(F->getInc());
     Restart = (Inc.empty() ? "" : Inc + "; ") + "for (; " + text(F->getCond()) + "; " +
-              Inc + ") " + text(F->getBody());
+              Inc + ") " + cppshLineMark(SM, F->getBody()->getBeginLoc()) +
+              text(F->getBody());
   } else if (auto *RF = dyn_cast<CXXForRangeStmt>(Loop)) {
     // Its iterators (handed over): on from the next element.
     auto varOf = [](Stmt *X) -> VarDecl * {
@@ -1407,7 +1428,8 @@ static void cppshWrapLoop(Sema &S, Preprocessor &PP, size_t OpenBefore,
               .str();
       std::string Bn = B->getName().str(), En = E->getName().str();
       Restart = "++" + Bn + "; for (; " + Bn + " != " + En + "; ++" + Bn + ") { " + Var +
-                " = *" + Bn + "; " + text(RF->getBody()) + " }";
+                " = *" + Bn + "; " + cppshLineMark(SM, RF->getBody()->getBeginLoc()) +
+                text(RF->getBody()) + " }";
     }
   }
   unsigned ID = S.getDiagnostics().getCustomDiagID(DiagnosticsEngine::Error, "%0");
@@ -1611,7 +1633,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
                           Actions.Context, Policy, /*WithGlobalNsPrefix=*/true));
     }
     unsigned Id = CppshCutRemainders.size();
-    CppshCutRemainders.push_back(Rest.str());
+    CppshCutRemainders.push_back(cppshLineMark(SM, Loc) + Rest.str());
     CppshCutLoopRests.emplace_back();
     CppshCutLocalNames.push_back(std::move(Names));
     CppshCutLocalTypes.push_back(std::move(Types));
@@ -1797,7 +1819,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
         // Made in a loop: what follows comes after the loop, run on.
         std::string &To = Loop.empty() ? Inner : Loop;
         if (!cppshReturnsAlways(To, getLangOpts()))
-          To = "{ " + To + " } " + Rest;
+          To = "{ " + To + " } " + cppshLineMark(SM, After) + Rest;
       }
       unsigned Id = CppshEmitCut(Rest, After, FD);
       // Made for what the cuts in the statement were made for, if one local.

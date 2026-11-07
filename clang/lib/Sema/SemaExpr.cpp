@@ -326,6 +326,25 @@ bool cppshMutates(const Stmt *S, const VarDecl *VD) {
   return false;
 }
 
+// Where text taken from what the user typed came from, for the continuation it
+// goes into (cppsh): a #line naming its buffer and line, and spaces to its
+// column -- so that an error in the continuation points at the line typed,
+// not at the generated text. (Only what a location presumes: the staging
+// itself reads the real buffers' offsets.)
+static std::string cppshLineMark(SourceManager &SM, SourceLocation Loc) {
+  PresumedLoc P = SM.getPresumedLoc(SM.getFileLoc(Loc));
+  if (P.isInvalid())
+    return "";
+  std::string File;
+  for (char C : llvm::StringRef(P.getFilename())) {
+    if (C == '"' || C == '\\')
+      File += '\\';
+    File += C;
+  }
+  return "\n#line " + std::to_string(P.getLine()) + " \"" + File + "\"\n" +
+         std::string(P.getColumn() > 0 ? P.getColumn() - 1 : 0, ' ');
+}
+
 // std::sh::<Name>, as an expression to call.
 static ExprResult cppshShCallee(Sema &S, StringRef Name, SourceLocation Loc) {
   NamespaceDecl *Std = S.getStdNamespace();
@@ -400,7 +419,7 @@ void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
                         S.Context, Policy, /*WithGlobalNsPrefix=*/true));
   }
   unsigned Id = CppshCutRemainders.size();
-  CppshCutRemainders.push_back(Rest.str());
+  CppshCutRemainders.push_back(cppshLineMark(SM, Loc) + Rest.str());
   CppshCutLoopRests.emplace_back();
   CppshCutLocalNames.push_back(std::move(Names));
   CppshCutLocalTypes.push_back(std::move(Types));
