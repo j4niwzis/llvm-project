@@ -90,6 +90,8 @@ void IncrementalParser::StartPTU() {
   }
   CppshDroppedDecls.clear();
   ConsumerFailed = false;
+  // What it uses and nothing defines, from here on its own.
+  UndefinedUsedAtStart = S.UndefinedButUsed.size();
 }
 
 // A failed input taken back whole: its decls out of the AST, the module code
@@ -108,6 +110,9 @@ llvm::Error IncrementalParser::TakeBackPTU(llvm::StringRef Why) {
     S.CurContext = nullptr;
     S.ActOnTranslationUnitScope(S.TUScope);
   }
+  // Its uses of what nothing defines gone with it: no warning of them.
+  while (S.UndefinedButUsed.size() > UndefinedUsedAtStart)
+    S.UndefinedButUsed.pop_back();
   DiagnosticsEngine &Diags = S.getDiagnostics();
   Diags.Reset(/*soft=*/true);
   Diags.getClient()->clear();

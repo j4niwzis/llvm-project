@@ -100,6 +100,8 @@ private:
 
   /// The consumer rejected a declaration of the unit being built.
   bool ConsumerFailed = false;
+  // cppsh: how many of Sema's UndefinedButUsed there were as the unit began.
+  size_t UndefinedUsedAtStart = 0;
   /// Parsing an input one top-level declaration at a time, past its first.
   bool StepwiseInput = false;
   /// The instantiation scopes of the unit being built.

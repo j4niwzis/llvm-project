@@ -254,19 +254,59 @@ struct __cppsh_member_fn {
     return obj.[:mem:];
   }
 
+  // A member function taking nothing, named as a value (`_.is_dir`): called,
+  // as a command named alone is (its name alone means nothing else).
+  template <typename... Xs>
+  static consteval bool is_nullary_method_eval() {
+    if constexpr (sizeof...(Xs) == 0) {
+      return false;
+    } else if constexpr (requires {
+                           std::declval<const Prev &>()(std::declval<Xs>()...);
+                         }) {
+      using ObjT =
+          decltype(std::declval<const Prev &>()(std::declval<Xs>()...));
+      using B = std::remove_cvref_t<ObjT>;
+      constexpr meta::info mem = meta::find_member(^^B, name);
+      if constexpr (meta::is_member_function(mem))
+        return requires(ObjT &&o) { static_cast<ObjT &&>(o).[:mem:](); };
+      else
+        return false;
+    } else {
+      return false;
+    }
+  }
+  template <typename... Xs>
+    requires (is_nullary_method_eval<Xs...>())
+  constexpr decltype(auto) operator()(Xs &&...xs) const {
+    auto &&obj = prev(static_cast<Xs &&>(xs)...);
+    using B = std::remove_cvref_t<decltype(obj)>;
+    constexpr meta::info mem = meta::find_member(^^B, name);
+    return static_cast<decltype(obj) &&>(obj).[:mem:]();
+  }
+
   // On a variant (an entry of `ls`: a file, a directory or a link): the
   // member of whichever alternative it holds, as __cppsh_variant_member
   // says -- the alternative is the entry's kind, stored nowhere else.
+  // (A member function taking nothing as well: its value, called.)
   template <typename A>
   static consteval bool alt_has() {
     using B = std::remove_cvref_t<A>;
-    return meta::is_nonstatic_data_member(meta::find_member(^^B, name));
+    constexpr meta::info mem = meta::find_member(^^B, name);
+    if constexpr (meta::is_nonstatic_data_member(mem))
+      return true;
+    else if constexpr (meta::is_member_function(mem))
+      return requires(const B &b) { b.[:mem:](); };
+    else
+      return false;
   }
   template <typename A>
   static constexpr decltype(auto) alt_member(A &&a) {
     using B = std::remove_cvref_t<A>;
     constexpr meta::info mem = meta::find_member(^^B, name);
-    return (static_cast<A &&>(a).[:mem:]);
+    if constexpr (meta::is_member_function(mem))
+      return static_cast<A &&>(a).[:mem:]();
+    else
+      return (static_cast<A &&>(a).[:mem:]);
   }
   template <typename... Xs>
   static consteval bool is_variant_member_eval() {
