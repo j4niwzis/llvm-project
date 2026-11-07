@@ -74,6 +74,11 @@ IncrementalParser::~IncrementalParser() { P.reset(); }
 // cppsh: a top-level declaration being parsed (ParseNextTopLevel): a unit
 // started meanwhile shown in the trace, with how it came to be.
 static bool CppshParsingTopLevel = false;
+// cppsh: a unit built since the last top-level declaration was parsed (a
+// snapshot before the next one): the scope and Sema's context are that
+// unit's -- the next parsed starts a scope of its own, as one between two
+// top-level declarations does, its first of an input too.
+static bool CppshBuiltSinceParse = false;
 
 void IncrementalParser::StartPTU() {
   if (CppshParsingTopLevel && cppshTraceStaging()) {
@@ -235,6 +240,7 @@ llvm::Error IncrementalParser::BeginBuild() {
   BuildGlobalInstantiations.emplace(S, /*Enabled=*/true, /*AtEndOfTU=*/true);
   BuildLocalInstantiations.emplace(S, /*AtEndOfTU=*/true);
   StartPTU();
+  CppshBuiltSinceParse = true;
   return llvm::Error::success();
 }
 
@@ -296,7 +302,8 @@ IncrementalParser::ParseNextTopLevel(bool First, bool &Done) {
   Sema::GlobalEagerInstantiationScope GlobalInstantiations(S, /*Enabled=*/true,
                                                            /*AtEndOfTU=*/true);
   Sema::LocalEagerInstantiationScope LocalInstantiations(S, /*AtEndOfTU=*/true);
-  StepwiseInput = !First;
+  StepwiseInput = !First || CppshBuiltSinceParse;
+  CppshBuiltSinceParse = false;
   StartPTU();
   StepwiseInput = true;
   Parser::DeclGroupPtrTy ADecl;
@@ -406,6 +413,15 @@ IncrementalParser::Parse(llvm::StringRef input) {
 
 void IncrementalParser::withdrawMostRecentTU(
     TranslationUnitDecl *MostRecentTU) {
+  if (CppshParsingTopLevel && cppshTraceStaging()) {
+    llvm::errs() << "cppsh-trace: a unit withdrawn while a top-level declaration "
+                    "is parsed"
+                 << (MostRecentTU == S.getASTContext().getTranslationUnitDecl()
+                         ? ""
+                         : " (not the current one)")
+                 << ", from:\n";
+    llvm::sys::PrintStackTrace(llvm::errs(), 40);
+  }
   TranslationUnitDecl *Prev = MostRecentTU->getPreviousDecl();
   if (!Prev)
     return;
