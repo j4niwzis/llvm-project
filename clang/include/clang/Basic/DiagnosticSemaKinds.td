@@ -6062,6 +6062,21 @@ def note_expansion_stmt_instantiation_here : Note<
   "in instantiation of expansion statement requested here">;
 def note_cppsh_staged_instantiation_here : Note<
   "in the code compiled here for the values the function runs with">;
+def err_cppsh_staged_nested_return : Error<
+  "a return from code staged inside other staged code is not supported">;
+def err_cppsh_staged_result_jump : Error<
+  "code that gives a staged function its result cannot also break or "
+  "continue a loop around it">;
+def err_cppsh_staged_result_falls_through : Error<
+  "code that gives a staged function its result must return on every path, "
+  "or be the rest of the function's body">;
+def err_cppsh_staged_case : Error<
+  "%select{'case'|'default'}0 label of a switch around staged code cannot be "
+  "inside it">;
+def err_cppsh_staged_label : Error<
+  "labels and 'goto' are not supported in staged code">;
+def err_cppsh_staged_coroutine : Error<
+  "'%0' is not supported in staged code">;
 def note_template_exception_spec_instantiation_here : Note<
   "in instantiation of exception specification for %0 requested here">;
 def note_template_requirement_instantiation_here : Note<

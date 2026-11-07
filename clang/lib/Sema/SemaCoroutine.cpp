@@ -582,6 +582,13 @@ static FunctionScopeInfo *checkCoroutineContext(Sema &S, SourceLocation Loc,
   if (!isValidCoroutineContext(S, Loc, Keyword))
     return nullptr;
 
+  // cppsh: staged code is compiled into a function of its own, which cannot
+  // suspend the coroutine it is in.
+  if (S.getCppshStagedJumpScope()) {
+    S.Diag(Loc, diag::err_cppsh_staged_coroutine) << Keyword;
+    return nullptr;
+  }
+
   assert(S.CurContext->getEnclosingFunction() && "not in a function scope");
 
   auto *ScopeInfo = S.getCurFunction();

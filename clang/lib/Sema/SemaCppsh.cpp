@@ -205,6 +205,10 @@ StmtResult Sema::ActOnCppshStagedLeave(SourceLocation Loc, Scope *Target,
   for (Scope *S = Info->BodyScope; S; S = S->getParent()) {
     if (S != Target)
       continue;
+    if (Info->KeepsResult) {
+      Diag(Loc, diag::err_cppsh_staged_result_jump);
+      return StmtError();
+    }
     Info->Leaves |= IsContinue ? CppshStagedStmt::LeavesByContinue
                                : CppshStagedStmt::LeavesByBreak;
     return new (Context) CppshStagedExitStmt(
@@ -218,6 +222,25 @@ StmtResult Sema::ActOnCppshStagedReturn(CppshStagedScope &Info,
                                         SourceLocation Loc, Expr *Value,
                                         Scope *CurScope) {
   Info.Leaves |= CppshStagedStmt::LeavesByReturn;
+  // From staged code inside other staged code: the inner one is compiled
+  // into a function of the outer one's -- no way to the function both are in.
+  if (CppshStagedScopes.size() > 1) {
+    Diag(Loc, diag::err_cppsh_staged_nested_return);
+    return StmtError();
+  }
+  // A value whose type is known only as the function runs, returned from a
+  // function whose type is deduced from it: the function is a staged one --
+  // this code its rest, its result kept for its caller.
+  if (!Info.KeepsResult && Value && Value->isTypeDependent())
+    if (FunctionDecl *FD = getCurFunctionDecl(/*AllowLambda=*/true);
+        FD && FD->getReturnType()->isUndeducedType())
+      Info.KeepsResult = true;
+  if (Info.KeepsResult &&
+      (Info.Leaves & (CppshStagedStmt::LeavesByBreak |
+                      CppshStagedStmt::LeavesByContinue))) {
+    Diag(Loc, diag::err_cppsh_staged_result_jump);
+    return StmtError();
+  }
   // The rest of a staged function's body: what it returns is kept for the
   // function's caller, of its own type -- not the function's.
   if (Info.KeepsResult) {

@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/AST/StmtCXX.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/PrettyDeclStackTrace.h"
 #include "clang/Basic/Attributes.h"
@@ -1194,98 +1195,24 @@ static bool cppshCutsIn(Sema &S, Scope *Sc) {
   return Sc != nullptr;
 }
 
-// The tokens of W of code's own: not inside a loop (SkipLoops) or a switch
-// (SkipSwitch) the code holds itself -- its own `break`s, `continue`s,
-// `case` labels.
-static SmallVector<size_t, 4> cppshOwnTokens(ArrayRef<Token> Toks,
-                                             tok::TokenKind W, bool SkipLoops,
-                                             bool SkipSwitch) {
-  auto skipGroup = [&](size_t I) {
-    int Depth = 0;
-    for (; I < Toks.size(); ++I) {
-      if (Toks[I].isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
-        ++Depth;
-      else if (Toks[I].isOneOf(tok::r_paren, tok::r_brace, tok::r_square) &&
-               --Depth <= 0)
-        return I + 1;
-    }
-    return I;
-  };
-  auto skipStmt = [&](size_t I) {
-    if (I < Toks.size() && Toks[I].is(tok::l_brace))
-      return skipGroup(I);
-    for (; I < Toks.size(); ++I) {
-      if (Toks[I].isOneOf(tok::l_paren, tok::l_brace, tok::l_square)) {
-        I = skipGroup(I) - 1;
-        continue;
-      }
-      if (Toks[I].is(tok::semi))
-        return I + 1;
-    }
-    return I;
-  };
-  SmallVector<size_t, 4> Found;
-  for (size_t I = 0; I < Toks.size();) {
-    if (Toks[I].is(W)) {
-      Found.push_back(I++);
-      continue;
-    }
-    if ((SkipLoops && Toks[I].isOneOf(tok::kw_for, tok::kw_while)) ||
-        (SkipSwitch && Toks[I].is(tok::kw_switch))) {
-      ++I;
-      if (I < Toks.size() && Toks[I].is(tok::l_paren))
-        I = skipGroup(I);
-      I = skipStmt(I);
-      continue;
-    }
-    if (SkipLoops && Toks[I].is(tok::kw_do)) {
-      I = skipStmt(I + 1);
-      continue;
-    }
-    ++I;
-  }
-  return Found;
-}
-
-// Whether code leaves the function it is in, or jumps where a function of its
-// own could not: a return, a goto, a co_*, a label of a switch around it.
-// (A break or continue of a loop around it can be told back: cppshLeavesLoop.)
-static bool cppshLeavesFunction(ArrayRef<Token> Toks) {
-  for (const Token &T : Toks)
-    if (T.isOneOf(tok::kw_goto, tok::kw_co_return, tok::kw_co_yield,
-                  tok::kw_co_await))
-      return true;
-  return !cppshOwnTokens(Toks, tok::kw_case, false, true).empty() ||
-         !cppshOwnTokens(Toks, tok::kw_default, false, true).empty();
-}
-
-// Whether code returns (from its function -- or from a lambda in it: a
-// return a region would tell back where it need not).
-static bool cppshReturns(ArrayRef<Token> Toks) {
-  return llvm::any_of(Toks, [](const Token &T) { return T.is(tok::kw_return); });
-}
-
-// Whether code always returns: a return statement of its own at its top
-// level (what follows it is dead), not one an if or else makes.
-static bool cppshAlwaysReturns(ArrayRef<Token> Toks) {
-  int Depth = 0;
-  for (size_t I = 0; I < Toks.size(); ++I) {
-    const Token &T = Toks[I];
-    if (T.isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
-      ++Depth;
-    else if (T.isOneOf(tok::r_paren, tok::r_brace, tok::r_square))
-      --Depth;
-    else if (Depth == 0 && T.is(tok::kw_return) &&
-             (I == 0 || Toks[I - 1].isOneOf(tok::semi, tok::l_brace, tok::r_brace)))
-      return true;
-  }
+// Whether staged code always returns: a return of its own at its top level
+// (what follows is dead), or an if whose both branches do.
+static bool cppshAlwaysReturns(const Stmt *S) {
+  if (!S)
+    return false;
+  if (const auto *Exit = dyn_cast<CppshStagedExitStmt>(S))
+    return Exit->getKind() == CppshStagedExitStmt::Return;
+  if (isa<ReturnStmt>(S))
+    return true;
+  if (const auto *C = dyn_cast<CompoundStmt>(S))
+    return llvm::any_of(C->body(),
+                        [](const Stmt *X) { return cppshAlwaysReturns(X); });
+  if (const auto *If = dyn_cast<IfStmt>(S))
+    return If->getElse() && cppshAlwaysReturns(If->getThen()) &&
+           cppshAlwaysReturns(If->getElse());
+  if (const auto *A = dyn_cast<AttributedStmt>(S))
+    return cppshAlwaysReturns(A->getSubStmt());
   return false;
-}
-
-// Whether code breaks out of, or continues, a loop (or switch) around it.
-static bool cppshLeavesLoop(ArrayRef<Token> Toks) {
-  return !cppshOwnTokens(Toks, tok::kw_break, true, true).empty() ||
-         !cppshOwnTokens(Toks, tok::kw_continue, true, false).empty();
 }
 
 // The locals live at Loc in the function being parsed, each the innermost of
@@ -1360,27 +1287,6 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
                         : std::optional<unsigned>(CppshInputTokens.size());
   if (!E || *E <= *B)
     return false;
-  ArrayRef<Token> Toks = ArrayRef<Token>(CppshInputTokens).slice(*B, *E - *B);
-  if (cppshLeavesFunction(Toks))
-    return false;
-  // In a staged statement's body already: returning from both is not
-  // something one function compiled for the inner one could do.
-  const bool Nested = !Actions.CppshStagedScopes.empty();
-  const bool Returns = cppshReturns(Toks);
-  FunctionDecl *Function = Actions.getCurFunctionDecl(/*AllowLambda=*/true);
-  // The rest of the body, returning what gives the function its type: its
-  // type is the result's, known only once it runs -- the result kept for
-  // whoever waits for it (a staged function), the function returning
-  // nothing itself. In a block of the body: where it always returns; the
-  // rest of the body after the statement holding it then made one too
-  // (CppshStagedPending).
-  const bool Staged = Returns && Function && !Nested &&
-                      Function->getReturnType()->isUndeducedType() &&
-                      !cppshLeavesLoop(Toks) &&
-                      ((AtBody && Declares) || cppshAlwaysReturns(Toks));
-  if (Returns && !Staged &&
-      (!Function || Nested || Function->getReturnType()->isUndeducedType()))
-    return false;
   // The instantiations the first parse queued, dropped by the caller: those
   // the staged statement references queued again, once it is made.
   auto Dropped = std::move(CppshDropped);
@@ -1419,10 +1325,24 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   const unsigned From = *B, To = *E;
   StmtResult S = CppshParseStaged(
       Begin, CppshInputTokens[To - 1].getEndLoc(), Locals, Needs, StagedCall,
-      Staged, From,
+      /*Keeps=*/false, From,
       [&](StmtVector &Body) { ParseCppshRegionStatements(Body, From, To); });
   if (!S.isUsable())
     return false;
+  // A return from it of a value whose type it gives made it the rest of a
+  // staged function (Sema): the result kept for the function's caller, the
+  // function returning nothing of its own after it -- so every path through
+  // it must return: the rest of the body, or code that always returns. In a
+  // block of the body, the rest of the body after the statement holding it
+  // is made one too (CppshStagedPending).
+  auto *Made0 = cast<CppshStagedStmt>(S.get());
+  const bool Staged = Made0->keepsResult();
+  FunctionDecl *Function = Actions.getCurFunctionDecl(/*AllowLambda=*/true);
+  if (Staged && (!Function || !((AtBody && Declares) ||
+                                cppshAlwaysReturns(Made0->getBody())))) {
+    Diag(Begin, diag::err_cppsh_staged_result_falls_through);
+    return true;
+  }
   Stmts.append(Before.begin(), Before.end());
   Stmts.push_back(S.get());
   SmallVector<Stmt *, 4> Made(Before.begin(), Before.end());
