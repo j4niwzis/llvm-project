@@ -9667,6 +9667,23 @@ StmtResult TreeTransform<Derived>::TransformCppshStagedStmt(CppshStagedStmt *S) 
   ArrayRef<ImplicitParamDecl *> OldParams = Old->parameters();
   for (unsigned I = 0; I < OldParams.size(); ++I) {
     ImplicitParamDecl *P = OldParams[I];
+    // The variable its frame entry names now, of the type it has now: what
+    // the parameter stands for -- an `auto` local's type deduced again from
+    // its transformed initializer (which an implicit conversion of the first
+    // parse no longer widens) is not its old type transformed.
+    if (I < Frame.size() && Frame[I])
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(Frame[I]->IgnoreParens()))
+        if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+            VD && !VD->getType()->isDependentType() &&
+            !VD->getType()->isUndeducedType()) {
+          QualType Local = VD->getType().getNonReferenceType();
+          if (const auto *Ref = P->getType()->getAs<ReferenceType>())
+            Local = Ref->isSpelledAsLValue()
+                        ? SemaRef.Context.getLValueReferenceType(Local)
+                        : SemaRef.Context.getRValueReferenceType(Local);
+          Types.push_back(Local);
+          continue;
+        }
     QualType T = getDerived().TransformType(P->getType());
     if (T.isNull())
       return StmtError();
