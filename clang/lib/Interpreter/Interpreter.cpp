@@ -2430,11 +2430,27 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
       bool Ok = false;
       VarDecl *Value = cppshRunTokens(*this, *B, *E + 1, /*Keep=*/true, Ok);
       std::optional<APValue> Now = Value ? cppshRuntimeValueOf(Value) : std::nullopt;
-      if (!Now || !Now->isInt())
-        return Fail("cppsh: the run-time template argument gave no integer");
+      if (!Now)
+        return Fail("cppsh: the run-time template argument's value is not known");
       const QualType T = Value->getType();
-      CppshSuppliedExprs[Need.getBegin().getRawEncoding()] =
-          IntegerLiteral::Create(Ctx, Now->getInt(), T, Need.getBegin());
+      const SourceLocation At = Need.getBegin();
+      // Its value, as a constant: a literal of an integer or a floating
+      // type; otherwise the variable holding it, its value attached
+      // (ConstantExpr) -- what a template argument of any type can be.
+      Expr *Supplied = nullptr;
+      if (Now->isInt()) {
+        Supplied = IntegerLiteral::Create(Ctx, Now->getInt(), T, At);
+      } else if (Now->isFloat()) {
+        Supplied = FloatingLiteral::Create(Ctx, Now->getFloat(), /*isexact=*/true,
+                                           T, At);
+      } else {
+        Expr *Ref = S.BuildDeclRefExpr(Value, T, VK_LValue, At);
+        Expr *Read = ImplicitCastExpr::Create(Ctx, T, CK_LValueToRValue, Ref,
+                                              nullptr, VK_PRValue,
+                                              FPOptionsOverride());
+        Supplied = ConstantExpr::Create(Ctx, Read, *Now);
+      }
+      CppshSuppliedExprs[At.getRawEncoding()] = Supplied;
     }
   }
   P.CppshRewind(Begin, End);

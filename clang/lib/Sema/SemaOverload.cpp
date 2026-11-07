@@ -6774,6 +6774,38 @@ ExprResult Sema::BuildConvertedConstantExpression(Expr *From, QualType T,
                                             PreNarrowingValue);
 }
 
+// cppsh: a value of a template parameter's type to stand in for a run-time
+// argument while the statement holding it is checked, dropped for the code
+// compiled once the argument has its value: zero for an integer, an
+// enumeration or a floating-point type, null for a pointer, a class type's
+// value-initialized value where that is a constant. None for anything else
+// (a reference): not a run-time argument cppsh can stage.
+static std::optional<APValue> cppshPlaceholder(Sema &S, QualType T,
+                                               SourceLocation Loc) {
+  ASTContext &C = S.Context;
+  if (T.isNull() || T->isDependentType())
+    return std::nullopt;
+  if (T->isIntegralOrEnumerationType())
+    return APValue(llvm::APSInt(C.getIntWidth(T),
+                                T->isUnsignedIntegerOrEnumerationType()));
+  if (T->isRealFloatingType())
+    return APValue(llvm::APFloat::getZero(C.getFloatTypeSemantics(T)));
+  if (T->isPointerType() || T->isNullPtrType())
+    return APValue(APValue::LValueBase(), CharUnits::Zero(),
+                   APValue::NoLValuePath(), /*IsNullPtr=*/true);
+  if (const auto *RD = T->getAsCXXRecordDecl(); RD && RD->hasDefinition()) {
+    Sema::SFINAETrap Trap(S);
+    ExprResult Init = S.BuildCXXTypeConstructExpr(
+        C.getTrivialTypeSourceInfo(T, Loc), Loc, {}, Loc,
+        /*ListInitialization=*/false);
+    Expr::EvalResult R;
+    if (Init.isUsable() && !Trap.hasErrorOccurred() &&
+        Init.get()->EvaluateAsConstantExpr(R, C) && R.Val.hasValue())
+      return R.Val;
+  }
+  return std::nullopt;
+}
+
 ExprResult Sema::CheckConvertedConstantExpression(Expr *From, QualType T,
                                                   APValue &Value, CCEKind CCE,
                                                   NamedDecl *Dest) {
@@ -6860,12 +6892,21 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
   std::optional<llvm::SaveAndRestore<DeclContext *>> CppshUse;
   if (CCE == CCEKind::TemplateArg && CppshTemplateUseContext)
     CppshUse.emplace(CurContext, CppshTemplateUseContext);
+  // What a run-time template argument is meanwhile -- for a parameter of any
+  // type a value of which can stand in for it (cppshPlaceholder), of the
+  // parameter's type or of the one deduced from the argument (`auto N`).
+  const QualType CppshT =
+      T->getContainedDeducedType() ? E->getType().getUnqualifiedType() : T;
+  const std::optional<APValue> CppshZero =
+      CCE == CCEKind::TemplateArg ? cppshPlaceholder(*this, CppshT, E->getExprLoc())
+                                  : std::nullopt;
+
   // cppsh: a template argument that reads a parameter pending on a value
   // known only later (a call's argument, a local of the function around the
   // call): no need of this body's -- the call around it, its read noted (the
-  // evaluation just made), is cut where that value is. Meanwhile a zero of
-  // its type, the diagnostics held (the hook of the read).
-  if (CCE == CCEKind::TemplateArg && !CppshParamPending.empty()) {
+  // evaluation just made), is cut where that value is. Meanwhile the
+  // placeholder, the diagnostics held (the hook of the read).
+  if (CppshZero && !CppshParamPending.empty()) {
     auto ReadsPending = [&](const Stmt *X, auto &Self) -> bool {
       if (!X)
         return false;
@@ -6878,52 +6919,33 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
           return true;
       return false;
     };
-    const QualType IntT =
-        T->isIntegralOrEnumerationType()
-            ? T
-            : T->getContainedDeducedType() &&
-                      E->getType()->isIntegralOrEnumerationType()
-                  ? E->getType().getUnqualifiedType()
-                  : QualType();
-    if (!IntT.isNull() && ReadsPending(E, ReadsPending)) {
-      Value = APValue(llvm::APSInt(Context.getIntWidth(IntT),
-                                   IntT->isUnsignedIntegerOrEnumerationType()));
+    if (ReadsPending(E, ReadsPending)) {
+      Value = *CppshZero;
       return ConstantExpr::Create(Context, E, Value);
     }
   }
 
-  if (CCE == CCEKind::TemplateArg && T->isIntegralOrEnumerationType())
+  if (CppshZero)
     if (const VarDecl *Local = cppshRuntimeLocalIn(*this, E)) {
       cppshMeetNeed(*this);
       CppshCutNeedVar = Local;
       CppshCutNeedFunction = getCurFunctionDecl();
-      Value = APValue(llvm::APSInt(Context.getIntWidth(T),
-                                   T->isUnsignedIntegerOrEnumerationType()));
+      Value = *CppshZero;
       return ConstantExpr::Create(Context, E, Value);
     }
 
   // cppsh: any other run-time template argument the user wrote -- a call's
   // value (input<int>()), written or a default substituted, for a function,
-  // class, variable or alias template alike -- for a parameter of an integral
-  // type, or of one deduced from it (`auto N`).
-  const QualType CppshT =
-      T->isIntegralOrEnumerationType()
-          ? T
-          : T->getContainedDeducedType() &&
-                    E->getType()->isIntegralOrEnumerationType()
-                ? E->getType().getUnqualifiedType()
-                : QualType();
-  if (CCE == CCEKind::TemplateArg && !CppshT.isNull()) {
-    llvm::APSInt Zero(Context.getIntWidth(CppshT),
-                      CppshT->isUnsignedIntegerOrEnumerationType());
+  // class, variable or alias template alike.
+  if (CppshZero) {
     // In a function body: a need -- evaluated where the body is cut, handed
-    // over in the frame; meanwhile a zero, the statement being dropped.
+    // over in the frame; meanwhile the placeholder, the statement dropped.
     if (cppshExprNeedHere(*this, E)) {
       cppshMeetNeed(*this);
       CppshCutNeedVar = nullptr;
       CppshCutNeedFunction = getCurFunctionDecl();
       CppshCutNeedExprs.push_back(E);
-      Value = APValue(Zero);
+      Value = *CppshZero;
       return ConstantExpr::Create(Context, E, Value);
     }
     // At the top level: the statement compiled again inside a function.
@@ -6931,7 +6953,7 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
       CppshTopNeed = true;
       cppshHoldDiagnostics(*this);
       CppshTopNeedExprs.push_back(E->getSourceRange());
-      Value = APValue(Zero);
+      Value = *CppshZero;
       return ConstantExpr::Create(Context, E, Value);
     }
   }
