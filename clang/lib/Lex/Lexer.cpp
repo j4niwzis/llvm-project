@@ -2039,6 +2039,30 @@ static const char *fastParseASCIIIdentifier(const char *CurPtr,
   return fastParseASCIIIdentifierScalar(CurPtr);
 }
 
+// cppsh: where `$(` begins a shell command, the end of it (past its `)`):
+// parentheses nest, quotes hold theirs; none on this line, none.
+static const char *cppshCommandEnd(const char *P, const char *End) {
+  int Depth = 1;
+  char Quote = 0;
+  for (; P < End && *P != '\n' && *P != '\r'; ++P) {
+    const char D = *P;
+    if (Quote) {
+      if (D == '\\' && Quote == '"' && P + 1 < End)
+        ++P;
+      else if (D == Quote)
+        Quote = 0;
+      continue;
+    }
+    if (D == '\'' || D == '"')
+      Quote = D;
+    else if (D == '(')
+      ++Depth;
+    else if (D == ')' && --Depth == 0)
+      return P + 1;
+  }
+  return nullptr;
+}
+
 bool Lexer::LexIdentifierContinue(Token &Result, const char *CurPtr) {
   // Match [_A-Za-z0-9]*, we have already matched an identifier start.
 
@@ -4171,6 +4195,30 @@ LexStart:
     MIOpt.ReadToken();
     return LexIdentifierContinue(Result, CurPtr);
   case '$':   // $ in identifiers.
+    // cppsh: in what the user typed (the REPL's input buffers; any raw
+    // lexing of it), `$(...)` is a shell command, and so is a line that
+    // begins with `$` -- one token each, the text in it run by the system
+    // shell as written (Parser::ParseCppshCommand).
+    if (LangOpts.IncrementalExtensions &&
+        (!PP || PP->getSourceManager()
+                    .getBufferName(PP->getSourceManager().getFileLoc(FileLoc))
+                    .starts_with("input_line_"))) {
+      if (*CurPtr == '(') {
+        if (const char *End = cppshCommandEnd(CurPtr + 1, BufferEnd)) {
+          MIOpt.ReadToken();
+          FormTokenWithChars(Result, End, tok::cppsh_command);
+          return true;
+        }
+      } else if (Result.isAtStartOfLine() && CurPtr < BufferEnd &&
+                 *CurPtr != '\n' && *CurPtr != '\r') {
+        const char *End = CurPtr;
+        while (End < BufferEnd && *End != '\n' && *End != '\r')
+          ++End;
+        MIOpt.ReadToken();
+        FormTokenWithChars(Result, End, tok::cppsh_command_line);
+        return true;
+      }
+    }
     if (LangOpts.DollarIdents) {
       if (!isLexingRawMode())
         Diag(CurPtr-1, diag::ext_dollar_in_identifier);

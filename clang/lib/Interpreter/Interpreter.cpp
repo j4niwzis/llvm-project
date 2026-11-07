@@ -1555,6 +1555,43 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
     CppshLastResult = "__cppsh_res" + Tag;
 }
 
+// A shell command at I -- `$(...)`, or a line beginning with `$` -- is one
+// token (the lexer's), nothing in it C++: the offset of its last character,
+// and whether it is a command line (a statement of its own). npos: none.
+static size_t cppshCommandAt(llvm::StringRef Code, size_t I, bool &Line) {
+  Line = false;
+  if (Code[I] != '$' || I + 1 >= Code.size())
+    return llvm::StringRef::npos;
+  if (Code[I + 1] == '(') {
+    int Depth = 1;
+    char Quote = 0;
+    for (size_t J = I + 2; J < Code.size() && Code[J] != '\n'; ++J) {
+      const char D = Code[J];
+      if (Quote) {
+        if (D == '\\' && Quote == '"')
+          ++J;
+        else if (D == Quote)
+          Quote = 0;
+      } else if (D == '\'' || D == '"') {
+        Quote = D;
+      } else if (D == '(') {
+        ++Depth;
+      } else if (D == ')' && --Depth == 0) {
+        return J;
+      }
+    }
+    return llvm::StringRef::npos;
+  }
+  const size_t P = I == 0 ? llvm::StringRef::npos : Code.find_last_not_of(" \t", I - 1);
+  if (P != llvm::StringRef::npos && Code[P] != '\n')
+    return llvm::StringRef::npos;
+  if (Code[I + 1] == '\n' || Code[I + 1] == '\r')
+    return llvm::StringRef::npos;
+  Line = true;
+  const size_t E = Code.find('\n', I);
+  return (E == llvm::StringRef::npos ? Code.size() : E) - 1;
+}
+
 // Whether an input may need staging: it holds more than one top-level
 // statement (a `;` at the top, with more after it, outside literals and
 // comments). One statement never needs a value it defines itself.
@@ -1562,6 +1599,13 @@ static bool cppshSeveralStatements(llvm::StringRef Code) {
   int Depth = 0;
   for (size_t I = 0; I < Code.size(); ++I) {
     char C = Code[I];
+    bool Line = false;
+    if (size_t Last = cppshCommandAt(Code, I, Line); Last != llvm::StringRef::npos) {
+      if (Line && Depth == 0 && !Code.substr(Last + 1).trim().empty())
+        return true;
+      I = Last;
+      continue;
+    }
     if (C == '"' || (C == '\'' && !(I > 0 && std::isalnum(static_cast<unsigned char>(Code[I - 1]))))) {
       for (++I; I < Code.size() && Code[I] != C; ++I)
         if (Code[I] == '\\')
@@ -1710,6 +1754,16 @@ static std::vector<llvm::StringRef> cppshStatements(llvm::StringRef Code) {
   size_t Begin = 0;
   for (size_t I = 0; I < Code.size(); ++I) {
     char C = Code[I];
+    bool Line = false;
+    if (size_t Last = cppshCommandAt(Code, I, Line); Last != llvm::StringRef::npos) {
+      if (Line && Depth == 0 && OpenDo == 0) {
+        if (!Code.slice(Begin, Last + 1).trim().empty())
+          Out.push_back(Code.slice(Begin, Last + 1));
+        Begin = Last + 1;
+      }
+      I = Last;
+      continue;
+    }
     if (C == '"' || (C == '\'' && !(I > 0 && std::isalnum(static_cast<unsigned char>(Code[I - 1]))))) {
       for (++I; I < Code.size() && Code[I] != C; ++I)
         if (Code[I] == '\\')

@@ -8686,6 +8686,11 @@ private:
   Decl *ParseFunctionExpressionBody(ParsingDeclarator &D,
                                     const ParsedTemplateInfo &TemplateInfo);
 
+  /// cppsh: a shell command token (`$(...)`, a `$` line): a call of
+  /// std::sh::__cppsh_shell (a command, used as any) or, for a line,
+  /// std::sh::__cppsh_shell_line (run as a statement), with its text.
+  ExprResult ParseCppshCommand();
+
   /// cppsh: the cut of a function body (ParseStmt.cpp) -- the function
   /// returns through std::sh::__cppsh_cut, its rest run with its live
   /// locals' values.

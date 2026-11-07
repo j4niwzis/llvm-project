@@ -156,6 +156,15 @@ Retry:
   tok::TokenKind Kind  = Tok.getKind();
   SourceLocation AtLoc;
   switch (Kind) {
+  case tok::cppsh_command_line: {
+    // cppsh: `$ls -la`: the line is the statement, a `;` after it optional.
+    ExprResult E = ParseCppshCommand();
+    TryConsumeToken(tok::semi);
+    if (E.isInvalid())
+      return StmtError();
+    return Actions.ActOnExprStmt(E, /*DiscardedValue=*/true);
+  }
+
   case tok::at: // May be a @try or @throw statement
     {
       AtLoc = ConsumeToken();  // consume @

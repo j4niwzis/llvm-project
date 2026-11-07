@@ -256,118 +256,15 @@ struct CppshPhase {
 // Code run as the interpreter stages it (Interpreter::ParseAndExecute): whole,
 // cut only where a value it defines is needed by what follows -- before each
 // piece, the snapshots of the variables it names.
-// `$llvm-lit -v clang/test/x`, `$ ls *.cpp | wc -l`: a line beginning with
-// `$` is a command line -- the rest of it run as it is written by the system
-// shell (/bin/sh -c: its pipes, globs, variables and quoting), as cppsh's
-// foreground job (a std::sh::command), its status last_status. Nothing of it
-// is read as C++.
-// A shell command as a C++ expression: std::sh::command of /bin/sh -c and
-// the text as it is written, in a raw string of a delimiter it does not hold.
-static std::string cppshShellCommand(llvm::StringRef Text) {
-  std::string Delim = "cppsh";
-  while (Text.contains(")" + Delim + "\""))
-    Delim += "_";
-  return "std::sh::command(std::vector<std::string>{\"/bin/sh\", \"-c\", R\"" + Delim +
-         "(" + Text.str() + ")" + Delim + "\"})";
-}
-
-// `$(git log --oneline) | take 3`, `ls | $(wc -l)`: a shell command written
-// inside C++ -- the text between `$(` and its `)` run by the system shell as
-// it is written, an expression of the C++ around it (a std::sh::command:
-// piped, captured, converted as any command is). Not inside C++ strings,
-// characters or comments; inside the command, quotes hold their parentheses.
-static std::string cppshCommandSubstitutions(llvm::StringRef Code) {
-  std::string Out;
-  size_t I = 0;
-  while (I < Code.size()) {
-    char C = Code[I];
-    // C++ comments and literals, copied as they are.
-    if (C == '/' && I + 1 < Code.size() && (Code[I + 1] == '/' || Code[I + 1] == '*')) {
-      size_t End = Code[I + 1] == '/' ? Code.find('\n', I) : Code.find("*/", I + 2);
-      End = End == llvm::StringRef::npos ? Code.size() : End + (Code[I + 1] == '/' ? 0 : 2);
-      Out += Code.slice(I, End).str();
-      I = End;
-      continue;
-    }
-    // A raw string, R"delim( ... )delim", copied as it is.
-    if (C == 'R' && I + 1 < Code.size() && Code[I + 1] == '"' &&
-        !(I > 0 && (std::isalnum(static_cast<unsigned char>(Code[I - 1])) || Code[I - 1] == '_'))) {
-      size_t Open = Code.find('(', I + 2);
-      if (Open != llvm::StringRef::npos) {
-        std::string Close = ")" + Code.slice(I + 2, Open).str() + "\"";
-        size_t End = Code.find(Close, Open);
-        End = End == llvm::StringRef::npos ? Code.size() : End + Close.size();
-        Out += Code.slice(I, End).str();
-        I = End;
-        continue;
-      }
-    }
-    if (C == '"' || (C == '\'' && !(I > 0 && std::isalnum(static_cast<unsigned char>(Code[I - 1]))))) {
-      size_t J = I + 1;
-      while (J < Code.size() && Code[J] != C)
-        J += Code[J] == '\\' ? 2 : 1;
-      J = std::min(J + 1, Code.size());
-      Out += Code.slice(I, J).str();
-      I = J;
-      continue;
-    }
-    if (C == '$' && I + 1 < Code.size() && Code[I + 1] == '(') {
-      size_t J = I + 2;
-      int Depth = 1;
-      char Quote = 0;
-      for (; J < Code.size(); ++J) {
-        char D = Code[J];
-        if (Quote) {
-          if (D == '\\' && Quote == '"')
-            ++J;
-          else if (D == Quote)
-            Quote = 0;
-          continue;
-        }
-        if (D == '\'' || D == '"')
-          Quote = D;
-        else if (D == '(')
-          ++Depth;
-        else if (D == ')' && --Depth == 0)
-          break;
-      }
-      if (J < Code.size()) {
-        Out += cppshShellCommand(Code.slice(I + 2, J).trim());
-        I = J + 1;
-        continue;
-      }
-    }
-    Out += C;
-    ++I;
-  }
-  return Out;
-}
-
-static std::string cppshCommandLines(llvm::StringRef Code) {
-  llvm::SmallVector<llvm::StringRef, 8> Lines;
-  Code.split(Lines, '\n');
-  std::string Out;
-  for (size_t I = 0; I < Lines.size(); ++I) {
-    llvm::StringRef Body = Lines[I].ltrim();
-    // (`$(` begins a command inside C++, below, not a command line.)
-    if (Body.size() > 1 && Body.front() == '$' && Body[1] != '(') {
-      Out += cppshShellCommand(Body.drop_front().trim()) + ";";
-    } else {
-      Out += cppshCommandSubstitutions(Lines[I]);
-    }
-    if (I + 1 < Lines.size())
-      Out += '\n';
-  }
-  return Out;
-}
-
+// `$llvm-lit -v clang/test/x`, `$ ls *.cpp | wc -l` (a line beginning with
+// `$`) and `$(git log) | take 3` (inside C++) are shell commands: tokens of
+// their own, made calls of std::sh by the parser (Parser::ParseCppshCommand).
 static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Code) {
   clang::CppshBeforeChunk = [](clang::Interpreter &I, llvm::StringRef Piece) {
     snapshotNamed(I, Piece);
   };
-  const std::string Expanded = cppshCommandLines(Code);
   CppshPhase Phase("input", llvm::StringRef(Code).trim().take_front(60).str());
-  llvm::Error Err = Interp.ParseAndExecute(Expanded);
+  llvm::Error Err = Interp.ParseAndExecute(Code);
   // An input's output out before the next input runs, stdio's and LLVM's
   // streams alike, in the order it was written.
   std::fflush(nullptr);

@@ -1125,6 +1125,11 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
     Res = ParseCXXBoolLiteral();
     break;
 
+  case tok::cppsh_command:
+  case tok::cppsh_command_line:
+    Res = ParseCppshCommand();
+    break;
+
   case tok::kw___objc_yes:
   case tok::kw___objc_no:
     Res = ParseObjCBoolLiteral();
@@ -4072,4 +4077,52 @@ ExprResult Parser::ParseAvailabilityCheckExpr(SourceLocation BeginLoc) {
 
   return Actions.ObjC().ActOnObjCAvailabilityCheckExpr(
       AvailSpecs, BeginLoc, Parens.getCloseLocation());
+}
+
+ExprResult Parser::ParseCppshCommand() {
+  assert(Tok.isOneOf(tok::cppsh_command, tok::cppsh_command_line) &&
+         "a shell command token expected");
+  const bool Line = Tok.is(tok::cppsh_command_line);
+  const SourceLocation Loc = Tok.getLocation();
+  const std::string Spelling = PP.getSpelling(Tok);
+  ConsumeToken();
+  // `$(text)`, `$text`: the text alone.
+  StringRef Text = StringRef(Spelling).drop_front(Line ? 1 : 2);
+  if (!Line)
+    Text = Text.drop_back(1);
+  Text = Text.trim();
+
+  NamedDecl *Fn = nullptr;
+  if (NamespaceDecl *Std = Actions.getStdNamespace()) {
+    LookupResult ShR(Actions, &PP.getIdentifierTable().get("sh"), Loc,
+                     Sema::LookupNamespaceName);
+    Actions.LookupQualifiedName(ShR, Std);
+    if (auto *Sh = ShR.getAsSingle<NamespaceDecl>()) {
+      LookupResult R(Actions,
+                     &PP.getIdentifierTable().get(Line ? "__cppsh_shell_line"
+                                                       : "__cppsh_shell"),
+                     Loc, Sema::LookupOrdinaryName);
+      Actions.LookupQualifiedName(R, Sh);
+      Fn = R.getAsSingle<NamedDecl>();
+    }
+  }
+  if (!Fn) {
+    Diag(Loc, Actions.getDiagnostics().getCustomDiagID(
+                  DiagnosticsEngine::Error,
+                  "a shell command needs std::sh (import std.sh)"));
+    return ExprError();
+  }
+  ASTContext &Ctx = Actions.getASTContext();
+  Expr *Lit = StringLiteral::Create(
+      Ctx, Text, StringLiteralKind::Ordinary, /*Pascal=*/false,
+      Ctx.getStringLiteralArrayType(Ctx.CharTy, Text.size()), Loc);
+  CXXScopeSpec SS;
+  LookupResult R(Actions, Fn->getDeclName(), Loc, Sema::LookupOrdinaryName);
+  R.addDecl(Fn);
+  R.resolveKind();
+  ExprResult Callee =
+      Actions.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
+  if (Callee.isInvalid())
+    return ExprError();
+  return Actions.ActOnCallExpr(getCurScope(), Callee.get(), Loc, Lit, Loc);
 }

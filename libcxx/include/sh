@@ -1486,6 +1486,15 @@ inline std::pair<int, std::string> pipeline::run_all(bool capture) {
   return __cppsh_run_stages(std::move(all), capture);
 }
 
+// `$(git log --oneline)`, `$ls -la`: a shell command typed in the input, its
+// text run by the system shell as written (the compiler makes the command's
+// token a call of these). A command line runs as a statement, in the
+// foreground.
+inline command __cppsh_shell(std::string_view text) {
+  return command(std::vector<std::string>{"/bin/sh", "-c", std::string(text)});
+}
+inline void __cppsh_shell_line(std::string_view text) { __cppsh_shell(text); }
+
 // `sleep 10 &` (the compiler turns a trailing `&` into this), `cmd |
 // background`: started as a job, not waited for.
 inline void __cppsh_background(command &&c) {

@@ -170,6 +170,12 @@ TOK(comment)             // Comment (only in -E -C[C] mode)
 TOK(identifier)          // abcde123
 TOK(raw_identifier)      // Used only in raw lexing mode.
 
+// cppsh: shell commands in what the user typed -- `$(git log)` inside C++,
+// and a line beginning with `$` (`$ls -la | wc -l`), its text run by the
+// system shell as written.
+TOK(cppsh_command)
+TOK(cppsh_command_line)
+
 // C99 6.4.4.1: Integer Constants
 // C99 6.4.4.2: Floating Constants
 TOK(numeric_constant)    // 0x123
