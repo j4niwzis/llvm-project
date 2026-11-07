@@ -1626,13 +1626,22 @@ static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
   // Which region: the specialization of __cppsh_region_tag at Tag.
   static llvm::DenseMap<const void *, VarTemplateSpecializationDecl *> Tags;
   VarTemplateSpecializationDecl *Spec = Tags.lookup(Tag);
+  // What the search met, said where it finds nothing.
+  bool HaveTemplate = false;
+  unsigned Candidates = 0, Unresolved = 0;
+  std::string FirstError;
   if (!Spec)
-    if (VarTemplateDecl *VTD = cppshRegionTagTemplate(S))
+    if (VarTemplateDecl *VTD = cppshRegionTagTemplate(S)) {
+      HaveTemplate = true;
       for (VarTemplateSpecializationDecl *Candidate : VTD->specializations()) {
+        ++Candidates;
         llvm::Expected<llvm::orc::ExecutorAddr> Addr =
             Interp.getSymbolAddress(GlobalDecl(Candidate));
         if (!Addr) {
-          llvm::consumeError(Addr.takeError());
+          ++Unresolved;
+          std::string Why = llvm::toString(Addr.takeError());
+          if (FirstError.empty())
+            FirstError = std::move(Why);
           continue;
         }
         if (Addr->toPtr<const void *>() == Tag) {
@@ -1640,12 +1649,18 @@ static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
           break;
         }
       }
+    }
   auto Fail = [](llvm::StringRef Why) {
     llvm::errs() << "error: cppsh: a staged region cannot run: " << Why << "\n";
   };
   if (!Spec) {
-    Fail("its closure type is not known (no __cppsh_region_tag specialization "
-         "at its address)");
+    Fail(!HaveTemplate
+             ? std::string("std::sh::__cppsh_region_tag is not found")
+             : "its closure type is not known: of " + std::to_string(Candidates) +
+                   " __cppsh_region_tag specializations, " +
+                   std::to_string(Unresolved) + " have no address" +
+                   (FirstError.empty() ? std::string() : " (" + FirstError + ")") +
+                   ", none is at it");
     return;
   }
   if (Spec->getTemplateArgs().size() != 2) {
