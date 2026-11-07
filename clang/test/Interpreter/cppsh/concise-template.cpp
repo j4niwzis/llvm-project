@@ -1,4 +1,4 @@
-// RUN: printf '41\n3\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '41\n3\n7\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
 
 // A concise function of explicit template parameters, a parameter with a
 // default without parentheses, ^ for return.
@@ -11,3 +11,8 @@ std::println("read {}", input<int>("number? ") + 1);
 f3 (x: int = input<int>("")) = std::array<int, x>{};
 std::println("size {}", f3().size());
 // CHECK: size 3
+
+// Template parameters named, no parameters at all.
+g<T> = { T response; std::cin >> response; ^ response; }
+std::println("got {}", g<int>());
+// CHECK: got 7

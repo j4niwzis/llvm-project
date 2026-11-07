@@ -218,7 +218,12 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
   }
 
   bool IsUnparenFunc = false;
-  if (NextToken().is(tok::identifier) &&
+  // `name<T> = body`: with template parameters named, a function of no
+  // parameters (`f = body` alone is a variable).
+  if (!CppshExplicitTemplateParams.empty() &&
+      NextToken().isOneOf(tok::equal, tok::question, tok::kw_requires))
+    IsUnparenFunc = true;
+  else if (NextToken().is(tok::identifier) &&
       !isKnownCallableOrType(Tok.getIdentifierInfo(), Tok.getLocation())) {
     if (GetLookAheadToken(2).is(tok::colon)) {
       IsUnparenFunc = true;
