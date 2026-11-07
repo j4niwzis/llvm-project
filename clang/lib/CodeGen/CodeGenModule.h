@@ -1914,6 +1914,16 @@ public:
 
   /// In incremental compilation, a symbol defined for the JIT elsewhere (an
   /// object file loaded): never deferred, never emitted.
+  /// Whether a unit's module made external anything but Except -- what later
+  /// modules may link to (the unit cannot be taken out of the JIT then).
+  bool exportsIncrementally(const TranslationUnitDecl *TU,
+                            llvm::StringRef Except) const {
+    auto It = ExportedByUnit.find(TU);
+    return It != ExportedByUnit.end() &&
+           llvm::any_of(It->second,
+                        [&](const auto &E) { return E.first != Except; });
+  }
+
   void markIncrementalExported(llvm::StringRef MangledName) {
     IncrementalExported.insert(MangledName);
     DeferredDecls.erase(MangledName);

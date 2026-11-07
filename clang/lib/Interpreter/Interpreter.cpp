@@ -2549,6 +2549,28 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
 // values the ones before it made. One that needs the result of a staged
 // function's call, or the value of a run-time template argument, of its own
 // is taken back, what it needs run, and parsed again with it supplied.
+// The code compiled for a staged statement kept for at most this many sets of
+// values: older ones taken out (cppshTrimStaged), where nothing links to them.
+static constexpr size_t CppshMaxInstances = 32;
+
+// Between inputs -- no compiled code running, staged code's least of all --
+// the statements compiled for more values than that lose their oldest.
+static void cppshTrimStaged(Interpreter &Interp) {
+  for (auto &[Staged, Instances] : CppshCompiled) {
+    for (size_t I = 0; Instances.size() > CppshMaxInstances && I < Instances.size();) {
+      CppshStagedCompiled &C = Instances[I];
+      if (!Interp.cppshEvictStaged(C.Function)) {
+        ++I;
+        continue;
+      }
+      if (auto Last = CppshLastRuns.find(Staged);
+          Last != CppshLastRuns.end() && Last->second.Address == C.Address)
+        CppshLastRuns.erase(Last);
+      Instances.erase(Instances.begin() + I);
+    }
+  }
+}
+
 // What was compiled of staged code in units taken back (a failed input's):
 // forgotten -- the statements those units held, and the code compiled into
 // them for any statement.
@@ -2586,6 +2608,15 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
         *V = std::move(LastValue);
     }
     return llvm::Error::success();
+  }
+  // An input of the user's (not one compiled code starts): staged code
+  // compiled for many values trimmed first.
+  static unsigned Depth = 0;
+  ++Depth;
+  auto Leave = llvm::scope_exit([&] { --Depth; });
+  if (Depth == 1) {
+    std::lock_guard<std::recursive_mutex> Lock(CppshInterpreterLock);
+    cppshTrimStaged(*this);
   }
   if (llvm::Error Err = IncrParser->BeginInput(Code))
     return Err;
@@ -2814,6 +2845,29 @@ llvm::Error Interpreter::cppshBeginBuild() { return IncrParser->BeginBuild(); }
 void Interpreter::cppshAddBuilt(Decl *D) { IncrParser->AddBuilt(DeclGroupRef(D)); }
 
 Parser &Interpreter::cppshParser() { return IncrParser->getParser(); }
+
+bool Interpreter::cppshEvictStaged(FunctionDecl *F) {
+  CodeGenerator *CG = Act->getCodeGen();
+  if (!F || !CG)
+    return false;
+  TranslationUnitDecl *TU = F->getTranslationUnitDecl();
+  auto It = llvm::find_if(PTUs, [&](const PartialTranslationUnit &P) {
+    return P.TUPart == TU;
+  });
+  if (It == PTUs.end() ||
+      CG->ExportsIncrementally(TU, CG->GetMangledName(GlobalDecl(F))))
+    return false;
+  if (IncrExecutor)
+    if (llvm::Error Err = IncrExecutor->removeModule(*It)) {
+      llvm::consumeError(std::move(Err));
+      return false;
+    }
+  CG->DiscardIncrementalUnit(TU, /*ThrowModuleAway=*/false);
+  IncrParser->CleanUpPTU(TU);
+  cppshForgetSpecializationsIn(TU);
+  PTUs.erase(It);
+  return true;
+}
 
 llvm::Error Interpreter::cppshEndBuildAndExecute() {
   llvm::Expected<TranslationUnitDecl *> TU = IncrParser->EndBuild();

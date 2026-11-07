@@ -3084,6 +3084,21 @@ static std::vector<CppshValueSpec *> CppshSpecLog;
 
 size_t clang::cppshSpecializationMark() { return CppshSpecLog.size(); }
 
+void clang::cppshForgetSpecializationsIn(const TranslationUnitDecl *TU) {
+  // Declared there. (One whose code a module made external keeps that
+  // module in the JIT: nothing of it is evicted.)
+  for (auto It = CppshSpecializations.begin(); It != CppshSpecializations.end();) {
+    CppshValueSpec *Spec = It->second.get();
+    if (Spec->Function->getTranslationUnitDecl() != TU) {
+      ++It;
+      continue;
+    }
+    CppshSpecOf.erase(Spec->Function);
+    llvm::erase(CppshSpecLog, Spec);
+    It = CppshSpecializations.erase(It);
+  }
+}
+
 void clang::cppshForgetSpecializationsSince(size_t Mark) {
   for (size_t I = Mark; I < CppshSpecLog.size(); ++I) {
     CppshValueSpec *Spec = CppshSpecLog[I];

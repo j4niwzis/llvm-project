@@ -89,6 +89,8 @@ bool cppshInTopStatement(Sema &S);
 // marking its function invalid.
 size_t cppshSpecializationMark();
 void cppshForgetSpecializationsSince(size_t Mark);
+// And those made in a unit taken out of the JIT (staged code's, evicted).
+void cppshForgetSpecializationsIn(const TranslationUnitDecl *TU);
 } // namespace clang
 
 #endif // LLVM_CLANG_SEMA_CPPSHSTAGING_H

@@ -171,6 +171,11 @@ namespace {
       });
     }
 
+    bool ExportsIncrementally(const TranslationUnitDecl *TU,
+                              llvm::StringRef Except) {
+      return Builder && Builder->exportsIncrementally(TU, Except);
+    }
+
     void MarkIncrementalExported(llvm::StringRef MangledName) {
       if (Builder)
         Builder->markIncrementalExported(MangledName);
@@ -431,6 +436,11 @@ llvm::Constant *CodeGenerator::GetAddrOfVTable(BaseSubobject base,
 llvm::Module *CodeGenerator::StartModule(llvm::StringRef ModuleName,
                                          llvm::LLVMContext &C) {
   return static_cast<CodeGeneratorImpl*>(this)->StartModule(ModuleName, C);
+}
+
+bool CodeGenerator::ExportsIncrementally(const TranslationUnitDecl *TU,
+                                         llvm::StringRef Except) {
+  return static_cast<CodeGeneratorImpl *>(this)->ExportsIncrementally(TU, Except);
 }
 
 void CodeGenerator::MarkIncrementalExported(llvm::StringRef MangledName) {

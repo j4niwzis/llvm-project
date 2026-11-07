@@ -120,6 +120,9 @@ public:
   /// \p ThrowModuleAway (its input failed, before its module was released),
   /// the module being built is thrown away and a new one started, what was
   /// to be emitted in it put back to be emitted where it is used again.
+  /// cppsh: whether a unit's module made external anything but Except
+  /// (what later modules may link to).
+  bool ExportsIncrementally(const TranslationUnitDecl *TU, llvm::StringRef Except);
   void DiscardIncrementalUnit(const TranslationUnitDecl *TU, bool ThrowModuleAway);
 
   /// In interactive processing, a symbol already defined for the JIT (an
