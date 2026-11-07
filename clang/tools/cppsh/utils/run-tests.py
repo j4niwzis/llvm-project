@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 here = os.path.dirname(os.path.abspath(__file__))
 root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
@@ -24,7 +25,8 @@ for tool in (cppsh, filecheck):
         sys.exit(f"missing {tool} (ninja -C {build} {os.path.basename(tool)})")
 
 def run_one(test):
-    """One test's RUN lines, in order: (passed, what it printed where not)."""
+    """One test's RUN lines, in order: (passed, what it printed where not, seconds)."""
+    started = time.monotonic()
     test = os.path.abspath(test)
     runs, line = [], ""
     for text in open(test):
@@ -47,8 +49,8 @@ def run_one(test):
                            for word in cmd.split(" ") if word != "not")
             result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
             if result.returncode != 0:
-                return False, f"  $ {run}\n{result.stdout}{result.stderr}"
-        return True, ""
+                return False, f"  $ {run}\n{result.stdout}{result.stderr}", time.monotonic() - started
+        return True, "", time.monotonic() - started
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -57,8 +59,8 @@ def run_one(test):
 failed = []
 jobs = int(os.environ.get("CPPSH_TEST_JOBS", os.cpu_count() or 1))
 with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-    for test, (ok, why) in zip(tests, pool.map(run_one, tests)):
-        print(f"{'PASS' if ok else 'FAIL'} {os.path.basename(test)}")
+    for test, (ok, why, seconds) in zip(tests, pool.map(run_one, tests)):
+        print(f"{'PASS' if ok else 'FAIL'} {os.path.basename(test)} ({seconds:.2f} s)")
         if not ok:
             print(why)
             failed.append(test)

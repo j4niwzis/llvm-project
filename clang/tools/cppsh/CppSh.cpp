@@ -172,6 +172,9 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
       Names.insert(Stmt.substr(I, J - I).str());
     I = J;
   }
+  // All of them in one input: one compile and one run of the JIT, not one
+  // for each variable named.
+  std::string Snapshots;
   for (const std::string &Name : Names) {
     clang::LookupResult R(S, &Ctx.Idents.get(Name), clang::SourceLocation(),
                           clang::Sema::LookupOrdinaryName);
@@ -183,10 +186,13 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
         VD->getType()->isDependentType() ||
         VD->getType().getNonReferenceType().isTriviallyCopyableType(Ctx))
       continue;
-    if (llvm::Error Err =
-            Interp.ParseAndExecute("std::sh::__cppsh_snapshot(" + Name + ");"))
-      llvm::consumeError(std::move(Err));
+    Snapshots += std::string(Snapshots.empty() ? "" : ", ") + "std::sh::__cppsh_snapshot(" +
+                 Name + ")";
   }
+  if (!Snapshots.empty())
+    // One expression statement: the staging probe forks only for several.
+    if (llvm::Error Err = Interp.ParseAndExecute("(" + Snapshots + ");"))
+      llvm::consumeError(std::move(Err));
 }
 
 namespace clang {
