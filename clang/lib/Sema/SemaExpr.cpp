@@ -8773,7 +8773,13 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                 continue;
               }
             Expr::EvalResult EV;
-            bool Ok = ArgE->EvaluateAsRValue(EV, Context);
+            // A value only folded, not a constant -- a local's initializer
+            // read past what changed it since (`bool b = false; cin >> b;
+            // f(b)`): not known. (Folding says so in a note.)
+            SmallVector<PartialDiagnosticAt, 4> FoldNotes;
+            EV.Diag = &FoldNotes;
+            bool Ok = ArgE->EvaluateAsRValue(EV, Context) && FoldNotes.empty();
+            EV.Diag = nullptr;
             // A braced list (`ls {.files_only = true}`) has no type of its
             // own yet: initialized as the parameter it goes to -- on a copy,
             // in a SFINAE trap -- and that evaluated.
