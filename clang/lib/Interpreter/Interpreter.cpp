@@ -2096,6 +2096,10 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
           llvm::errs() << "\n";
         }
       }
+      // Compiled, but having wanted a value it was not given (a placeholder
+      // stood in for it): not the code for these values -- again, with it.
+      if (F && More && !Report)
+        F = nullptr;
       if (F) {
         Interp.cppshAddBuilt(F);
         KeptType = Run.ReturnType;

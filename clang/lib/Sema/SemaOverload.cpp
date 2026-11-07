@@ -58,6 +58,7 @@ using namespace clang;
 namespace clang {
 extern bool CppshCutNeeded;
 extern DeclContext *CppshTemplateUseContext;
+extern llvm::DenseMap<const VarDecl *, const VarDecl *> CppshParamPending;
 extern const VarDecl *CppshCutNeedVar;
 extern const FunctionDecl *CppshCutNeedFunction;
 const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E);
@@ -6859,6 +6860,38 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
   std::optional<llvm::SaveAndRestore<DeclContext *>> CppshUse;
   if (CCE == CCEKind::TemplateArg && CppshTemplateUseContext)
     CppshUse.emplace(CurContext, CppshTemplateUseContext);
+  // cppsh: a template argument that reads a parameter pending on a value
+  // known only later (a call's argument, a local of the function around the
+  // call): no need of this body's -- the call around it, its read noted (the
+  // evaluation just made), is cut where that value is. Meanwhile a zero of
+  // its type, the diagnostics held (the hook of the read).
+  if (CCE == CCEKind::TemplateArg && !CppshParamPending.empty()) {
+    auto ReadsPending = [&](const Stmt *X, auto &Self) -> bool {
+      if (!X)
+        return false;
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(X))
+        if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+            VD && CppshParamPending.count(VD))
+          return true;
+      for (const Stmt *C : X->children())
+        if (Self(C, Self))
+          return true;
+      return false;
+    };
+    const QualType IntT =
+        T->isIntegralOrEnumerationType()
+            ? T
+            : T->getContainedDeducedType() &&
+                      E->getType()->isIntegralOrEnumerationType()
+                  ? E->getType().getUnqualifiedType()
+                  : QualType();
+    if (!IntT.isNull() && ReadsPending(E, ReadsPending)) {
+      Value = APValue(llvm::APSInt(Context.getIntWidth(IntT),
+                                   IntT->isUnsignedIntegerOrEnumerationType()));
+      return ConstantExpr::Create(Context, E, Value);
+    }
+  }
+
   if (CCE == CCEKind::TemplateArg && T->isIntegralOrEnumerationType())
     if (const VarDecl *Local = cppshRuntimeLocalIn(*this, E)) {
       cppshMeetNeed(*this);
