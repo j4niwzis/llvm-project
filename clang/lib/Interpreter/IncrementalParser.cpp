@@ -198,10 +198,11 @@ llvm::Expected<TranslationUnitDecl *> IncrementalParser::EndBuild() {
   // unqualified is the templates' own (and argument-dependent), never a
   // scope of the parser's -- which, between the parsed units, is not one of
   // this unit.
-  Scope *const SavedScope = std::exchange(S.CurScope, nullptr);
+  Scope *const SavedScope = S.getCurScope();
+  S.setCurScopeForBuiltUnit(nullptr);
   llvm::Expected<TranslationUnitDecl *> TU =
       FinishPTU(*BuildLocalInstantiations, *BuildGlobalInstantiations);
-  S.CurScope = SavedScope;
+  S.setCurScopeForBuiltUnit(SavedScope);
   BuildLocalInstantiations.reset();
   BuildGlobalInstantiations.reset();
   return TU;

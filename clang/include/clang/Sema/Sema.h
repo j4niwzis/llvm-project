@@ -1164,6 +1164,9 @@ public:
   /// itself and in routines directly invoked from the parser and *never* from
   /// template substitution or instantiation.
   Scope *getCurScope() const { return CurScope; }
+  /// cppsh: the scope a unit built from the AST (not parsed) runs its
+  /// instantiations in -- none: a scope of the parser's is not one of it.
+  void setCurScopeForBuiltUnit(Scope *S) { CurScope = S; }
 
   IdentifierInfo *getSuperIdentifier() const;
 
