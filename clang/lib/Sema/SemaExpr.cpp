@@ -516,6 +516,13 @@ const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
                 S.CodeSynthesisContexts.back().Entity == Cur))
       return nullptr;
     Owner = Cur;
+  } else if (FunctionDecl *Tpl = S.getCurFunctionDecl(/*AllowLambda=*/true);
+             Tpl && Tpl->isDependentContext() && S.CodeSynthesisContexts.empty() &&
+             cppshInUserInput(S, Tpl->getLocation())) {
+    // A template's body the user is writing (a generic lambda's, a function
+    // template's), being parsed: its locals the same -- the statement made
+    // staged code, compiled once its instantiation runs.
+    Owner = Tpl;
   } else if (const TopLevelStmtDecl *Top = cppshTopStatement(S);
              Top && cppshInUserInput(S, E->getBeginLoc())) {
     Owner = Top;
