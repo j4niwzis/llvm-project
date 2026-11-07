@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/AST/StmtCXX.h"
+#include "clang/AST/ASTLambda.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/PrettyDeclStackTrace.h"
 #include "clang/Basic/Attributes.h"
@@ -1232,8 +1233,13 @@ SmallVector<VarDecl *, 8> Parser::CppshLiveLocals(SourceLocation Loc) {
     for (VarDecl *VD : Here)
       if (Seen.insert(VD->getIdentifier()).second)
         Live.push_back(VD);
-    if (Sc->getFlags() & Scope::FnScope)
-      break;
+    // A lambda's body: the enclosing function's locals too -- what the
+    // lambda captures of them, which the frame names as the lambda does.
+    if (Sc->getFlags() & Scope::FnScope) {
+      auto *DC = dyn_cast_or_null<DeclContext>(Sc->getEntity());
+      if (!DC || !isLambdaCallOperator(DC))
+        break;
+    }
   }
   for (size_t R = CppshRangeBase; R < CppshRangeFors.size(); ++R)
     for (Stmt *DSt : {CppshRangeFors[R]->getBeginStmt(), CppshRangeFors[R]->getEndStmt()})
