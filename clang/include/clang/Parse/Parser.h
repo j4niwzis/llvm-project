@@ -8728,8 +8728,17 @@ private:
   IdentifierInfo *CppshRegionCode = nullptr;
   /// cppsh: where the recorded tokens being parsed again end (a step's).
   std::optional<unsigned> CppshReplayEnd;
-  /// cppsh: the region being left with Code, its call operator returning.
-  StmtResult CppshLeaveRegion(SourceLocation Loc, unsigned Code);
+  /// cppsh: the region being left with Code, its call operator returning
+  /// (Before first, where there is one).
+  StmtResult CppshLeaveRegion(SourceLocation Loc, unsigned Code,
+                              Stmt *Before = nullptr);
+  /// cppsh: in a region being parsed that returns from its function, the
+  /// slot the value returned is put in (none where the function returns
+  /// nothing); whether it does.
+  IdentifierInfo *CppshRegionReturnSlot = nullptr;
+  bool CppshRegionReturns = false;
+  /// cppsh: a return of the function a region is in, from inside it.
+  StmtResult CppshReturnFromRegion(SourceLocation Loc, ExprResult Value);
   CppshBuiltBody CppshBeginBuiltReturn(SourceLocation Open);
   void CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
                               SmallVectorImpl<Stmt *> &Stmts, ExprResult E,

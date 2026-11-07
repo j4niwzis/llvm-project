@@ -1,4 +1,4 @@
-// RUN: printf '3\n4\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '3\n4\n5\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
 
 // A statement that needs a value read as its function runs, and declares
 // nothing: compiled with the value when it runs, against the function's own
@@ -27,3 +27,8 @@ std::println("h {}", h());
 k() = { int n = 0; std::cin >> n; std::array<int, n> a{}; std::println("k {}", a.size()); };
 k();
 // CHECK: k 4
+
+// A return of the function from the region: its value through the frame.
+int r() { int n = 0; std::cin >> n; std::array<int, n> a{}; return static_cast<int>(a.size()) + 1; }
+std::println("r {}", r());
+// CHECK: r 6

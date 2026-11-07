@@ -1631,11 +1631,17 @@ static SmallVector<size_t, 4> cppshOwnTokens(ArrayRef<Token> Toks,
 // (A break or continue of a loop around it can be told back: cppshLeavesLoop.)
 static bool cppshLeavesFunction(ArrayRef<Token> Toks) {
   for (const Token &T : Toks)
-    if (T.isOneOf(tok::kw_return, tok::kw_goto, tok::kw_co_return,
-                  tok::kw_co_yield, tok::kw_co_await))
+    if (T.isOneOf(tok::kw_goto, tok::kw_co_return, tok::kw_co_yield,
+                  tok::kw_co_await))
       return true;
   return !cppshOwnTokens(Toks, tok::kw_case, false, true).empty() ||
          !cppshOwnTokens(Toks, tok::kw_default, false, true).empty();
+}
+
+// Whether code returns (from its function -- or from a lambda in it: a
+// return a region would tell back where it need not).
+static bool cppshReturns(ArrayRef<Token> Toks) {
+  return llvm::any_of(Toks, [](const Token &T) { return T.is(tok::kw_return); });
 }
 
 // Whether code breaks out of, or continues, a loop (or switch) around it.
@@ -1716,7 +1722,16 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   ArrayRef<Token> Toks = ArrayRef<Token>(CppshInputTokens).slice(*B, *E - *B);
   if (cppshLeavesFunction(Toks))
     return false;
-  const bool Code = cppshLeavesLoop(Toks);
+  // A return of the function: told back too, its value through a slot --
+  // where the function's type is known without it (declared, or deduced
+  // from a return before), and the region is not in another.
+  const bool Returns = cppshReturns(Toks);
+  FunctionDecl *Function = Actions.getCurFunctionDecl(/*AllowLambda=*/true);
+  if (Returns && (!Function || cppshIsRegion(Function) ||
+                  Function->getReturnType()->isUndeducedType()))
+    return false;
+  const QualType ReturnType = Returns ? Function->getReturnType() : QualType();
+  const bool Code = Returns || cppshLeavesLoop(Toks);
   llvm::SmallPtrSet<const IdentifierInfo *, 16> Named;
   for (const Token &T : Toks)
     if (T.is(tok::identifier))
@@ -1754,6 +1769,39 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     Frame.push_back({CodeName, Ctx.IntTy, false, /*ByRef=*/true});
     Args.push_back(Actions.BuildDeclRefExpr(CodeVar, Ctx.IntTy, VK_LValue, Begin));
   }
+  // The slot of the value it returns: a std::optional of the function's type.
+  IdentifierInfo *RetName = &PP.getIdentifierTable().get("__cppsh_ret");
+  VarDecl *RetVar = nullptr;
+  StmtResult RetDecl;
+  if (Returns && !ReturnType->isVoidType()) {
+    NamespaceDecl *Std = Actions.getStdNamespace();
+    LookupResult OptR(Actions, &PP.getIdentifierTable().get("optional"), Begin,
+                      Sema::LookupOrdinaryName);
+    if (!Std || !Actions.LookupQualifiedName(OptR, Std))
+      return false;
+    auto *Optional = OptR.getAsSingle<ClassTemplateDecl>();
+    if (!Optional)
+      return false;
+    TemplateArgumentListInfo OptArgs(Begin, Begin);
+    OptArgs.addArgument(TemplateArgumentLoc(
+        TemplateArgument(ReturnType), Ctx.getTrivialTypeSourceInfo(ReturnType, Begin)));
+    const QualType SlotType = Actions.CheckTemplateIdType(
+        ElaboratedTypeKeyword::None, TemplateName(Optional), Begin, OptArgs,
+        getCurScope(), /*ForNestedNameSpecifier=*/false);
+    if (SlotType.isNull())
+      return false;
+    RetVar = VarDecl::Create(Ctx, Actions.CurContext, Begin, Begin, RetName,
+                             SlotType, Ctx.getTrivialTypeSourceInfo(SlotType, Begin),
+                             SC_None);
+    Actions.ActOnUninitializedDecl(RetVar);
+    Actions.PushOnScopeChains(RetVar, getCurScope());
+    RetDecl = Actions.ActOnDeclStmt(Actions.ConvertDeclToDeclGroup(RetVar), Begin,
+                                    Begin);
+    if (!RetDecl.isUsable())
+      return false;
+    Frame.push_back({RetName, SlotType, false, /*ByRef=*/true});
+    Args.push_back(Actions.BuildDeclRefExpr(RetVar, SlotType, VK_LValue, Begin));
+  }
   // The run-time template arguments the statement met: evaluated here, each
   // handed over as a parameter of its own.
   SmallVector<SourceLocation, 2> NeedLocs;
@@ -1762,7 +1810,12 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     Args.push_back(NE);
   }
   CppshCutNeedExprs.clear();
+  const bool SavedReturns = std::exchange(CppshRegionReturns, Returns);
+  IdentifierInfo *const SavedSlot =
+      std::exchange(CppshRegionReturnSlot, RetVar ? RetName : nullptr);
   ExprResult Lambda = ParseCppshRegionLambda(Frame, NeedLocs, *B, *E);
+  CppshRegionReturns = SavedReturns;
+  CppshRegionReturnSlot = SavedSlot;
   ExprResult RegionFn = cppshShFunction(Actions, PP, "__cppsh_region", Begin);
   if (!Lambda.isUsable() || !RegionFn.isUsable())
     return false;
@@ -1778,9 +1831,17 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     Stmts.push_back(Run.get());
     return true;
   }
-  // if (__cppsh_code == K) break/continue;
-  SmallVector<Stmt *, 4> Block{CodeDecl.get(), Run.get()};
-  for (unsigned K : {1u, 2u}) {
+  // if (__cppsh_code == K) break/continue/return;
+  SmallVector<Stmt *, 4> Block{CodeDecl.get()};
+  if (RetVar)
+    Block.push_back(RetDecl.get());
+  Block.push_back(Run.get());
+  // Only the jumps it makes: a continue is no statement outside a loop.
+  const bool Breaks = !cppshOwnTokens(Toks, tok::kw_break, true, true).empty();
+  const bool Continues = !cppshOwnTokens(Toks, tok::kw_continue, true, false).empty();
+  for (unsigned K : {1u, 2u, 3u}) {
+    if ((K == 1 && !Breaks) || (K == 2 && !Continues) || (K == 3 && !Returns))
+      continue;
     Expr *Ref = Actions.BuildDeclRefExpr(CodeVar, Ctx.IntTy, VK_LValue, Begin);
     Expr *Lit = IntegerLiteral::Create(
         Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), K), Ctx.IntTy, Begin);
@@ -1789,10 +1850,27 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
         Cond.isUsable() ? Actions.ActOnCondition(getCurScope(), Begin, Cond.get(),
                                                  Sema::ConditionKind::Boolean)
                         : Sema::ConditionError();
-    StmtResult Jump =
-        K == 1 ? Actions.ActOnBreakStmt(Begin, getCurScope(), nullptr, SourceLocation())
-               : Actions.ActOnContinueStmt(Begin, getCurScope(), nullptr,
-                                           SourceLocation());
+    StmtResult Jump;
+    if (K == 3) {
+      // return *std::move(__cppsh_ret); -- or return; where it returns nothing.
+      ExprResult Value;
+      if (RetVar) {
+        Expr *Slot = ImplicitCastExpr::Create(
+            Ctx, RetVar->getType(), CK_NoOp,
+            Actions.BuildDeclRefExpr(RetVar, RetVar->getType(), VK_LValue, Begin),
+            nullptr, VK_XValue, FPOptionsOverride());
+        Value = Actions.BuildUnaryOp(getCurScope(), Begin, UO_Deref, Slot);
+        if (!Value.isUsable())
+          return false;
+      }
+      Jump = Actions.ActOnReturnStmt(Begin, Value.isUsable() ? Value.get() : nullptr,
+                                     getCurScope());
+    } else {
+      Jump = K == 1 ? Actions.ActOnBreakStmt(Begin, getCurScope(), nullptr,
+                                             SourceLocation())
+                    : Actions.ActOnContinueStmt(Begin, getCurScope(), nullptr,
+                                                SourceLocation());
+    }
     if (C.isInvalid() || !Jump.isUsable())
       return false;
     StmtResult If =
@@ -3559,7 +3637,8 @@ StmtResult Parser::ParseBreakOrContinueStatement(bool IsContinue) {
   return Actions.ActOnBreakStmt(KwLoc, getCurScope(), Target, LabelLoc);
 }
 
-StmtResult Parser::CppshLeaveRegion(SourceLocation Loc, unsigned Code) {
+StmtResult Parser::CppshLeaveRegion(SourceLocation Loc, unsigned Code,
+                                    Stmt *Before) {
   LookupResult R(Actions, CppshRegionCode, Loc, Sema::LookupOrdinaryName);
   Actions.LookupName(R, getCurScope());
   auto *Slot = R.getAsSingle<VarDecl>();
@@ -3578,8 +3657,49 @@ StmtResult Parser::CppshLeaveRegion(SourceLocation Loc, unsigned Code) {
   if (!SetStmt.isUsable() || !Ret.isUsable())
     return StmtError();
   Sema::CompoundScopeRAII CompoundScope(Actions);
-  Stmt *Both[2] = {SetStmt.get(), Ret.get()};
-  return Actions.ActOnCompoundStmt(Loc, Loc, Both, /*isStmtExpr=*/false);
+  SmallVector<Stmt *, 3> All;
+  if (Before)
+    All.push_back(Before);
+  All.push_back(SetStmt.get());
+  All.push_back(Ret.get());
+  return Actions.ActOnCompoundStmt(Loc, Loc, All, /*isStmtExpr=*/false);
+}
+
+// return e; in a region: the value put in its slot (__cppsh_ret.emplace(e)),
+// or e run where the function returns nothing -- then the region left
+// saying so (3).
+StmtResult Parser::CppshReturnFromRegion(SourceLocation Loc, ExprResult Value) {
+  if (Value.isInvalid())
+    return StmtError();
+  Stmt *Before = nullptr;
+  if (Value.isUsable()) {
+    ExprResult Done = Value;
+    if (CppshRegionReturnSlot) {
+      LookupResult R(Actions, CppshRegionReturnSlot, Loc, Sema::LookupOrdinaryName);
+      Actions.LookupName(R, getCurScope());
+      auto *Slot = R.getAsSingle<VarDecl>();
+      if (!Slot)
+        return StmtError();
+      Expr *Base = Actions.BuildDeclRefExpr(
+          Slot, Slot->getType().getNonReferenceType(), VK_LValue, Loc);
+      CXXScopeSpec SS;
+      ExprResult Emplace = Actions.BuildMemberReferenceExpr(
+          Base, Base->getType(), Loc, /*IsArrow=*/false, SS, SourceLocation(),
+          nullptr, DeclarationNameInfo(&PP.getIdentifierTable().get("emplace"), Loc),
+          nullptr, getCurScope());
+      Expr *Arg = Value.get();
+      Done = Emplace.isUsable()
+                 ? Actions.BuildCallExpr(getCurScope(), Emplace.get(), Loc, Arg, Loc)
+                 : ExprError();
+    }
+    StmtResult Put = Done.isUsable()
+                         ? Actions.ActOnExprStmt(Done, /*DiscardedValue=*/true)
+                         : StmtError();
+    if (!Put.isUsable())
+      return StmtError();
+    Before = Put.get();
+  }
+  return CppshLeaveRegion(Loc, 3, Before);
 }
 
 StmtResult Parser::ParseContinueStatement() {
@@ -3623,6 +3743,11 @@ StmtResult Parser::ParseReturnStatement() {
   }
   if (IsCoreturn)
     return Actions.ActOnCoreturnStmt(getCurScope(), ReturnLoc, R.get());
+  // cppsh: a return of the function a region is in, from the region itself
+  // (not from a lambda in it).
+  if (CppshRegionReturns && CppshRegionCode &&
+      cppshIsRegion(Actions.getCurFunctionDecl(/*AllowLambda=*/true)))
+    return CppshReturnFromRegion(ReturnLoc, R);
   return Actions.ActOnReturnStmt(ReturnLoc, R.get(), getCurScope());
 }
 
