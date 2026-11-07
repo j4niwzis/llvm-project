@@ -1,4 +1,4 @@
-// RUN: cppsh %s 2>&1 | FileCheck %s
+// RUN: not cppsh %s 2>&1 | FileCheck %s
 
 // A failed input is taken back whole -- code generation included: what it
 // had code generation emit (std::string's inline functions, instantiated
