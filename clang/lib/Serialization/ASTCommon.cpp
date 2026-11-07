@@ -474,6 +474,7 @@ bool serialization::isRedeclarableDeclKind(unsigned Kind) {
   case Decl::OpenACCDeclare:
   case Decl::OpenACCRoutine:
   case Decl::CXXExpansionStmt:
+  case Decl::CppshStaged:
     return false;
 
   // These indirectly derive from Redeclarable<T> but are not actually
