@@ -474,6 +474,12 @@ void cppshNeedForTemplateCall(Sema &S, Expr *Fn, ArrayRef<Expr *> Args) {
     if (!VD || isa<ParmVarDecl>(VD) || !VD->hasLocalStorage() || VD->isConstexpr() ||
         VD->getParentFunctionOrMethod() != Cur)
       continue;
+    // Of a type known already: the call is built now, the local pending on
+    // it (BuildCallExpr) -- a need only if the callee reads it. Only where
+    // its type waits for the template's arguments is nothing to be built:
+    // a need as it is.
+    if (!Args[I]->isTypeDependent() && !Args[I]->isValueDependent())
+      continue;
     for (NamedDecl *ND : ULE->decls())
       if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
           // A template whose return type is deduced: what its instantiation
@@ -8457,6 +8463,21 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                     if (!PatFD->getParamDecl(I)->getType()->isReferenceType()) {
                       setPending(PatFD->getParamDecl(I), VD);
                       PendingNeeds.push_back({VD, NeedFD});
+                    }
+                    continue;
+                  }
+                  // A local of a template's body the user is writing, of a
+                  // type known already: pending the same way -- if read, the
+                  // body is cut here, as the template is parsed.
+                  if (FunctionDecl *TplFD = getCurFunctionDecl(/*AllowLambda=*/true);
+                      !NeedFD && TplFD && TplFD->isDependentContext() &&
+                      VD->hasLocalStorage() && !isa<ParmVarDecl>(VD) &&
+                      !VD->isConstexpr() &&
+                      VD->getParentFunctionOrMethod() == TplFD &&
+                      cppshInUserInput(*this, TplFD->getLocation())) {
+                    if (!PatFD->getParamDecl(I)->getType()->isReferenceType()) {
+                      setPending(PatFD->getParamDecl(I), VD);
+                      PendingNeeds.push_back({VD, TplFD});
                     }
                     continue;
                   }
