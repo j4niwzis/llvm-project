@@ -7880,8 +7880,9 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
       Name = ULE->getName();
     else if (auto *DRE = dyn_cast<DeclRefExpr>(Callee))
       Name = DRE->getDecl()->getDeclName();
-    if (Name.isIdentifier() && Name.getAsIdentifierInfo()->isStr("visit") &&
-        ArgExprs.size() >= 2) {
+    // (An empty DeclarationName is an identifier too, of no IdentifierInfo.)
+    if (const IdentifierInfo *II = Name.getAsIdentifierInfo();
+        II && II->isStr("visit") && ArgExprs.size() >= 2) {
       if (ExprResult Visited = cppshVariantVisit(*this, ArgExprs[0],
                                                  ArgExprs.drop_front(), LParenLoc);
           !Visited.isUnset())
@@ -7897,8 +7898,9 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
       Base = ME->getBase();
       Member = ME->getMemberDecl()->getDeclName();
     }
-    if (Base && !ME_IsArrow(Callee) && Member.isIdentifier() &&
-        Member.getAsIdentifierInfo()->isStr("visit") && ArgExprs.size() == 1) {
+    if (const IdentifierInfo *II = Member.getAsIdentifierInfo();
+        Base && II && !ME_IsArrow(Callee) && II->isStr("visit") &&
+        ArgExprs.size() == 1) {
       Expr *Variants[1] = {Base};
       if (ExprResult Visited =
               cppshVariantVisit(*this, ArgExprs[0], Variants, LParenLoc);
