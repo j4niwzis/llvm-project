@@ -474,11 +474,13 @@ void cppshNeedForTemplateCall(Sema &S, Expr *Fn, ArrayRef<Expr *> Args) {
     if (!VD || isa<ParmVarDecl>(VD) || !VD->hasLocalStorage() || VD->isConstexpr() ||
         VD->getParentFunctionOrMethod() != Cur)
       continue;
-    // Of a type known already: the call is built now, the local pending on
-    // it (BuildCallExpr) -- a need only if the callee reads it. Only where
-    // its type waits for the template's arguments is nothing to be built:
-    // a need as it is.
-    if (!Args[I]->isTypeDependent() && !Args[I]->isValueDependent())
+    // Where the call is built now (no argument of it waits for the
+    // template's arguments): the local pending on it (BuildCallExpr) -- a
+    // need only if the callee reads it. Otherwise nothing is built until the
+    // template is instantiated, too late to cut: a need as it is.
+    if (llvm::none_of(Args, [](const Expr *A) {
+          return A && (A->isTypeDependent() || A->isValueDependent());
+        }))
       continue;
     for (NamedDecl *ND : ULE->decls())
       if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());

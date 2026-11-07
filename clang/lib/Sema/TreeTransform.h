@@ -58,6 +58,8 @@ using namespace llvm::omp;
 namespace clang {
 // cppsh: how many bound values have been read (ExprConstant.cpp).
 extern unsigned CppshBindingReads;
+// cppsh: an `if`'s condition being evaluated to fold it (ExprConstant.cpp).
+extern bool CppshFoldingCondition;
 // cppsh: cuts in instantiated bodies (SemaExpr.cpp).
 extern bool CppshCutNeeded;
 extern std::vector<Expr *> CppshCutNeedExprs;
@@ -8614,8 +8616,11 @@ TreeTransform<Derived>::TransformIfStmt(IfStmt *S) {
     if (!CondE->isValueDependent()) {
       const unsigned ReadsBefore = CppshBindingReads;
       bool CondBool = false;
-      if (CondE->EvaluateAsBooleanCondition(CondBool, getSema().Context) &&
-          CppshBindingReads != ReadsBefore)
+      const bool WasFolding = std::exchange(CppshFoldingCondition, true);
+      const bool Known =
+          CondE->EvaluateAsBooleanCondition(CondBool, getSema().Context);
+      CppshFoldingCondition = WasFolding;
+      if (Known && CppshBindingReads != ReadsBefore)
         ConstexprConditionValue = CondBool;
     }
   }

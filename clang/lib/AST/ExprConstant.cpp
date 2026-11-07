@@ -116,6 +116,11 @@ llvm::SmallPtrSet<const VarDecl *, 8> CppshStagedWanted;
 llvm::DenseMap<const VarDecl *, const VarDecl *> CppshParamPending;
 llvm::SmallPtrSet<const VarDecl *, 4> CppshPendingReads;
 void (*CppshOnNeedRead)() = nullptr;
+// Whether a plain `if`'s condition is being evaluated to fold it (the value
+// specialization's TreeTransform::TransformIfStmt): a read there wants the
+// value, as one in a constant-evaluated context does. Any other evaluation
+// is speculative (a warning's check of `v * 2`): it fails, and wants nothing.
+bool CppshFoldingCondition = false;
 static void cppshReadPending(const VarDecl *Source) {
   CppshPendingReads.insert(Source);
   if (CppshStagedTracked.count(Source))
@@ -3585,7 +3590,8 @@ static bool evaluateVarDeclInit(EvalInfo &Info, const Expr *E,
   if (isa<ParmVarDecl>(VD)) {
     if (auto Pending = CppshParamPending.find(VD);
         Pending != CppshParamPending.end()) {
-      cppshReadPending(Pending->second);
+      if (Info.InConstantContext || CppshFoldingCondition)
+        cppshReadPending(Pending->second);
       Info.FFDiag(E);
       return false;
     }
