@@ -3034,8 +3034,18 @@ struct CppshValueSpec {
         Other.size() != Params.size())
       return false;
     for (unsigned I = 0; I < Params.size(); ++I) {
-      // Made with it unbound, or never reading it: any value does.
-      if (!Params[I] || (ReadKnown && !Read.test(I)))
+      // Made with it unbound: for a call with it unbound only -- a making
+      // without a value its body wanted (a quiet attempt of staged code's)
+      // may have failed short of marking the function invalid, and never
+      // got to read it.
+      if (!Params[I]) {
+        if (Other[I])
+          return false;
+        continue;
+      }
+      // Bound and never read: taken at run time (unbound once its body was
+      // made), whatever the call's is.
+      if (ReadKnown && !Read.test(I))
         continue;
       if (!Other[I] || *Other[I] != *Params[I])
         return false;

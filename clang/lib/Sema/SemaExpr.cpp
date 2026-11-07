@@ -8345,11 +8345,34 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         if (AnyValueCandidate && !CurContext->isDependentContext()) {
           DiagnosticsEngine &Diags = getDiagnostics();
           const bool WasSuppressed = Diags.getSuppressAllDiagnostics();
+          // What the statement has met so far: a need the probe meets (a
+          // run-time default template argument, a staged call inside) is the
+          // statement's -- met once, not again by a second build.
+          const bool HeldBefore = CppshNeedHolding;
+          const bool CutBefore = CppshCutNeeded, TopBefore = CppshTopNeed;
+          const size_t CutExprsBefore = CppshCutNeedExprs.size(),
+                       TopExprsBefore = CppshTopNeedExprs.size(),
+                       StagedCallsBefore = CppshCutStagedCalls.size();
+          const bool StageBefore = CppshStageAt.isValid();
           Diags.setSuppressAllDiagnostics(true);
           ExprResult Plain = BuildOverloadedCallExpr(
               Scope, Fn, ULE, LParenLoc, ArgExprs, RParenLoc, ExecConfig,
               /*AllowTypoCorrection=*/false, find.IsAddressOfOperand);
-          Diags.setSuppressAllDiagnostics(WasSuppressed);
+          // A hold begun in the probe holds the statement's diagnostics: what
+          // it puts back is what they were before the probe, and it stays.
+          if (!HeldBefore && CppshNeedHolding)
+            CppshNeedWasSuppressed = WasSuppressed;
+          Diags.setSuppressAllDiagnostics(WasSuppressed || CppshNeedHolding);
+          if (CppshCutNeeded != CutBefore || CppshTopNeed != TopBefore ||
+              CppshCutNeedExprs.size() != CutExprsBefore ||
+              CppshTopNeedExprs.size() != TopExprsBefore ||
+              CppshCutStagedCalls.size() != StagedCallsBefore ||
+              CppshStageAt.isValid() != StageBefore)
+            // The statement is staged (or taken back) for it: this call as
+            // the probe built it, its diagnostics held with the statement's.
+            return Plain.isUsable()
+                       ? Plain
+                       : CreateRecoveryExpr(Fn->getBeginLoc(), RParenLoc, ArgExprs);
           bool Fine = Plain.isUsable() && !Plain.get()->containsErrors();
           if (Fine)
             if (auto *CE = dyn_cast<CallExpr>(Plain.get()))
