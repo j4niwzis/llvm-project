@@ -1522,19 +1522,8 @@ namespace {
 // that declaration is, IncrementalParser::FinishPTU).
 struct CppshFrameState {
   bool WasHoist = std::exchange(CppshInHoist, false);
-  SourceLocation WasHoistBegin = std::exchange(CppshHoistBegin, SourceLocation());
-  SourceLocation WasHoistEnd = std::exchange(CppshHoistEnd, SourceLocation());
-  SourceLocation WasStageAt = std::exchange(CppshStageAt, SourceLocation());
-  bool WasTopNeed = std::exchange(CppshTopNeed, false);
-  std::vector<SourceRange> WasTopNeedExprs = std::exchange(CppshTopNeedExprs, {});
-  ~CppshFrameState() {
-    CppshInHoist = WasHoist;
-    CppshHoistBegin = WasHoistBegin;
-    CppshHoistEnd = WasHoistEnd;
-    CppshStageAt = WasStageAt;
-    CppshTopNeed = WasTopNeed;
-    CppshTopNeedExprs = std::move(WasTopNeedExprs);
-  }
+  CppshStagingScope Staging;
+  ~CppshFrameState() { CppshInHoist = WasHoist; }
 };
 } // namespace
 

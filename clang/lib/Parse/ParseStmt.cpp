@@ -1784,28 +1784,16 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
     CppshBodyOpen = T.getOpenLocation();
     CppshRangeBase = CppshRangeFors.size();
   }
-  // A function's body has needs of its own: none pending as it opens -- what
-  // the statement around it (a lambda's) met, or what was left over before
-  // it, kept aside and put back after.
-  bool CppshSavedNeeded = false;
-  const VarDecl *CppshSavedNeedVar = nullptr;
-  std::vector<Expr *> CppshSavedNeedExprs, CppshSavedStagedCalls;
-  if (CppshBody) {
-    CppshSavedNeeded = std::exchange(CppshCutNeeded, false);
-    CppshSavedNeedVar = std::exchange(CppshCutNeedVar, nullptr);
-    CppshSavedNeedExprs = std::exchange(CppshCutNeedExprs, {});
-    CppshSavedStagedCalls = std::exchange(CppshCutStagedCalls, {});
-  }
   llvm::scope_exit CppshRestoreBody([&] {
     if (CppshBody) {
       CppshBodyOpen = CppshSavedBodyOpen;
       CppshRangeBase = CppshSavedRangeBase;
-      CppshCutNeeded = CppshSavedNeeded;
-      CppshCutNeedVar = CppshSavedNeedVar;
-      CppshCutNeedExprs = std::move(CppshSavedNeedExprs);
-      CppshCutStagedCalls = std::move(CppshSavedStagedCalls);
     }
   });
+  // A function's body has its own staging state: none pending as it opens --
+  // what the statement around it (a lambda's) met, or what was left over
+  // before it, kept aside and put back after.
+  CppshStagingScope CppshBodyState(CppshBody);
   // Not where a need is pending as the block opens -- raised in the header
   // of the statement it is the body of (`for (e : ls o) {`): that one makes
   // a region of the whole statement, in the block around it.

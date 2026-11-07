@@ -214,6 +214,34 @@ std::optional<unsigned> cppshTokenIndex(SourceLocation Loc) {
 // in its place (Interpreter::ParseAndExecute) -- unless it is that hoisted
 // call itself being run.
 SourceLocation CppshHoistBegin, CppshHoistEnd;
+
+CppshStagingState cppshTakeStagingState() {
+  CppshStagingState State;
+  State.Needed = std::exchange(CppshCutNeeded, false);
+  State.Var = std::exchange(CppshCutNeedVar, nullptr);
+  State.Exprs = std::exchange(CppshCutNeedExprs, {});
+  State.StagedCalls = std::exchange(CppshCutStagedCalls, {});
+  State.Function = std::exchange(CppshCutNeedFunction, nullptr);
+  State.HoistBegin = std::exchange(CppshHoistBegin, SourceLocation());
+  State.HoistEnd = std::exchange(CppshHoistEnd, SourceLocation());
+  State.StageAt = std::exchange(CppshStageAt, SourceLocation());
+  State.TopNeed = std::exchange(CppshTopNeed, false);
+  State.TopNeedExprs = std::exchange(CppshTopNeedExprs, {});
+  return State;
+}
+
+void cppshPutStagingState(CppshStagingState State) {
+  CppshCutNeeded = State.Needed;
+  CppshCutNeedVar = State.Var;
+  CppshCutNeedExprs = std::move(State.Exprs);
+  CppshCutStagedCalls = std::move(State.StagedCalls);
+  CppshCutNeedFunction = State.Function;
+  CppshHoistBegin = State.HoistBegin;
+  CppshHoistEnd = State.HoistEnd;
+  CppshStageAt = State.StageAt;
+  CppshTopNeed = State.TopNeed;
+  CppshTopNeedExprs = std::move(State.TopNeedExprs);
+}
 bool CppshInHoist = false;
 
 // Whether a location is in what the user typed (the REPL's input buffers).

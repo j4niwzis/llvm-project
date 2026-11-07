@@ -16,6 +16,7 @@
 #define LLVM_CLANG_SEMA_CPPSHSTAGING_H
 
 #include "clang/AST/Type.h"
+#include "clang/Basic/SourceLocation.h"
 #include "clang/Lex/Token.h"
 #include "llvm/ADT/DenseMap.h"
 #include <optional>
@@ -91,6 +92,46 @@ size_t cppshSpecializationMark();
 void cppshForgetSpecializationsSince(size_t Mark);
 // And those made in a unit taken out of the JIT (staged code's, evicted).
 void cppshForgetSpecializationsIn(const TranslationUnitDecl *TU);
+
+// What the statement being analysed has met that its staging needs: a local
+// whose value only running gives (Var), run-time template arguments (Exprs),
+// staged functions' calls (StagedCalls), the function it is a need of; at the
+// top level, a staged call to hoist (HoistBegin/End), the place to stage the
+// input at (StageAt), run-time template arguments of a declaration (TopNeed).
+// One state: a body with needs of its own, a staged statement compiled as it
+// runs, take it and put it back whole (CppshStagingScope) -- never a part of
+// it forgotten.
+struct CppshStagingState {
+  bool Needed = false;
+  const VarDecl *Var = nullptr;
+  std::vector<Expr *> Exprs;
+  std::vector<Expr *> StagedCalls;
+  const FunctionDecl *Function = nullptr;
+  SourceLocation HoistBegin, HoistEnd, StageAt;
+  bool TopNeed = false;
+  std::vector<SourceRange> TopNeedExprs;
+};
+// The state now taken (none left), and one put back in its place.
+CppshStagingState cppshTakeStagingState();
+void cppshPutStagingState(CppshStagingState State);
+// A body (a function's, a lambda's, one instantiated) or a run with a state
+// of its own: the one around it taken as it begins, put back as it ends.
+class CppshStagingScope {
+  CppshStagingState Outer;
+  bool Active;
+
+public:
+  explicit CppshStagingScope(bool Active = true) : Active(Active) {
+    if (Active)
+      Outer = cppshTakeStagingState();
+  }
+  ~CppshStagingScope() {
+    if (Active)
+      cppshPutStagingState(std::move(Outer));
+  }
+  CppshStagingScope(const CppshStagingScope &) = delete;
+  CppshStagingScope &operator=(const CppshStagingScope &) = delete;
+};
 } // namespace clang
 
 #endif // LLVM_CLANG_SEMA_CPPSHSTAGING_H
