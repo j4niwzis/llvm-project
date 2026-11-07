@@ -53,6 +53,12 @@
 #include <optional>
 
 using namespace clang;
+namespace clang {
+extern bool CppshCutNeeded;
+extern const VarDecl *CppshCutNeedVar;
+extern const FunctionDecl *CppshCutNeedFunction;
+const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E);
+} // namespace clang
 using namespace sema;
 
 using AllowedExplicit = Sema::AllowedExplicit;
@@ -6832,6 +6838,23 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
       return E;
     }
   }
+
+  // cppsh: a template argument not constant only because it reads a local
+  // whose value exists as the function runs (std::array<int, n>, n read
+  // from std::cin): a need, as a value-specialized call's argument is -- the
+  // body cut at this statement, the rest compiled with the value known (a
+  // continuation's parameter, which the evaluator reads). Meanwhile the
+  // argument is a zero of its type, so that the statement checks: it is
+  // dropped for the cut.
+  if (CCE == CCEKind::TemplateArg && T->isIntegralOrEnumerationType())
+    if (const VarDecl *Local = cppshRuntimeLocalIn(*this, E)) {
+      CppshCutNeeded = true;
+      CppshCutNeedVar = Local;
+      CppshCutNeedFunction = getCurFunctionDecl();
+      Value = APValue(llvm::APSInt(Context.getIntWidth(T),
+                                   T->isUnsignedIntegerOrEnumerationType()));
+      return ConstantExpr::Create(Context, E, Value);
+    }
 
   // It's not a constant expression. Produce an appropriate diagnostic.
   if (Notes.size() == 1 &&

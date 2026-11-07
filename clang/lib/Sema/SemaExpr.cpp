@@ -345,6 +345,38 @@ static std::string cppshLineMark(SourceManager &SM, SourceLocation Loc) {
          std::string(P.getColumn() > 0 ? P.getColumn() - 1 : 0, ' ');
 }
 
+// The local an expression reads whose value exists only as the function being
+// written runs (cppsh): one of its own locals, outside a lambda, in a body the
+// user typed (or instantiated from one), not a parameter whose value is known
+// -- what a need is made of (a value-specialized call's argument, a template
+// argument). None where the expression reads no such local.
+const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
+  FunctionDecl *Cur = S.getCurFunctionDecl();
+  if (!E || !Cur || isLambdaCallOperator(Cur) || Cur->isDependentContext() ||
+      !cppshInUserInput(S, Cur->getLocation()))
+    return nullptr;
+  if (S.CodeSynthesisContexts.empty()
+          ? Cur->isTemplateInstantiation()
+          : !(S.CodeSynthesisContexts.back().Kind ==
+                  Sema::CodeSynthesisContext::TemplateInstantiation &&
+              S.CodeSynthesisContexts.back().Entity == Cur))
+    return nullptr;
+  auto Find = [&](const Stmt *X, auto &Self) -> const VarDecl * {
+    if (!X)
+      return nullptr;
+    if (auto *DRE = dyn_cast<DeclRefExpr>(X))
+      if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+          VD && VD->hasLocalStorage() && VD->getParentFunctionOrMethod() == Cur &&
+          !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)))
+        return VD;
+    for (const Stmt *C : X->children())
+      if (const VarDecl *VD = Self(C, Self))
+        return VD;
+    return nullptr;
+  };
+  return Find(E, Find);
+}
+
 // std::sh::<Name>, as an expression to call.
 static ExprResult cppshShCallee(Sema &S, StringRef Name, SourceLocation Loc) {
   NamespaceDecl *Std = S.getStdNamespace();
