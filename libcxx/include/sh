@@ -1926,4 +1926,47 @@ constexpr unsigned long long operator""_GB(unsigned long long v) noexcept {
   return v * 1024ULL * 1024ULL * 1024ULL;
 }
 
+// cppsh: what nearly every session uses, instantiated while the std.sh
+// module is built -- kept in the module, and found there by each input rather
+// than instantiated again in every process: printing and formatting the
+// common values, a listing of each kind taken from and shown as a table, the
+// snapshots of the common variables. Never called.
+namespace std::sh::__cppsh_warm {
+inline void __uses() {
+  std::string s;
+  const std::string cs;
+  int i = 0;
+  long long ll = 0;
+  double d = 0;
+  bool b = false;
+  const char *p = "";
+  std::println("");
+  std::println("{}", 1);
+  std::println("{}", i);
+  std::println("{}", ll);
+  std::println("{}", d);
+  std::println("{}", b);
+  std::println("{}", p);
+  std::println("{}", "");
+  std::println("{}", s);
+  std::println("{}", cs);
+  std::println("{}", std::string());
+  std::println("{} {}", s, i);
+  std::print("{}", s);
+  (void)std::format("{}", s);
+  (void)std::format("{}", i);
+  using std::ranges::views::show;
+  using std::ranges::views::take;
+  std::sh::ls_view<std::sh::fs_entry>(std::string("."), std::sh::ls_opts{}) | take(2) | show;
+  std::sh::ls_view<std::sh::file_entry>(std::string("."), std::sh::ls_opts{}) | take(2) | show;
+  std::sh::ls_view<std::sh::dir_entry>(std::string("."), std::sh::ls_opts{}) | take(2) | show;
+  std::sh::ls_view<std::sh::fs_entry>(std::string("."), std::sh::ls_opts{}) | show;
+  std::sh::ls_view<std::sh::file_entry>(std::string("."), std::sh::ls_opts{}) | show;
+  std::sh::ls_view<std::sh::dir_entry>(std::string("."), std::sh::ls_opts{}) | show;
+  std::sh::fs_entry e;
+  std::sh::__cppsh_snapshot(e);
+  std::sh::__cppsh_snapshot(s);
+}
+} // namespace std::sh::__cppsh_warm
+
 #endif // _LIBCPP_SH
