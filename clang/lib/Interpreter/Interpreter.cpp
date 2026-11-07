@@ -73,6 +73,7 @@
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/APInt.h"
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #if !defined(_WIN32)
@@ -1406,6 +1407,12 @@ extern std::vector<SourceLocation> CppshTopLevelStarts;
 void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef) = nullptr;
 // How many inputs the staging probe forked for (CPPSH_TIME).
 unsigned CppshProbes = 0;
+// Set by the interpreter's own code that knows it needs no staging (a
+// continuation's, laid out by __cppsh_cut_run): no probe forked for it.
+bool CppshNoProbe = false;
+// Time spent parsing (with code generation) and executing (JIT link and run),
+// for CPPSH_TIME.
+unsigned long long CppshParseNs = 0, CppshExecuteNs = 0;
 
 extern std::vector<std::string> CppshCutRemainders;
 extern std::vector<std::string> CppshCutLoopRests;
@@ -1434,7 +1441,7 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   std::string Tag = std::to_string(K);
   const std::vector<std::string> &Names = CppshCutLocalNames[Id];
   const std::vector<std::string> &Types = CppshCutLocalTypes[Id];
-  std::string Code, Params, Args;
+  std::string Globals, Code, Params, Args;
   // A type marked `&&` (no copy): moved -- the frame it is in is left as
   // soon as the continuation has run.
   std::vector<std::string> Tys;
@@ -1445,8 +1452,8 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
       Ty = Ty.substr(2);
     Tys.push_back(Ty);
     std::string Global = "__cppsh_f" + Tag + "_" + Names[I];
-    Code += "auto &" + Global + " = *static_cast<" + Ty + " *>((void *)" +
-            std::to_string(reinterpret_cast<uintptr_t>(Frame[I])) + "ULL);\n";
+    Globals += "auto &" + Global + " = *static_cast<" + Ty + " *>((void *)" +
+               std::to_string(reinterpret_cast<uintptr_t>(Frame[I])) + "ULL);\n";
     Params += std::string(Params.empty() ? "" : ", ") + "auto " + Names[I];
     Args += std::string(Args.empty() ? "" : ", ") +
             (Move ? "static_cast<" + Ty + " &&>(" + Global + ")" : Global);
@@ -1489,8 +1496,16 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
           "); });\n";
   bool WasHoist = CppshInHoist;
   CppshInHoist = false;
-  if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Code))
+  // Laid out here, and known: the frame's globals first (run, so that the
+  // rest reads their values), then the continuation and its result -- no
+  // staging probe for either.
+  bool WasNoProbe = CppshNoProbe;
+  CppshNoProbe = true;
+  if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Globals))
     llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
+  else if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Code))
+    llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
+  CppshNoProbe = WasNoProbe;
   CppshInHoist = WasHoist;
   // The result: that of this continuation -- unless it was staged on in turn
   // (a staged{} of its own): then that of the innermost, set as it ran.
@@ -1656,16 +1671,28 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
 
     CppshStagePlan Plan;
     if (cppshSeveralStatements(Code))
-      Plan = (++CppshProbes, cppshProbe(*this, Code));
+      Plan = CppshNoProbe ? CppshStagePlan{} : (++CppshProbes, cppshProbe(*this, Code));
 
     if (Plan.Split == 0) {
       // As it is: compiled, run, its value shown.
+      auto Started = std::chrono::steady_clock::now();
+      auto Since = [&] {
+        auto Now = std::chrono::steady_clock::now();
+        unsigned long long Ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Now - Started).count();
+        Started = Now;
+        return Ns;
+      };
       auto PTU = Parse(Code);
+      CppshParseNs += Since();
       if (!PTU)
         return PTU.takeError();
-      if (PTU->TheModule)
-        if (llvm::Error Err = Execute(*PTU))
+      if (PTU->TheModule) {
+        llvm::Error Err = Execute(*PTU);
+        CppshExecuteNs += Since();
+        if (Err)
           return Err;
+      }
       if (LastValue.isValid()) {
         if (!V) {
           // What the input's own code wrote (stdio, buffered where the

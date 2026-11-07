@@ -204,6 +204,7 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
 namespace clang {
 extern void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef);
 extern unsigned CppshProbes;
+extern unsigned long long CppshParseNs, CppshExecuteNs;
 } // namespace clang
 
 // CPPSH_TIME=1: how long each phase took, on stderr -- the start, piece by
@@ -218,6 +219,7 @@ struct CppshPhase {
   std::string Detail;
   std::chrono::steady_clock::time_point Start = std::chrono::steady_clock::now();
   unsigned Probes = clang::CppshProbes, Snapshots = CppshSnapshotCompiles;
+  unsigned long long ParseNs = clang::CppshParseNs, ExecuteNs = clang::CppshExecuteNs;
   explicit CppshPhase(const char *What, std::string Detail = {})
       : What(What), Detail(std::move(Detail)) {}
   ~CppshPhase() {
@@ -227,6 +229,10 @@ struct CppshPhase {
                     std::chrono::steady_clock::now() - Start)
                     .count();
     llvm::errs() << llvm::format("[cppsh-time] %8.1f ms  %s", Ms, What);
+    if (clang::CppshParseNs != ParseNs || clang::CppshExecuteNs != ExecuteNs)
+      llvm::errs() << llvm::format(" [parse %.1f ms, jit %.1f ms]",
+                                   (clang::CppshParseNs - ParseNs) / 1e6,
+                                   (clang::CppshExecuteNs - ExecuteNs) / 1e6);
     if (clang::CppshProbes != Probes || CppshSnapshotCompiles != Snapshots)
       llvm::errs() << " (probes " << (clang::CppshProbes - Probes) << ", snapshot compiles "
                    << (CppshSnapshotCompiles - Snapshots) << ")";
