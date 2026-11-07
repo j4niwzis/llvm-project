@@ -29,6 +29,12 @@
 #include "llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h"
 #include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
 #include "llvm/ExecutionEngine/Orc/Debugging/DebuggerSupport.h"
+#include <mutex>
+#include "llvm/Support/Process.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Format.h"
+#include "llvm/ExecutionEngine/JITLink/JITLink.h"
+#include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/Orc/EPCDynamicLibrarySearchGenerator.h"
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/ExecutorProcessControl.h"
@@ -164,6 +170,67 @@ createJITTargetMachineBuilder(const llvm::Triple &TT) {
   return JTMB;
 }
 
+namespace {
+// cppsh: whether a debugger traces this process (Linux: /proc/self/status's
+// TracerPid) -- the JIT's objects registered with it then, its frames named
+// in its backtraces, at no cost otherwise.
+bool cppshUnderDebugger() {
+#if defined(__linux__)
+  auto Status = llvm::MemoryBuffer::getFileAsStream("/proc/self/status");
+  if (!Status)
+    return false;
+  for (llvm::StringRef Line : llvm::split((*Status)->getBuffer(), '\n'))
+    if (Line.consume_front("TracerPid:"))
+      return Line.trim() != "0";
+#endif
+  return false;
+}
+
+// cppsh: each function the JIT links named for perf (CPPSH_PERF_MAP=1):
+// `<address> <size> <name>` lines in /tmp/perf-<pid>.map, as perf reads
+// for code it finds no object file of.
+class CppshPerfMapPlugin : public llvm::orc::ObjectLinkingLayer::Plugin {
+  std::mutex Lock;
+  std::unique_ptr<llvm::raw_fd_ostream> Out;
+
+public:
+  CppshPerfMapPlugin() {
+    std::error_code EC;
+    std::string Path =
+        "/tmp/perf-" + std::to_string(llvm::sys::Process::getProcessId()) + ".map";
+    Out = std::make_unique<llvm::raw_fd_ostream>(Path, EC, llvm::sys::fs::OF_Append);
+    if (EC)
+      Out.reset();
+  }
+  void modifyPassConfig(llvm::orc::MaterializationResponsibility &,
+                        llvm::jitlink::LinkGraph &,
+                        llvm::jitlink::PassConfiguration &Config) override {
+    Config.PostFixupPasses.push_back([this](llvm::jitlink::LinkGraph &G) {
+      std::lock_guard<std::mutex> Guard(Lock);
+      if (!Out)
+        return llvm::Error::success();
+      for (llvm::jitlink::Symbol *Sym : G.defined_symbols())
+        if (Sym->hasName() && Sym->isCallable() && Sym->getSize())
+          *Out << llvm::format("%llx %llx ",
+                               (unsigned long long)Sym->getAddress().getValue(),
+                               (unsigned long long)Sym->getSize())
+               << *Sym->getName() << "\n";
+      Out->flush();
+      return llvm::Error::success();
+    });
+  }
+  llvm::Error notifyFailed(llvm::orc::MaterializationResponsibility &) override {
+    return llvm::Error::success();
+  }
+  llvm::Error notifyRemovingResources(llvm::orc::JITDylib &,
+                                      llvm::orc::ResourceKey) override {
+    return llvm::Error::success();
+  }
+  void notifyTransferringResources(llvm::orc::JITDylib &, llvm::orc::ResourceKey,
+                                   llvm::orc::ResourceKey) override {}
+};
+} // namespace
+
 static llvm::Expected<std::unique_ptr<llvm::orc::LLJITBuilder>>
 createDefaultJITBuilder(llvm::orc::JITTargetMachineBuilder JTMB) {
   auto JITBuilder = std::make_unique<llvm::orc::LLJITBuilder>();
@@ -172,8 +239,13 @@ createDefaultJITBuilder(llvm::orc::JITTargetMachineBuilder JTMB) {
     // Try to enable debugging of JIT'd code (only works with JITLink for
     // ELF and MachO) -- where asked for (CLANG_REPL_JIT_DEBUG): it copies
     // and registers every object linked, an input's worth of work each time.
-    if (std::getenv("CLANG_REPL_JIT_DEBUG"))
+    // (cppsh: and under a debugger, without being asked.)
+    if (std::getenv("CLANG_REPL_JIT_DEBUG") || cppshUnderDebugger())
       consumeError(llvm::orc::enableDebuggerSupport(J));
+    if (std::getenv("CPPSH_PERF_MAP"))
+      if (auto *OLL =
+              llvm::dyn_cast<llvm::orc::ObjectLinkingLayer>(&J.getObjLinkingLayer()))
+        OLL->addPlugin(std::make_shared<CppshPerfMapPlugin>());
     return llvm::Error::success();
   });
   return std::move(JITBuilder);
