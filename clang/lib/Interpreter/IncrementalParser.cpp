@@ -194,8 +194,14 @@ void IncrementalParser::AddBuilt(DeclGroupRef DG) {
 }
 
 llvm::Expected<TranslationUnitDecl *> IncrementalParser::EndBuild() {
+  // A unit built from the AST, not parsed: what its instantiations look up
+  // unqualified is the templates' own (and argument-dependent), never a
+  // scope of the parser's -- which, between the parsed units, is not one of
+  // this unit.
+  Scope *const SavedScope = std::exchange(S.CurScope, nullptr);
   llvm::Expected<TranslationUnitDecl *> TU =
       FinishPTU(*BuildLocalInstantiations, *BuildGlobalInstantiations);
+  S.CurScope = SavedScope;
   BuildLocalInstantiations.reset();
   BuildGlobalInstantiations.reset();
   return TU;
