@@ -166,6 +166,12 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
       return NextToken().is(tok::period);
     if (isFlagStart() || isPathStart())
       return true;
+    // A negation glued to what it negates (`filter !_.is_dir`): no binary
+    // `!` exists for it to be read as instead.
+    if (Tok.is(tok::exclaim) && Tok.hasLeadingSpace() &&
+        !NextToken().hasLeadingSpace() &&
+        !NextToken().isOneOf(tok::eof, tok::semi, tok::equal))
+      return true;
     return Tok.isOneOf(tok::identifier, tok::annot_cxxscope,
                        tok::numeric_constant, tok::char_constant,
                        tok::wide_char_constant, tok::utf8_char_constant,
