@@ -9262,6 +9262,17 @@ TreeTransform<Derived>::TransformDependentCoawaitExpr(DependentCoawaitExpr *E) {
 template<typename Derived>
 ExprResult
 TreeTransform<Derived>::TransformCoyieldExpr(CoyieldExpr *E) {
+  // cppsh: staged code compiled as a coroutine of its own -- what it yields
+  // yielded again, on its own coroutine's promise (which hands it to the
+  // outer one), not the outer promise's yield_value it was built with.
+  if (Expr *Yielded = getSema().cppshStagedYieldOperand(E)) {
+    ExprResult Value = getDerived().TransformInitializer(Yielded,
+                                                         /*NotCopyInit*/false);
+    if (Value.isInvalid())
+      return ExprError();
+    return getSema().ActOnCoyieldExpr(getSema().getCurScope(),
+                                      E->getKeywordLoc(), Value.get());
+  }
   ExprResult Result = getDerived().TransformInitializer(E->getOperand(),
                                                         /*NotCopyInit*/false);
   if (Result.isInvalid())

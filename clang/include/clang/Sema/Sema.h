@@ -16124,6 +16124,9 @@ public:
     /// ways out co_returns, a co_return of its code the outer promise's.
     bool Coroutine = false;
     ParmVarDecl *OuterPromise = nullptr;
+    /// The outer coroutine's own promise variable, on which the parser built
+    /// what the staged code yields (`__promise.yield_value(e)`).
+    VarDecl *OuterPromiseVar = nullptr;
   };
   CppshStagedRun *CurrentCppshStagedRun = nullptr;
 
@@ -16180,6 +16183,11 @@ public:
 
   /// `this`, in a staged statement's body compiled as it runs.
   Expr *CppshStagedThis(SourceLocation Loc);
+  /// In staged code compiled as a coroutine of its own: what a co_yield built
+  /// on the outer coroutine's promise yields (the `e` of
+  /// `__promise.yield_value(e)`) -- yielded again on this coroutine's
+  /// promise; none for any other co_yield.
+  Expr *cppshStagedYieldOperand(CoyieldExpr *E);
 
   /// A staged statement in a coroutine whose code suspends it: what the
   /// coroutine runs it by (CppshStagedStmt::setSuspend).

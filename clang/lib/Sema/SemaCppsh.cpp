@@ -605,6 +605,7 @@ StmtResult Sema::InstantiateCppshStaged(CppshStagedStmt *S,
     if (!FSI->CoroutinePromise)
       return StmtError();
     Scope.InstantiatedLocal(OuterBody->getPromiseDecl(), FSI->CoroutinePromise);
+    Run.OuterPromiseVar = OuterBody->getPromiseDecl();
   }
   for (unsigned I = 0; I < Params.size(); ++I)
     Scope.InstantiatedLocal(Params[I], Locals[I]);
@@ -863,6 +864,23 @@ bool Sema::BuildCppshStagedSuspend(CppshStagedStmt *SS) {
   SS->setSuspend(CompoundStmt::Create(C, Stmts, FPOptionsOverride(), Loc, Loc),
                  Left.get());
   return true;
+}
+
+Expr *Sema::cppshStagedYieldOperand(CoyieldExpr *E) {
+  CppshStagedRun *Run = CurrentCppshStagedRun;
+  if (!Run || !Run->Coroutine || !Run->OuterPromiseVar || !E)
+    return nullptr;
+  auto *Call = dyn_cast_or_null<CXXMemberCallExpr>(
+      E->getOperand() ? E->getOperand()->IgnoreImplicit() : nullptr);
+  if (!Call || Call->getNumArgs() != 1)
+    return nullptr;
+  const auto *Object = dyn_cast<DeclRefExpr>(
+      Call->getImplicitObjectArgument()->IgnoreParenImpCasts());
+  const CXXMethodDecl *Method = Call->getMethodDecl();
+  if (!Object || Object->getDecl() != Run->OuterPromiseVar || !Method ||
+      !Method->getIdentifier() || Method->getName() != "yield_value")
+    return nullptr;
+  return Call->getArg(0);
 }
 
 Expr *Sema::CppshStagedThis(SourceLocation Loc) {
