@@ -106,6 +106,23 @@ unsigned CppshBindingReads = 0;
 llvm::DenseSet<const VarDecl *> CppshBindingsRead;
 bool CppshStagedLive = false;
 llvm::SmallPtrSet<const VarDecl *, 8> CppshStagedWanted;
+// Parameters of a call being built whose argument's value is not known yet,
+// each with the variable it comes from: a local of the function being
+// written (known as it runs), a staged statement's local not bound yet. Read
+// as the callee is instantiated, the value is needed -- the variable noted in
+// CppshPendingReads (a staged local wanted, the hook told of any other: its
+// statement's diagnostics held, a need met); the evaluation not constant.
+// Never read, the call is as it is: no value of it needed.
+llvm::DenseMap<const VarDecl *, const VarDecl *> CppshParamPending;
+llvm::SmallPtrSet<const VarDecl *, 4> CppshPendingReads;
+void (*CppshOnNeedRead)() = nullptr;
+static void cppshReadPending(const VarDecl *Source) {
+  CppshPendingReads.insert(Source);
+  if (CppshStagedTracked.count(Source))
+    CppshStagedWanted.insert(Source);
+  else if (CppshOnNeedRead)
+    CppshOnNeedRead();
+}
 } // namespace clang
 using llvm::APFixedPoint;
 using llvm::APInt;
@@ -3566,6 +3583,12 @@ static bool evaluateVarDeclInit(EvalInfo &Info, const Expr *E,
   // Used to be C++20 [expr.const]p5.12.2:
   // ... its lifetime began within the evaluation of E;
   if (isa<ParmVarDecl>(VD)) {
+    if (auto Pending = CppshParamPending.find(VD);
+        Pending != CppshParamPending.end()) {
+      cppshReadPending(Pending->second);
+      Info.FFDiag(E);
+      return false;
+    }
     if (auto Known = CppshParamValue.find(cast<ParmVarDecl>(VD));
         Known != CppshParamValue.end()) {
       ++CppshBindingReads;

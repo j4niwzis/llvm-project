@@ -46,6 +46,7 @@ namespace clang {
 extern llvm::DenseMap<const VarDecl *, const Expr *> CppshParamRebuild;
 extern llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
 extern llvm::DenseSet<const VarDecl *> CppshBindingsRead;
+extern llvm::DenseMap<const VarDecl *, const VarDecl *> CppshParamPending;
 } // namespace clang
 
 static bool isDeclWithinFunction(const Decl *D) {
@@ -3124,8 +3125,10 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
 
   bool HasCppshConstParam = false;
   for (const ParmVarDecl *P : D->parameters()) {
+    // (A pending one too: made with it, a specialization forgotten if it
+    // reads it -- none to be found by the template arguments alone.)
     if (P && (P->hasConstantInitialization() || CppshParamRebuild.count(P) ||
-              CppshParamValue.count(P))) {
+              CppshParamValue.count(P) || CppshParamPending.count(P))) {
       HasCppshConstParam = true;
       break;
     }
@@ -3330,6 +3333,11 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
         if (auto Known = CppshParamValue.find(OrigP); Known != CppshParamValue.end()) {
           APValue Value = Known->second;
           CppshParamValue[Params[P]] = std::move(Value);
+        }
+        if (auto Pending = CppshParamPending.find(OrigP);
+            Pending != CppshParamPending.end()) {
+          const VarDecl *Source = Pending->second;
+          CppshParamPending[Params[P]] = Source;
         }
         if (OrigP && OrigP->hasConstantInitialization()) {
           if (const APValue *Val = OrigP->getEvaluatedValue()) {
@@ -6574,6 +6582,9 @@ void Sema::InstantiateFunctionDefinition(SourceLocation PointOfInstantiation,
             CppshParamValue.erase(Function->getParamDecl(I));
             CppshParamRebuild.erase(Function->getParamDecl(I));
           }
+        // Pending only while it is made.
+        for (ParmVarDecl *FP : Function->parameters())
+          CppshParamPending.erase(FP);
       }
       for (ParmVarDecl *FP : Function->parameters()) {
         if (FP) {

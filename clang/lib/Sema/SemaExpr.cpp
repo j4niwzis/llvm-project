@@ -94,6 +94,11 @@ std::optional<APValue> (*CppshRuntimeValueOf)(const VarDecl *) = nullptr;
 Expr *(*CppshRuntimeRebuildOf)(Sema &, const VarDecl *) = nullptr;
 extern llvm::DenseMap<const VarDecl *, const Expr *> CppshParamRebuild;
 extern llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
+extern llvm::DenseMap<const VarDecl *, const VarDecl *> CppshParamPending;
+extern llvm::SmallPtrSet<const VarDecl *, 4> CppshPendingReads;
+extern void (*CppshOnNeedRead)();
+extern llvm::DenseSet<const VarDecl *> CppshStagedTracked;
+extern bool CppshStagedLive;
 // The first place the value specialization needed the value of a variable
 // this same input defines, not run yet: where the interpreter stages it --
 // running what comes before the top-level declaration holding this, then
@@ -133,6 +138,15 @@ void cppshHoldDiagnostics(Sema &S) {
 void cppshMeetNeed(Sema &S) {
   CppshCutNeeded = true;
   cppshHoldDiagnostics(S);
+}
+
+// The Sema building a call with a pending parameter: a read of it (as the
+// callee is instantiated) holds the statement's diagnostics -- what is made
+// without the value is not what will be.
+static Sema *CppshPendingSema = nullptr;
+static void cppshPendingNeedRead() {
+  if (CppshPendingSema)
+    cppshHoldDiagnostics(*CppshPendingSema);
 }
 
 void cppshEndNeedDiagnostics(Sema &S) {
@@ -8298,9 +8312,24 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
           CppshParamValue[P] = std::move(V);
         };
         SmallVector<std::pair<ParmVarDecl *, const Expr *>, 4> SavedRebuilds;
-        // This call needs what only running its function gives (cppsh): the
-        // body is cut at its statement, so the call is not built.
-        bool CppshCutHere = false;
+        // The parameters whose argument's value is not known yet (a local of
+        // the function being written, a staged local not bound): pending on
+        // that variable (CppshParamPending) -- needed only if the callee's
+        // instantiation reads them.
+        SmallVector<std::pair<ParmVarDecl *, std::optional<const VarDecl *>>, 4>
+            SavedPending;
+        auto setPending = [&](ParmVarDecl *P, const VarDecl *Source) {
+          auto Known = CppshParamPending.find(P);
+          SavedPending.push_back(
+              {P, Known == CppshParamPending.end()
+                      ? std::nullopt
+                      : std::optional<const VarDecl *>(Known->second)});
+          CppshParamPending[P] = Source;
+        };
+        // This call's own: a local of the function being written (the
+        // function it is a need of), a staged local.
+        SmallVector<std::pair<const VarDecl *, FunctionDecl *>, 2> PendingNeeds;
+        SmallVector<const VarDecl *, 2> PendingStaged;
         // An argument whose value is not known yet (a template parameter's,
         // a staged parameter's in a staged statement) for a candidate that
         // would be specialized on it: the call's type may depend on that
@@ -8356,6 +8385,17 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             // be wrong after the change.
             if (cppshMutates(PatBody, PatFD->getParamDecl(I)))
               continue;
+            // A parameter pending itself (an outer call's, its callee being
+            // instantiated) handed on: pending on the same variable -- read
+            // here, it is read there.
+            if (auto *DRE = dyn_cast<DeclRefExpr>(ArgE->IgnoreParenImpCasts()))
+              if (auto *PV = dyn_cast<VarDecl>(DRE->getDecl());
+                  PV && CppshParamPending.count(PV)) {
+                const VarDecl *Source = CppshParamPending.lookup(PV);
+                if (!PatFD->getParamDecl(I)->getType()->isReferenceType())
+                  setPending(PatFD->getParamDecl(I), Source);
+                continue;
+              }
             Expr::EvalResult EV;
             bool Ok = ArgE->EvaluateAsRValue(EV, Context);
             // A braced list (`ls {.files_only = true}`) has no type of its
@@ -8389,10 +8429,21 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             if (!Ok) {
               if (auto *DRE = dyn_cast<DeclRefExpr>(ArgE->IgnoreParenImpCasts())) {
                 if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+                  // A staged statement's local not bound yet (its value
+                  // known, bound in another attempt): pending -- wanted if
+                  // read. (A reference parameter is specialized on no value.)
+                  if (CppshStagedLive && CppshStagedTracked.count(VD)) {
+                    if (!PatFD->getParamDecl(I)->getType()->isReferenceType()) {
+                      setPending(PatFD->getParamDecl(I), VD);
+                      PendingStaged.push_back(VD);
+                    }
+                    continue;
+                  }
                   // A local of the function whose body is being written, its
-                  // value only known as it runs: the body is cut here.
-                  // (Not in a lambda's body: no cut is made there, and the
-                  // call would be left a recovery expression, unsaid.)
+                  // value only known as it runs: pending -- if read, the body
+                  // is cut here. (Not in a lambda's body: no cut is made
+                  // there, and the call would be left a recovery expression,
+                  // unsaid.)
                   FunctionDecl *NeedFD = cppshNeedFunction(*this);
                   if (VD->hasLocalStorage() && NeedFD &&
                       (CodeSynthesisContexts.empty()
@@ -8403,10 +8454,10 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                       VD->getParentFunctionOrMethod() == NeedFD &&
                       !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)) &&
                       cppshInUserInput(*this, NeedFD->getLocation())) {
-                    cppshMeetNeed(*this);
-                    CppshCutNeedVar = VD;
-                    CppshCutNeedFunction = NeedFD;
-                    CppshCutHere = true;
+                    if (!PatFD->getParamDecl(I)->getType()->isReferenceType()) {
+                      setPending(PatFD->getParamDecl(I), VD);
+                      PendingNeeds.push_back({VD, NeedFD});
+                    }
                     continue;
                   }
                   // Defined by this same input, not run yet: its value is not
@@ -8502,31 +8553,35 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             setValue(P, EV.Val);
           }
         }
-        auto RestoreParams = [&] {
-          for (auto &[P, Was] : llvm::reverse(SavedRebuilds)) {
-            if (Was)
-              CppshParamRebuild[P] = Was;
-            else
-              CppshParamRebuild.erase(P);
-          }
-          SavedRebuilds.clear();
-          for (auto &[P, Was] : llvm::reverse(SavedValues)) {
-            if (Was)
-              CppshParamValue[P] = std::move(*Was);
-            else
-              CppshParamValue.erase(P);
-          }
-          SavedValues.clear();
-        };
-        if (CppshCutHere) {
-          // A recovery expression of no type: what uses it is not diagnosed,
-          // and the parser drops the statement for the cut.
-          RestoreParams();
-          return CreateRecoveryExpr(Fn->getBeginLoc(), RParenLoc, ArgExprs);
-        }
+        // Built with them: what its making read of the pending ones is
+        // noted, from nothing (put back after, with this call's own: a call
+        // inside another's callee reads for that one too).
+        const size_t SpecsBefore = cppshSpecializationMark();
+        auto SavedReads = std::exchange(CppshPendingReads, {});
+        Sema *const SavedPendingSema = std::exchange(CppshPendingSema, this);
+        CppshOnNeedRead = &cppshPendingNeedRead;
         ExprResult OvRes = BuildOverloadedCallExpr(
             Scope, Fn, ULE, LParenLoc, ArgExprs, RParenLoc, ExecConfig,
             /*AllowTypoCorrection=*/true, find.IsAddressOfOperand);
+        CppshPendingSema = SavedPendingSema;
+        const VarDecl *NeedRead = nullptr;
+        const FunctionDecl *NeedReadFn = nullptr;
+        for (const auto &[Source, NeedFn] : PendingNeeds)
+          if (CppshPendingReads.count(Source)) {
+            NeedRead = Source;
+            NeedReadFn = NeedFn;
+            break;
+          }
+        const bool StagedRead = llvm::any_of(PendingStaged, [](const VarDecl *V) {
+          return CppshPendingReads.count(V) != 0;
+        });
+        CppshPendingReads.insert(SavedReads.begin(), SavedReads.end());
+        for (auto &[P, Was] : llvm::reverse(SavedPending)) {
+          if (Was)
+            CppshParamPending[P] = *Was;
+          else
+            CppshParamPending.erase(P);
+        }
         for (auto &[P, Was] : llvm::reverse(SavedRebuilds)) {
           if (Was)
             CppshParamRebuild[P] = Was;
@@ -8538,6 +8593,20 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             CppshParamValue[P] = std::move(*Was);
           else
             CppshParamValue.erase(P);
+        }
+        // A value read that was not there: what was made without it is no
+        // specialization of anything -- forgotten.
+        if (NeedRead || StagedRead)
+          cppshForgetSpecializationsSince(SpecsBefore);
+        // This call needs what only running its function gives (cppsh): the
+        // body is cut at its statement -- the call a recovery expression of
+        // no type (what uses it is not diagnosed; the parser drops the
+        // statement for the cut).
+        if (NeedRead) {
+          cppshMeetNeed(*this);
+          CppshCutNeedVar = NeedRead;
+          CppshCutNeedFunction = NeedReadFn;
+          return CreateRecoveryExpr(Fn->getBeginLoc(), RParenLoc, ArgExprs);
         }
         return OvRes;
       }
