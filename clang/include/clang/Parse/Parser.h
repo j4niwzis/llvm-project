@@ -8716,6 +8716,14 @@ private:
   Decl *ParseCppshStepFunction(IdentifierInfo *Name,
                                ArrayRef<CppshCutLocal> Frame, unsigned Begin,
                                unsigned End);
+  /// cppsh: in the function of a step being parsed, the frame's slot a break
+  /// or continue of a loop around the step sets (1, 2) before returning;
+  /// none outside one, or where it has none.
+  IdentifierInfo *CppshStepCode = nullptr;
+  /// cppsh: where the recorded tokens being parsed again end (a step's).
+  std::optional<unsigned> CppshReplayEnd;
+  /// cppsh: the step being left with Code, its function returning.
+  StmtResult CppshLeaveStep(SourceLocation Loc, unsigned Code);
   CppshBuiltBody CppshBeginBuiltReturn(SourceLocation Open);
   void CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
                               SmallVectorImpl<Stmt *> &Stmts, ExprResult E,

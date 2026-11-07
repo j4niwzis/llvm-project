@@ -1625,19 +1625,23 @@ static SmallVector<size_t, 4> cppshOwnTokens(ArrayRef<Token> Toks,
   return Found;
 }
 
-// Whether a statement leaves itself other than by finishing: a return, a
-// goto, a co_* of the function, a break or continue of a loop around it, a
-// label of a switch around it. Such a statement cannot run on its own and
-// hand the function back.
-static bool cppshLeavesItself(ArrayRef<Token> Toks) {
+// Whether code leaves the function it is in, or jumps where a function of its
+// own could not: a return, a goto, a co_*, a label of a switch around it.
+// Such code cannot run on its own and hand its function back. (A break or
+// continue of a loop around it can: cppshLeavesLoop.)
+static bool cppshLeavesFunction(ArrayRef<Token> Toks) {
   for (const Token &T : Toks)
     if (T.isOneOf(tok::kw_return, tok::kw_goto, tok::kw_co_return,
                   tok::kw_co_yield, tok::kw_co_await))
       return true;
-  return !cppshOwnTokens(Toks, tok::kw_break, true, true).empty() ||
-         !cppshOwnTokens(Toks, tok::kw_continue, true, false).empty() ||
-         !cppshOwnTokens(Toks, tok::kw_case, false, true).empty() ||
+  return !cppshOwnTokens(Toks, tok::kw_case, false, true).empty() ||
          !cppshOwnTokens(Toks, tok::kw_default, false, true).empty();
+}
+
+// Whether code breaks out of, or continues, a loop (or switch) around it.
+static bool cppshLeavesLoop(ArrayRef<Token> Toks) {
+  return !cppshOwnTokens(Toks, tok::kw_break, true, true).empty() ||
+         !cppshOwnTokens(Toks, tok::kw_continue, true, false).empty();
 }
 
 // The locals live at Loc in the function being parsed, each the innermost of
@@ -1672,52 +1676,85 @@ SmallVector<VarDecl *, 8> Parser::CppshLiveLocals(SourceLocation Loc) {
   return Live;
 }
 
-// cppsh: a statement that needs a value only running the function gives,
-// which declares nothing the rest of the function could use and leaves
-// itself only by finishing: compiled when it runs, with the values known,
-// against the function's own locals -- then the function goes on, in its
-// frame. The statement becomes std::sh::__cppsh_step(id, __cppsh_frame(the
-// locals it names...)); a local it only reads is handed over by value (a
-// value it is compiled with), one it changes, or that has no copy, by
-// reference. False where it cannot be (a cut is made instead).
+// cppsh: a statement that needs a value only running the function gives:
+// compiled when it runs, with the values known, against the function's own
+// locals -- then the function goes on, in its frame. What is compiled so: the
+// statement alone; or, where it declares what follows may use (`std::array<
+// int, n> a;`), the rest of its block -- nothing after the block sees what it
+// declares, so all after it is the function's own code. It becomes
+//   std::sh::__cppsh_step(id, __cppsh_frame(the locals it names...));
+// every local by reference (its frame's own; one it does not change is still
+// a value it is compiled with: Sema's value specialization) -- and, where it
+// breaks out of or continues a loop around it, a slot saying so:
+//   { int __cppsh_code = 0; __cppsh_step(...);
+//     if (__cppsh_code == 1) break; if (__cppsh_code == 2) continue; }
+// False where it cannot be: it returns, jumps, or is no value's need (a
+// staged function's result): a cut is made instead.
 bool Parser::CppshEmitStep(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
                            SourceLocation Begin) {
-  // A value it needs: a local's (CppshCutNeedVar), a run-time template
-  // argument's. Not a staged function's result (no local named): its
-  // caller waits for that as ever.
-  if (!R.isUsable() || isa<DeclStmt>(R.get()) ||
-      (!CppshCutNeedVar && CppshCutNeedExprs.empty()))
+  if (!R.isUsable() || (!CppshCutNeedVar && CppshCutNeedExprs.empty()))
     return false;
   std::optional<unsigned> B = cppshTokenIndex(Begin);
-  std::optional<unsigned> E = cppshTokenIndex(Tok.getLocation());
-  if (!B || !E || *E <= *B)
+  if (!B)
+    return false;
+  // Where it ends: past the statement, or the rest of its block.
+  const bool WholeRest = isa<DeclStmt>(R.get());
+  if (WholeRest)
+    SkipUntil(tok::r_brace, StopBeforeMatch);
+  std::optional<unsigned> E = Tok.is(tok::eof) && CppshReplayEnd
+                                  ? CppshReplayEnd
+                                  : cppshTokenIndex(Tok.getLocation());
+  if (!E || *E <= *B)
     return false;
   ArrayRef<Token> Toks = ArrayRef<Token>(CppshInputTokens).slice(*B, *E - *B);
-  if (cppshLeavesItself(Toks))
+  if (cppshLeavesFunction(Toks))
     return false;
+  const bool Code = cppshLeavesLoop(Toks);
   llvm::SmallPtrSet<const IdentifierInfo *, 16> Named;
   for (const Token &T : Toks)
     if (T.is(tok::identifier))
       Named.insert(T.getIdentifierInfo());
+  ASTContext &Ctx = Actions.getASTContext();
   std::vector<CppshCutLocal> Frame;
   SmallVector<Expr *, 8> Refs;
   for (VarDecl *VD : CppshLiveLocals(Begin)) {
     if (!Named.count(VD->getIdentifier()))
       continue;
     const QualType T = VD->getType().getNonReferenceType();
-    const bool ByRef = T->isArrayType() || cppshMoveOnly(Actions, VD->getType()) ||
-                       cppshMutates(R.get(), VD);
-    Frame.push_back({VD->getIdentifier(), T.getUnqualifiedType(), false, ByRef});
+    Frame.push_back({VD->getIdentifier(), T.getUnqualifiedType(), false,
+                     /*ByRef=*/true});
     Refs.push_back(Actions.BuildDeclRefExpr(VD, T, VK_LValue, Begin));
+  }
+  // The slot saying how it left: a local of a block of its own.
+  ParseScope CodeScope(this, Scope::DeclScope);
+  Sema::CompoundScopeRAII CodeCompound(Actions);
+  IdentifierInfo *CodeName = &PP.getIdentifierTable().get("__cppsh_code");
+  VarDecl *CodeVar = nullptr;
+  StmtResult CodeDecl;
+  if (Code) {
+    CodeVar = VarDecl::Create(Ctx, Actions.CurContext, Begin, Begin, CodeName,
+                              Ctx.IntTy, Ctx.getTrivialTypeSourceInfo(Ctx.IntTy, Begin),
+                              SC_None);
+    Actions.AddInitializerToDecl(
+        CodeVar,
+        IntegerLiteral::Create(Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), 0),
+                               Ctx.IntTy, Begin),
+        /*DirectInit=*/false);
+    Actions.PushOnScopeChains(CodeVar, getCurScope());
+    CodeDecl = Actions.ActOnDeclStmt(Actions.ConvertDeclToDeclGroup(CodeVar),
+                                     Begin, Begin);
+    if (!CodeDecl.isUsable())
+      return false;
+    Frame.push_back({CodeName, Ctx.IntTy, false, /*ByRef=*/true});
+    Refs.push_back(Actions.BuildDeclRefExpr(CodeVar, Ctx.IntTy, VK_LValue, Begin));
   }
   // The run-time template arguments it met, their values as long long.
   for (Expr *NE : CppshCutNeedExprs) {
     ExprResult AsLL = Actions.BuildCStyleCastExpr(
-        Begin, Actions.Context.getTrivialTypeSourceInfo(Actions.Context.LongLongTy, Begin),
-        Begin, NE);
+        Begin, Ctx.getTrivialTypeSourceInfo(Ctx.LongLongTy, Begin), Begin, NE);
     if (!AsLL.isUsable())
       return false;
-    Frame.push_back({nullptr, Actions.Context.LongLongTy, false, false});
+    Frame.push_back({nullptr, Ctx.LongLongTy, false, false});
     Refs.push_back(AsLL.get());
   }
   ExprResult FrameFn = cppshShFunction(Actions, PP, "__cppsh_frame", Begin);
@@ -1729,19 +1766,50 @@ bool Parser::CppshEmitStep(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   if (!FrameCall.isUsable())
     return false;
   const unsigned Id = CppshSteps.size();
-  Expr *Args[2] = {IntegerLiteral::Create(Actions.Context, llvm::APInt(32, Id),
-                                          Actions.Context.UnsignedIntTy, Begin),
+  Expr *Args[2] = {IntegerLiteral::Create(Ctx, llvm::APInt(32, Id),
+                                          Ctx.UnsignedIntTy, Begin),
                    FrameCall.get()};
   ExprResult StepCall =
       Actions.ActOnCallExpr(getCurScope(), StepFn.get(), Begin, Args, Begin);
-  StmtResult S = StepCall.isUsable()
-                     ? Actions.ActOnExprStmt(StepCall, /*DiscardedValue=*/true)
-                     : StmtError();
-  if (!S.isUsable())
+  StmtResult Step = StepCall.isUsable()
+                        ? Actions.ActOnExprStmt(StepCall, /*DiscardedValue=*/true)
+                        : StmtError();
+  if (!Step.isUsable())
     return false;
+  if (!Code) {
+    Stmts.push_back(Step.get());
+  } else {
+    // if (__cppsh_code == K) break/continue;
+    SmallVector<Stmt *, 4> Block{CodeDecl.get(), Step.get()};
+    for (unsigned K : {1u, 2u}) {
+      Expr *Ref = Actions.BuildDeclRefExpr(CodeVar, Ctx.IntTy, VK_LValue, Begin);
+      Expr *Lit = IntegerLiteral::Create(
+          Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), K), Ctx.IntTy, Begin);
+      ExprResult Cond = Actions.BuildBinOp(getCurScope(), Begin, BO_EQ, Ref, Lit);
+      Sema::ConditionResult C = Cond.isUsable()
+                                    ? Actions.ActOnCondition(getCurScope(), Begin,
+                                                             Cond.get(),
+                                                             Sema::ConditionKind::Boolean)
+                                    : Sema::ConditionError();
+      StmtResult Jump = K == 1 ? Actions.ActOnBreakStmt(Begin, getCurScope(), nullptr, SourceLocation())
+                               : Actions.ActOnContinueStmt(Begin, getCurScope(), nullptr, SourceLocation());
+      if (C.isInvalid() || !Jump.isUsable())
+        return false;
+      StmtResult If = Actions.ActOnIfStmt(Begin, IfStatementKind::Ordinary, Begin,
+                                          nullptr, C, Begin, Jump.get(),
+                                          SourceLocation(), nullptr);
+      if (!If.isUsable())
+        return false;
+      Block.push_back(If.get());
+    }
+    StmtResult Compound =
+        Actions.ActOnCompoundStmt(Begin, Begin, Block, /*isStmtExpr=*/false);
+    if (!Compound.isUsable())
+      return false;
+    Stmts.push_back(Compound.get());
+  }
   CppshCutNeedExprs.clear();
   CppshSteps.push_back({*B, *E, std::move(Frame), false});
-  Stmts.push_back(S.get());
   return true;
 }
 
@@ -1808,6 +1876,15 @@ Decl *Parser::ParseCppshStepFunction(IdentifierInfo *Name,
   // left is one of a local it declares itself, not staged.
   const SourceLocation SavedOpen = std::exchange(CppshBodyOpen, SourceLocation());
   const bool SavedNeeded = std::exchange(CppshCutNeeded, false);
+  // A break or continue of a loop around it: the slot set, the step left.
+  IdentifierInfo *const SavedCode = std::exchange(
+      CppshStepCode,
+      llvm::any_of(Frame, [](const CppshCutLocal &L) {
+        return L.Name && L.Name->isStr("__cppsh_code");
+      })
+          ? &PP.getIdentifierTable().get("__cppsh_code")
+          : nullptr);
+  const std::optional<unsigned> SavedReplayEnd = std::exchange(CppshReplayEnd, End);
   StmtResult Body;
   {
     Sema::CompoundScopeRAII CompoundScope(Actions);
@@ -1827,10 +1904,15 @@ Decl *Parser::ParseCppshStepFunction(IdentifierInfo *Name,
                     DiagnosticsEngine::Error,
                     "this needs a value only running it gives, of a variable "
                     "it declares itself: not staged yet"));
-    Body = Actions.ActOnCompoundStmt(Loc, Loc, Stmts, /*isStmtExpr=*/false);
+    // Its end: past its last token (where an instantiation of it is cut, the
+    // rest up to there).
+    Body = Actions.ActOnCompoundStmt(Loc, CppshInputTokens[End - 1].getEndLoc(),
+                                     Stmts, /*isStmtExpr=*/false);
   }
   CppshBodyOpen = SavedOpen;
   CppshCutNeeded = SavedNeeded;
+  CppshStepCode = SavedCode;
+  CppshReplayEnd = SavedReplayEnd;
   CppshCutNeedExprs.clear();
   BodyScope.Exit();
   return Actions.ActOnFinishFunctionBody(Fn, Body.get());
@@ -3393,9 +3475,39 @@ StmtResult Parser::ParseBreakOrContinueStatement(bool IsContinue) {
     }
   }
 
+  // cppsh: in a step's function, a break or continue of a loop of the
+  // function it was taken out of: the step left, saying which.
+  if (CppshStepCode && !Target &&
+      !(IsContinue ? getCurScope()->getContinueParent()
+                   : getCurScope()->getBreakParent()))
+    return CppshLeaveStep(KwLoc, IsContinue ? 2 : 1);
+
   if (IsContinue)
     return Actions.ActOnContinueStmt(KwLoc, getCurScope(), Target, LabelLoc);
   return Actions.ActOnBreakStmt(KwLoc, getCurScope(), Target, LabelLoc);
+}
+
+StmtResult Parser::CppshLeaveStep(SourceLocation Loc, unsigned Code) {
+  LookupResult R(Actions, CppshStepCode, Loc, Sema::LookupOrdinaryName);
+  Actions.LookupName(R, getCurScope());
+  auto *Slot = R.getAsSingle<VarDecl>();
+  if (!Slot)
+    return StmtError();
+  ASTContext &Ctx = Actions.getASTContext();
+  Expr *Ref = Actions.BuildDeclRefExpr(
+      Slot, Slot->getType().getNonReferenceType(), VK_LValue, Loc);
+  Expr *Value = IntegerLiteral::Create(
+      Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), Code), Ctx.IntTy, Loc);
+  ExprResult Set = Actions.BuildBinOp(getCurScope(), Loc, BO_Assign, Ref, Value);
+  StmtResult SetStmt = Set.isUsable()
+                           ? Actions.ActOnExprStmt(Set, /*DiscardedValue=*/true)
+                           : StmtError();
+  StmtResult Ret = Actions.ActOnReturnStmt(Loc, nullptr, getCurScope());
+  if (!SetStmt.isUsable() || !Ret.isUsable())
+    return StmtError();
+  Sema::CompoundScopeRAII CompoundScope(Actions);
+  Stmt *Both[2] = {SetStmt.get(), Ret.get()};
+  return Actions.ActOnCompoundStmt(Loc, Loc, Both, /*isStmtExpr=*/false);
 }
 
 StmtResult Parser::ParseContinueStatement() {

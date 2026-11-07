@@ -8383,9 +8383,12 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                   // Not plain data: rebuilt from its snapshot, by an
                   // expression the parameter keeps (a parameter taken by
                   // value: a reference would bind to the rebuilt copy).
+                  // (A continuation's reference parameter -- one it does
+                  // not change -- is folded by the constant evaluator alone;
+                  // what it refers to is the one changed at run time.)
                   ParmVarDecl *P = PatFD->getParamDecl(I);
                   if (!Ok && CppshRuntimeRebuildOf && VD->hasGlobalStorage() &&
-                      !P->getType()->isReferenceType())
+                      (Continuation || !P->getType()->isReferenceType()))
                     if (Expr *Rebuild = CppshRuntimeRebuildOf(*this, VD)) {
                       SavedRebuilds.push_back({P, CppshParamRebuild.lookup(P)});
                       CppshParamRebuild[P] = Rebuild;
@@ -8402,7 +8405,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             if (Ok && EV.Val.hasValue()) {
               ParmVarDecl *P = PatFD->getParamDecl(I);
               QualType PT = P->getType();
-              if (PT->isReferenceType())
+              if (PT->isReferenceType() && !Continuation)
                 continue;
               if (PT->isDependentType()) {
                 QualType AT = ArgE->getType();

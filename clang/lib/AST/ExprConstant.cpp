@@ -9823,6 +9823,25 @@ bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
     return Success(VD);
   }
 
+  // cppsh: a reference parameter of a value specialization (a continuation's,
+  // taking its function's locals by reference): bound, as it is evaluated,
+  // to an object holding the value it was specialized on -- or rebuilt from
+  // the snapshot of what it refers to.
+  if (const auto *PVD = dyn_cast<ParmVarDecl>(VD); PVD && !Frame) {
+    const QualType T = VD->getType().getNonReferenceType();
+    if (auto Known = CppshParamValue.find(PVD); Known != CppshParamValue.end()) {
+      APValue &Slot = Info.CurrentCall->createTemporary(
+          PVD, T, ScopeKind::FullExpression, Result);
+      Slot = Known->second;
+      return true;
+    }
+    if (const Expr *Rebuild = CppshParamRebuild.lookup(PVD)) {
+      APValue &Slot = Info.CurrentCall->createTemporary(
+          Rebuild, Rebuild->getType(), ScopeKind::FullExpression, Result);
+      return EvaluateInPlace(Slot, Info, Result, Rebuild);
+    }
+  }
+
   if (!Info.getLangOpts().CPlusPlus11) {
     Info.CCEDiag(E, diag::note_constexpr_ltor_non_integral, 1)
         << VD << VD->getType();
