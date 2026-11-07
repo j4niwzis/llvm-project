@@ -45,6 +45,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/STLForwardCompat.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include <algorithm>
@@ -56,6 +57,7 @@
 using namespace clang;
 namespace clang {
 extern bool CppshCutNeeded;
+extern DeclContext *CppshTemplateUseContext;
 extern const VarDecl *CppshCutNeedVar;
 extern const FunctionDecl *CppshCutNeedFunction;
 const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E);
@@ -6852,6 +6854,11 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
   // continuation's parameter, which the evaluator reads). Meanwhile the
   // argument is a zero of its type, so that the statement checks: it is
   // dropped for the cut.
+  // (A function template's arguments are checked in its own context: where
+  // it is used asked about instead.)
+  std::optional<llvm::SaveAndRestore<DeclContext *>> CppshUse;
+  if (CCE == CCEKind::TemplateArg && CppshTemplateUseContext)
+    CppshUse.emplace(CurContext, CppshTemplateUseContext);
   if (CCE == CCEKind::TemplateArg && T->isIntegralOrEnumerationType())
     if (const VarDecl *Local = cppshRuntimeLocalIn(*this, E)) {
       cppshMeetNeed(*this);
@@ -6896,6 +6903,7 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
     }
   }
 
+  CppshUse.reset();
   // It's not a constant expression. Produce an appropriate diagnostic.
   if (Notes.size() == 1 &&
       Notes[0].second.getDiagID() == diag::note_invalid_subexpr_in_const_expr) {

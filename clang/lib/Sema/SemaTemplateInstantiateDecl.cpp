@@ -47,6 +47,7 @@ extern llvm::DenseMap<const VarDecl *, const Expr *> CppshParamRebuild;
 extern llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
 extern llvm::DenseSet<const VarDecl *> CppshBindingsRead;
 extern llvm::DenseMap<const VarDecl *, const VarDecl *> CppshParamPending;
+extern DeclContext *CppshTemplateUseContext;
 } // namespace clang
 
 static bool isDeclWithinFunction(const Decl *D) {
@@ -6552,6 +6553,8 @@ void Sema::InstantiateFunctionDefinition(SourceLocation PointOfInstantiation,
       // cppsh: a specialization on argument values -- what its body reads of
       // them noted; the parameters it does not read unbound after, taken at
       // run time (it is the one for any call agreeing on the others).
+      // (Its own body uses templates where it is: no outer use's context.)
+      llvm::SaveAndRestore<DeclContext *> CppshNoUse(CppshTemplateUseContext, nullptr);
       CppshValueSpec *CppshSpec = CppshSpecOf.lookup(Function);
       std::optional<CppshReadWindow> CppshWindow;
       if (CppshSpec)

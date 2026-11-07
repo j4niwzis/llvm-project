@@ -112,6 +112,12 @@ namespace clang {
   };
 }
 
+
+namespace clang {
+// cppsh: the context a function template is used in while its arguments are
+// substituted and checked in the template's own (CheckConvertedConstantExpression).
+DeclContext *CppshTemplateUseContext = nullptr;
+} // namespace clang
 using namespace clang;
 using namespace sema;
 
@@ -3633,6 +3639,9 @@ TemplateDeductionResult Sema::SubstituteExplicitTemplateArguments(
   // done in the context of the templated declaration.  Explicit
   // argument substitution, on the other hand, needs to happen in the
   // calling context.
+  // cppsh: where the template is used, asked about by what checks its
+  // arguments in its own context (a default read at run time: a need there).
+  llvm::SaveAndRestore CppshUse(CppshTemplateUseContext, CurContext);
   ContextRAII SavedContext(*this, FunctionTemplate->getTemplatedDecl());
 
   // If we deduced template arguments for a template parameter pack,
@@ -3964,6 +3973,9 @@ TemplateDeductionResult Sema::FinishTemplateArgumentDeduction(
   if (Inst.isInvalid())
     return TemplateDeductionResult::InstantiationDepth;
 
+  // cppsh: where the template is used, asked about by what checks its
+  // arguments in its own context (a default read at run time: a need there).
+  llvm::SaveAndRestore CppshUse(CppshTemplateUseContext, CurContext);
   ContextRAII SavedContext(*this, FunctionTemplate->getTemplatedDecl());
 
   // C++ [temp.deduct.type]p2:
