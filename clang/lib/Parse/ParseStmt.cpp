@@ -1704,7 +1704,7 @@ SmallVector<VarDecl *, 8> Parser::CppshLiveLocals(SourceLocation Loc) {
 // False where it cannot be (it returns or jumps out; a staged function's
 // result, not a value's need): the caller cuts instead, or says so.
 bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
-                             SourceLocation Begin) {
+                             SourceLocation Begin, bool AtBody) {
   if (!R.isUsable() || (!CppshCutNeedVar && CppshCutNeedExprs.empty()))
     return false;
   std::optional<unsigned> B = cppshTokenIndex(Begin);
@@ -1727,11 +1727,22 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   // from a return before), and the region is not in another.
   const bool Returns = cppshReturns(Toks);
   FunctionDecl *Function = Actions.getCurFunctionDecl(/*AllowLambda=*/true);
-  if (Returns && (!Function || cppshIsRegion(Function) ||
-                  Function->getReturnType()->isUndeducedType()))
+  // The rest of the body, returning what gives the function its type: its
+  // type is the region's result's, known only once it runs. The function
+  // returns std::sh::staged, the region its own returns -- the result kept
+  // for whoever waits for it (__cppsh_region_staged), as a staged
+  // function's is.
+  const bool Staged = Returns && AtBody && isa<DeclStmt>(R.get()) && Function &&
+                      !cppshIsRegion(Function) &&
+                      Function->getReturnType()->isUndeducedType() &&
+                      !cppshLeavesLoop(Toks);
+  if (Returns && !Staged &&
+      (!Function || cppshIsRegion(Function) ||
+       Function->getReturnType()->isUndeducedType()))
     return false;
-  const QualType ReturnType = Returns ? Function->getReturnType() : QualType();
-  const bool Code = Returns || cppshLeavesLoop(Toks);
+  const QualType ReturnType =
+      Returns && !Staged ? Function->getReturnType() : QualType();
+  const bool Code = (Returns && !Staged) || cppshLeavesLoop(Toks);
   llvm::SmallPtrSet<const IdentifierInfo *, 16> Named;
   for (const Token &T : Toks)
     if (T.is(tok::identifier))
@@ -1773,7 +1784,7 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   IdentifierInfo *RetName = &PP.getIdentifierTable().get("__cppsh_ret");
   VarDecl *RetVar = nullptr;
   StmtResult RetDecl;
-  if (Returns && !ReturnType->isVoidType()) {
+  if (Returns && !Staged && !ReturnType->isVoidType()) {
     NamespaceDecl *Std = Actions.getStdNamespace();
     LookupResult OptR(Actions, &PP.getIdentifierTable().get("optional"), Begin,
                       Sema::LookupOrdinaryName);
@@ -1810,18 +1821,30 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     Args.push_back(NE);
   }
   CppshCutNeedExprs.clear();
-  const bool SavedReturns = std::exchange(CppshRegionReturns, Returns);
+  const bool SavedReturns = std::exchange(CppshRegionReturns, Returns && !Staged);
   IdentifierInfo *const SavedSlot =
       std::exchange(CppshRegionReturnSlot, RetVar ? RetName : nullptr);
   ExprResult Lambda = ParseCppshRegionLambda(Frame, NeedLocs, *B, *E);
   CppshRegionReturns = SavedReturns;
   CppshRegionReturnSlot = SavedSlot;
-  ExprResult RegionFn = cppshShFunction(Actions, PP, "__cppsh_region", Begin);
+  ExprResult RegionFn = cppshShFunction(
+      Actions, PP, Staged ? "__cppsh_region_staged" : "__cppsh_region", Begin);
   if (!Lambda.isUsable() || !RegionFn.isUsable())
     return false;
   Args.insert(Args.begin(), Lambda.get());
   ExprResult Call =
       Actions.ActOnCallExpr(getCurScope(), RegionFn.get(), Begin, Args, Begin);
+  if (Staged) {
+    // return std::sh::__cppsh_region_staged(...); -- a staged function.
+    StmtResult Ret = Call.isUsable()
+                         ? Actions.ActOnReturnStmt(Begin, Call.get(), getCurScope())
+                         : StmtError();
+    if (!Ret.isUsable())
+      return false;
+    CppshCutFunctions.insert(Function->getCanonicalDecl());
+    Stmts.push_back(Ret.get());
+    return true;
+  }
   StmtResult Run = Call.isUsable()
                        ? Actions.ActOnExprStmt(Call, /*DiscardedValue=*/true)
                        : StmtError();
@@ -2265,7 +2288,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
       CppshCutNeeded = false;
       FunctionDecl *FD = Actions.getCurFunctionDecl();
       // A staged region, the function going on in its frame: no cut.
-      if (CppshEmitRegion(Stmts, R, CppshStmtBegin)) {
+      if (CppshEmitRegion(Stmts, R, CppshStmtBegin, CppshBody)) {
         LastIsError = false;
         continue;
       }

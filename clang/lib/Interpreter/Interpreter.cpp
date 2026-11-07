@@ -1681,8 +1681,8 @@ static VarTemplateDecl *cppshRegionTagTemplate(Sema &S) {
 // snapshots), each a value it is compiled with unless it changes it -- and
 // called with them, in their frame. One instantiation for each set of values
 // (its __cppsh_key), found again for the same values.
-extern "C" void __cppsh_region_run(const void *Tag, void *Closure,
-                                   void *const *Frame, unsigned N) {
+static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
+                           unsigned N, bool Keep) {
   if (!CppshActiveInterpreter)
     return;
   Interpreter &Interp = *CppshActiveInterpreter;
@@ -1797,22 +1797,43 @@ extern "C" void __cppsh_region_run(const void *Tag, void *Closure,
     ExprResult Call = Member.isUsable()
                           ? S.BuildCallExpr(S.TUScope, Member.get(), Loc, Args, Loc)
                           : ExprError();
-    ExprResult Full = Call.isUsable()
-                          ? S.ActOnFinishFullExpr(Call.get(), /*DiscardedValue=*/true)
-                          : ExprError();
     // A need met as it was instantiated: a value it changes (no constant).
     if (CppshCutNeeded) {
       S.Diag(Pattern->getLocation(),
              S.getDiagnostics().getCustomDiagID(
                  DiagnosticsEngine::Error,
                  "this needs the value of a variable it changes itself: not staged"));
-      Full = ExprError();
+      Call = ExprError();
     }
+    // Its result kept (a staged function's: __cppsh_region_staged), where it
+    // gives one: a global, __cppsh_resK, for whoever waits for it.
+    const bool Result = Keep && Call.isUsable() &&
+                        !Call.get()->getType()->isVoidType();
+    ExprResult Full = Call.isUsable() && !Result
+                          ? S.ActOnFinishFullExpr(Call.get(), /*DiscardedValue=*/true)
+                          : ExprError();
     S.ActOnFinishTopLevelStmtDecl(
         Stmt, Full.isUsable() ? static_cast<clang::Stmt *>(Full.get())
                               : new (Ctx) NullStmt(Loc));
     Interp.cppshAddBuilt(Stmt);
-    cppshReport(Interp.cppshEndBuildAndExecute());
+    bool Value = false;
+    std::string ResultName = "__cppsh_res" + Unit;
+    if (Result) {
+      const QualType T =
+          Call.get()->getType().getNonReferenceType().getUnqualifiedType();
+      auto *Res = VarDecl::Create(Ctx, Ctx.getTranslationUnitDecl(), Loc, Loc,
+                                  &Idents.get(ResultName), T,
+                                  Ctx.getTrivialTypeSourceInfo(T, Loc), SC_None);
+      S.AddInitializerToDecl(Res, Call.get(), /*DirectInit=*/false);
+      S.FinalizeDeclaration(Res);
+      S.PushOnScopeChains(Res, S.TUScope);
+      Interp.cppshAddBuilt(Res);
+      auto *RecordType = T->getAsCXXRecordDecl();
+      Value = !(RecordType && RecordType->getIdentifier() &&
+                RecordType->getName() == "staged");
+    }
+    if (cppshReport(Interp.cppshEndBuildAndExecute()) && Value)
+      CppshLastResult = ResultName;
   }
   CppshCutNeeded = WasNeeded;
   for (auto &[P, Was] : llvm::reverse(SavedRebuilds)) {
@@ -1827,6 +1848,17 @@ extern "C" void __cppsh_region_run(const void *Tag, void *Closure,
     else
       CppshParamValue.erase(P);
   }
+}
+
+extern "C" void __cppsh_region_run(const void *Tag, void *Closure,
+                                   void *const *Frame, unsigned N) {
+  cppshRunRegion(Tag, Closure, Frame, N, /*Keep=*/false);
+}
+
+// The rest of a staged function's body made a region: its result kept.
+extern "C" void __cppsh_region_run_staged(const void *Tag, void *Closure,
+                                          void *const *Frame, unsigned N) {
+  cppshRunRegion(Tag, Closure, Frame, N, /*Keep=*/true);
 }
 
 // A staged function's rest, as its cut left it, run --

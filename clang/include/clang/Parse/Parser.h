@@ -8711,7 +8711,7 @@ private:
   /// instantiated with the values as the function runs, in its frame
   /// (std::sh::__cppsh_region); false where it cannot be.
   bool CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
-                       SourceLocation Begin);
+                       SourceLocation Begin, bool AtBody = false);
   ExprResult ParseCppshRegionLambda(ArrayRef<CppshCutLocal> Frame,
                                     ArrayRef<SourceLocation> NeedLocs,
                                     unsigned Begin, unsigned End);

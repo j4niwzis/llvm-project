@@ -1,4 +1,4 @@
-// RUN: printf '3\n4\n5\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '3\n4\n5\n6\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
 
 // A statement that needs a value read as its function runs, and declares
 // nothing: compiled with the value when it runs, against the function's own
@@ -32,3 +32,8 @@ k();
 int r() { int n = 0; std::cin >> n; std::array<int, n> a{}; return static_cast<int>(a.size()) + 1; }
 std::println("r {}", r());
 // CHECK: r 6
+
+// A function whose type comes from the region: staged, its result kept.
+auto s() { int n = 0; std::cin >> n; std::array<int, n> a{}; return a; }
+std::println("s {}", s().size());
+// CHECK: s 6

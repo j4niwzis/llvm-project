@@ -1852,6 +1852,9 @@ extern "C" void __cppsh_cut_run(unsigned id, void *const *frame, unsigned n);
 // `tag` names, instantiated with the values at `frame` and run on them.
 extern "C" void __cppsh_region_run(const void *tag, void *closure,
                                    void *const *frame, unsigned n);
+// And one that is the rest of a staged function's body: its result kept.
+extern "C" void __cppsh_region_run_staged(const void *tag, void *closure,
+                                          void *const *frame, unsigned n);
 
 namespace std {
 namespace sh {
@@ -1872,6 +1875,18 @@ void __cppsh_region(C &&closure, A &&...args) {
   ::__cppsh_region_run(&__cppsh_region_tag<std::remove_cvref_t<C>, A...>,
                        const_cast<void *>(static_cast<const void *>(std::addressof(closure))),
                        frame, static_cast<unsigned>(sizeof...(A)));
+}
+
+// The rest of a staged function's body made a region (the compiler returns
+// this): run, its result kept by the interpreter for whoever waits for it.
+template <class C, class... A>
+staged __cppsh_region_staged(C &&closure, A &&...args) {
+  void *frame[] = {const_cast<void *>(static_cast<const void *>(std::addressof(args)))...,
+                   nullptr};
+  ::__cppsh_region_run_staged(&__cppsh_region_tag<std::remove_cvref_t<C>, A...>,
+                              const_cast<void *>(static_cast<const void *>(std::addressof(closure))),
+                              frame, static_cast<unsigned>(sizeof...(A)));
+  return {};
 }
 
 template <std::size_t N>
