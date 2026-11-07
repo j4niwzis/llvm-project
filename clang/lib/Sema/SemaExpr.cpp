@@ -8342,6 +8342,24 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         // would be specialized on it: the call's type may depend on that
         // value -- the call is dependent, resolved as its context is
         // instantiated.
+        // A default template argument of a candidate that is read at run time
+        // and supplied, in staged code, by a staged parameter: deduction with
+        // it waits for its value -- the call is dependent, resolved as the
+        // code is instantiated (the default supplied again then).
+        if (CurContext->isDependentContext() && !CppshSuppliedExprs.empty())
+          for (NamedDecl *ND : ULE->decls())
+            if (auto *FTD =
+                    dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl()))
+              for (NamedDecl *P : *FTD->getTemplateParameters())
+                if (auto *NTTP = dyn_cast<NonTypeTemplateParmDecl>(P);
+                    NTTP && NTTP->hasDefaultArgument())
+                  if (const Expr *D =
+                          NTTP->getDefaultArgument().getSourceExpression();
+                      D && CppshSuppliedExprs.count(
+                               D->getBeginLoc().getRawEncoding()))
+                    return CallExpr::Create(Context, Fn, ArgExprs,
+                                            Context.DependentTy, VK_PRValue,
+                                            RParenLoc, CurFPFeatureOverrides());
         if (CurContext->isDependentContext()) {
           for (NamedDecl *ND : ULE->decls()) {
             auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
