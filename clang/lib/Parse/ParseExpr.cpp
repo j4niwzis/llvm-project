@@ -50,6 +50,8 @@ extern bool CppshCutNeeded;
 extern const VarDecl *CppshCutNeedVar;
 extern std::vector<Expr *> CppshCutNeedExprs;
 extern std::vector<Expr *> CppshCutStagedCalls;
+extern SourceLocation CppshHoistBegin, CppshHoistEnd;
+extern SourceLocation CppshStageAt;
 } // namespace clang
 
 ExprResult
@@ -2424,6 +2426,16 @@ Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
             // its value supplied.
             const SourceLocation At = LHS.get()->getBeginLoc();
             LHS = Supplied;
+            // The staged call hoisted out of a top-level declaration, its
+            // result now in its place: Sema, building the call before it was
+            // replaced, marked it to be hoisted again -- unmarked (the
+            // declaration is not taken back a second time).
+            if (At == CppshHoistBegin) {
+              CppshHoistBegin = CppshHoistEnd = SourceLocation();
+              if (CppshStageAt == At)
+                CppshStageAt = SourceLocation();
+              cppshEndNeedDiagnostics(Actions);
+            }
             // Once: a member call on it (f3().size()) begins where it does.
             CppshSuppliedExprs.erase(At.getRawEncoding());
             llvm::erase_if(CppshCutStagedCalls,
