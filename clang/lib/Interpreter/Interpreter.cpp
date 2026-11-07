@@ -2468,6 +2468,10 @@ static VarDecl *cppshRunTokens(Interpreter &Interp, unsigned Begin, unsigned End
 // needed supplied: a staged function's call it made (Hoist), run first, its
 // result in its place; each run-time template argument of it, evaluated
 // first, its value in its place.
+// The results of the staged calls hoisted from the top-level declaration
+// being staged (cppshStageDecl), in the order hoisted.
+static std::vector<std::pair<SourceLocation, Expr *>> CppshHoistSupplies;
+
 llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist) {
   Parser &P = cppshParser();
   Sema &S = getCompilerInstance()->getSema();
@@ -2496,8 +2500,14 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
                        : nullptr;
     if (!Result)
       return Fail("cppsh: the staged call left no result");
-    CppshSuppliedExprs[At.getRawEncoding()] = S.BuildDeclRefExpr(
-        Result, Result->getType().getNonReferenceType(), VK_LValue, At);
+    // Each staged call hoisted from this declaration so far supplied again:
+    // the parser takes each supply once (a member call on the result begins
+    // where the call does), and the declaration is parsed again whole.
+    CppshHoistSupplies.push_back(
+        {At, S.BuildDeclRefExpr(Result, Result->getType().getNonReferenceType(),
+                                VK_LValue, At)});
+    for (const auto &[Loc, Supplied] : CppshHoistSupplies)
+      CppshSuppliedExprs[Loc.getRawEncoding()] = Supplied;
   } else {
     for (SourceRange Need : CppshTopNeedExprs) {
       std::optional<unsigned> B = cppshTokenIndex(Need.getBegin());
@@ -2591,6 +2601,7 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
   const size_t PTUsBefore = PTUs.size();
   auto Failed = [&](llvm::Error Err) -> llvm::Error {
     IncrParser->SkipInput();
+    CppshHoistSupplies.clear();
     if (PTUs.size() > PTUsBefore) {
       std::vector<const TranslationUnitDecl *> Gone;
       for (auto It = std::next(PTUs.begin(), PTUsBefore); It != PTUs.end(); ++It)
@@ -2663,6 +2674,7 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
     }
     Redos = 0;
     Hoisted.clear();
+    CppshHoistSupplies.clear();
     CppshSuppliedExprs.clear();
     if (!TU)
       return Failed(TU.takeError());
