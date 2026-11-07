@@ -2581,6 +2581,8 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
     return Err;
   Parser &P = cppshParser();
   unsigned Redos = 0;
+  // The staged calls of the declaration being staged hoisted so far.
+  llvm::SmallDenseSet<SourceLocation::UIntTy, 8> Hoisted;
   // A failed input taken back whole: each unit it made before the one that
   // failed -- run one top-level declaration at a time, they were compiled and
   // run -- out of the AST and the JIT, as Undo takes one back; what was
@@ -2635,7 +2637,13 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
       break;
     }
     const bool Hoist = CppshHoistBegin.isValid() && CppshHoistEnd.isValid();
-    if (!TU && (Hoist || CppshTopNeed) && Redos++ < 4) {
+    // Parsed again as long as each time takes a step: a staged call not
+    // hoisted yet (one per redo, however many the declaration makes), or
+    // its run-time template arguments (all at once, a few times at most).
+    const bool Progress =
+        Hoist ? Hoisted.insert(CppshHoistBegin.getRawEncoding()).second
+              : Redos++ < 4;
+    if (!TU && (Hoist || CppshTopNeed) && Progress) {
       llvm::consumeError(TU.takeError());
       std::optional<unsigned> Begin =
           CppshTopLevelStarts.empty() ? std::nullopt
@@ -2654,6 +2662,7 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
       continue;
     }
     Redos = 0;
+    Hoisted.clear();
     CppshSuppliedExprs.clear();
     if (!TU)
       return Failed(TU.takeError());
