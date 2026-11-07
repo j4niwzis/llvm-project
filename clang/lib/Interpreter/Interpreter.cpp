@@ -1716,6 +1716,15 @@ static std::vector<llvm::StringRef> cppshStatements(llvm::StringRef Code) {
   return Out;
 }
 
+// Whether an input holds a preprocessor directive (a line beginning with
+// `#`): its statements are not split -- an #if may open in one and close in
+// another (the interpreter's own runtime prelude does).
+static bool cppshHasDirective(llvm::StringRef Code) {
+  llvm::SmallVector<llvm::StringRef, 16> Lines;
+  Code.split(Lines, '\n');
+  return llvm::any_of(Lines, [](llvm::StringRef L) { return L.ltrim().starts_with("#"); });
+}
+
 // Whether an input names a function known to be staged (cut): a call of it
 // at the top level is hoisted -- run on its own, its result put in its place.
 static bool cppshMentionsStaged(llvm::StringRef Code) {
@@ -1746,7 +1755,7 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
   // each sees what the ones before it made -- their values known as it is
   // compiled, no stage point to find, nothing parsed twice. (Not for what
   // the interpreter lays out itself: a continuation is whole.)
-  if (!CppshNoProbe && cppshSeveralStatements(Code)) {
+  if (!CppshNoProbe && cppshSeveralStatements(Code) && !cppshHasDirective(Code)) {
     for (llvm::StringRef Statement : cppshStatements(Code))
       if (llvm::Error Err = ParseAndExecute(Statement, V))
         return Err;
