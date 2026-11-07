@@ -495,6 +495,10 @@ Sema::ActOnStartCppshStagedInstantiation(CppshStagedDecl *Old,
                                          bool KeepsResult) {
   auto *SD = CppshStagedDecl::Create(Context, CurContext, Old->getLocation());
   CurContext->addDecl(SD);
+  // The function instantiated around it has staged code too: its control
+  // flow not known here (AnalysisBasedWarnings), as the pattern's was not.
+  if (sema::FunctionScopeInfo *FSI = getCurFunction())
+    FSI->HasCppshStaged = true;
   SD->setUsesThis(Old->usesThis());
   ArrayRef<ImplicitParamDecl *> OldParams = Old->parameters();
   // The results' types (the last parameters'), their depth as the
