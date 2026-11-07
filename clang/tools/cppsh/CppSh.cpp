@@ -1665,7 +1665,9 @@ int main(int argc, const char **argv) {
   // into an object beside the module file: loaded by every later process --
   // a link, not a compile -- and its symbols known to code generation, never
   // emitted again. Made where it is not there yet.
-  if (!NoStdSh && !clang::CppshStdShPcmPath.empty() && !HasError) {
+  // CPPSH_NO_WARM=1: without it (to tell its faults from the rest).
+  if (!NoStdSh && !clang::CppshStdShPcmPath.empty() && !HasError &&
+      !std::getenv("CPPSH_NO_WARM")) {
     Phase.emplace("warm-up object");
     std::string ObjectPath = clang::CppshStdShPcmPath + ".warm.o";
     std::string SymbolsPath = clang::CppshStdShPcmPath + ".warm.syms";
@@ -1678,7 +1680,8 @@ int main(int argc, const char **argv) {
       for (llvm::StringRef L : Lines)
         Defines.push_back(L.str());
       if (llvm::Error Err = Interp->loadCompiledObject((*Object)->getBuffer(), Defines))
-        llvm::consumeError(std::move(Err));
+        llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(),
+                                    "cppsh: warm-up object (" + ObjectPath + "): ");
     } else if (auto Made = Interp->compileKeepingObject(
                    "auto *__cppsh_warm_ref = &std::sh::__cppsh_warm::__uses;")) {
       // Written aside and renamed: another process reads it whole or not at all.
@@ -1699,7 +1702,8 @@ int main(int argc, const char **argv) {
       if (!Made->first.empty() && WriteAtomically(SymbolsPath, SymbolList))
         WriteAtomically(ObjectPath, Made->first);
     } else {
-      llvm::consumeError(Made.takeError());
+      llvm::logAllUnhandledErrors(Made.takeError(), llvm::errs(),
+                                  "cppsh: warm-up object, compiling it: ");
     }
   }
   Phase.reset();
