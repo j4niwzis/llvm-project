@@ -1190,10 +1190,17 @@ static SmallVector<CppshTok, 64> cppshLex(StringRef Code, const LangOptions &LO)
   SmallVector<CppshTok, 64> Toks;
   Lexer L(SourceLocation(), LO, Code.begin(), Code.begin(), Code.end());
   Token T;
+  // A directive's line (the #line marks a remainder carries) is no
+  // statement: its tokens left out, up to the next line.
+  bool InDirective = false;
   while (true) {
     L.LexFromRawLexer(T);
     if (T.is(tok::eof))
       break;
+    if (T.isAtStartOfLine())
+      InDirective = T.is(tok::hash);
+    if (InDirective)
+      continue;
     size_t End = L.getBufferLocation() - Code.begin();
     Toks.push_back({T, End - T.getLength()});
   }

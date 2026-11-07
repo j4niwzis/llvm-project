@@ -229,6 +229,19 @@ static std::string cppshCommandSubstitutions(llvm::StringRef Code) {
       I = End;
       continue;
     }
+    // A raw string, R"delim( ... )delim", copied as it is.
+    if (C == 'R' && I + 1 < Code.size() && Code[I + 1] == '"' &&
+        !(I > 0 && (std::isalnum(static_cast<unsigned char>(Code[I - 1])) || Code[I - 1] == '_'))) {
+      size_t Open = Code.find('(', I + 2);
+      if (Open != llvm::StringRef::npos) {
+        std::string Close = ")" + Code.slice(I + 2, Open).str() + "\"";
+        size_t End = Code.find(Close, Open);
+        End = End == llvm::StringRef::npos ? Code.size() : End + Close.size();
+        Out += Code.slice(I, End).str();
+        I = End;
+        continue;
+      }
+    }
     if (C == '"' || (C == '\'' && !(I > 0 && std::isalnum(static_cast<unsigned char>(Code[I - 1]))))) {
       size_t J = I + 1;
       while (J < Code.size() && Code[J] != C)
@@ -280,7 +293,7 @@ static std::string cppshCommandLines(llvm::StringRef Code) {
     if (Body.size() > 1 && Body.front() == '$' && Body[1] != '(') {
       Out += cppshShellCommand(Body.drop_front().trim()) + ";";
     } else {
-      Out += Lines[I].str();
+      Out += cppshCommandSubstitutions(Lines[I]);
     }
     if (I + 1 < Lines.size())
       Out += '\n';
@@ -292,7 +305,7 @@ static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Cod
   clang::CppshBeforeChunk = [](clang::Interpreter &I, llvm::StringRef Piece) {
     snapshotNamed(I, Piece);
   };
-  const std::string Expanded = cppshCommandSubstitutions(cppshCommandLines(Code));
+  const std::string Expanded = cppshCommandLines(Code);
   llvm::Error Err = Interp.ParseAndExecute(Expanded);
   // An input's output out before the next input runs, stdio's and LLVM's
   // streams alike, in the order it was written.
