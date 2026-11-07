@@ -409,6 +409,89 @@ ExprResult cppshVariantDeref(Sema &S, SourceLocation OpLoc, Expr *Input) {
   return S.BuildCallExpr(nullptr, Fn.get(), OpLoc, CallArgs, OpLoc);
 }
 
+// Whether a member access is written with `->`.
+static bool ME_IsArrow(const Expr *E) {
+  if (const auto *UME = dyn_cast<UnresolvedMemberExpr>(E))
+    return UME->isArrow();
+  if (const auto *ME = dyn_cast<MemberExpr>(E))
+    return ME->isArrow();
+  return false;
+}
+
+// The alternatives of a std::variant type, none where it is no variant.
+static SmallVector<QualType, 4> cppshVariantAlternatives(QualType T) {
+  SmallVector<QualType, 4> Alts;
+  auto *Spec = dyn_cast_or_null<ClassTemplateSpecializationDecl>(
+      T.getNonReferenceType()->getAsCXXRecordDecl());
+  if (!Spec || !Spec->getIdentifier() || Spec->getName() != "variant" ||
+      !Spec->isInStdNamespace() || Spec->getTemplateArgs().size() != 1 ||
+      Spec->getTemplateArgs()[0].getKind() != TemplateArgument::Pack)
+    return Alts;
+  for (const TemplateArgument &A : Spec->getTemplateArgs()[0].pack_elements())
+    if (A.getKind() == TemplateArgument::Type)
+      Alts.push_back(A.getAsType());
+  return Alts;
+}
+
+// `std::visit(f, v...)` or `v.visit(f)`, f giving a different type for some
+// alternative (C++ asks one): f called on the values held, `*v` each
+// (cppshVariantDeref) -- the type of the call the one known once the
+// alternatives are, as the statement runs. Where f gives one type for all,
+// the call is C++'s as written (nothing here).
+ExprResult cppshVariantVisit(Sema &S, Expr *F, ArrayRef<Expr *> Variants,
+                             SourceLocation Loc) {
+  if (!F || Variants.empty() || !cppshInUserInput(S, Loc) ||
+      F->isTypeDependent())
+    return ExprEmpty();
+  SmallVector<SmallVector<QualType, 4>, 2> Alts;
+  size_t Product = 1;
+  for (Expr *V : Variants) {
+    if (!V || V->isTypeDependent())
+      return ExprEmpty();
+    Alts.push_back(cppshVariantAlternatives(V->getType()));
+    if (Alts.back().empty())
+      return ExprEmpty();
+    Product *= Alts.back().size();
+    if (Product > 64)
+      return ExprEmpty();
+  }
+  // What f gives for each combination of alternatives (each of the value
+  // category its variant has).
+  std::optional<QualType> One;
+  bool Differ = false;
+  for (size_t K = 0; K < Product && !Differ; ++K) {
+    SmallVector<Expr *, 2> Args;
+    size_t Rest = K;
+    for (size_t I = 0; I < Variants.size(); ++I) {
+      QualType A = Alts[I][Rest % Alts[I].size()];
+      Rest /= Alts[I].size();
+      Args.push_back(new (S.Context) OpaqueValueExpr(
+          Loc, A.getNonReferenceType(), Variants[I]->getValueKind()));
+    }
+    EnterExpressionEvaluationContext Unevaluated(
+        S, Sema::ExpressionEvaluationContext::Unevaluated);
+    Sema::SFINAETrap Trap(S, /*WithAccessChecking=*/true);
+    ExprResult Call = S.BuildCallExpr(nullptr, F, Loc, Args, Loc);
+    if (!Call.isUsable() || Trap.hasErrorOccurred())
+      return ExprEmpty();
+    const QualType R = S.Context.getCanonicalType(Call.get()->getType());
+    if (!One)
+      One = R;
+    else if (*One != R)
+      Differ = true;
+  }
+  if (!Differ)
+    return ExprEmpty();
+  SmallVector<Expr *, 2> Held;
+  for (Expr *V : Variants) {
+    ExprResult D = cppshVariantDeref(S, V->getBeginLoc(), V);
+    if (!D.isUsable())
+      return ExprEmpty();
+    Held.push_back(D.get());
+  }
+  return S.BuildCallExpr(nullptr, F, Loc, Held, Loc);
+}
+
 // Whether a local of this type is handed over by moving it (cppsh): it has
 // no copy constructor to use.
 bool cppshMoveOnly(Sema &S, QualType T) {
@@ -7787,6 +7870,42 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
 
   if (CheckArgsForPlaceholders(ArgExprs))
     return ExprError();
+
+  // cppsh: std::visit(f, v...) / v.visit(f), f's types differing by
+  // alternative: f called on the values held (cppshVariantVisit).
+  if (getLangOpts().CPlusPlus) {
+    Expr *Callee = Fn->IgnoreParens();
+    DeclarationName Name;
+    if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(Callee))
+      Name = ULE->getName();
+    else if (auto *DRE = dyn_cast<DeclRefExpr>(Callee))
+      Name = DRE->getDecl()->getDeclName();
+    if (Name.isIdentifier() && Name.getAsIdentifierInfo()->isStr("visit") &&
+        ArgExprs.size() >= 2) {
+      if (ExprResult Visited = cppshVariantVisit(*this, ArgExprs[0],
+                                                 ArgExprs.drop_front(), LParenLoc);
+          !Visited.isUnset())
+        return Visited;
+    }
+    Expr *Base = nullptr;
+    DeclarationName Member;
+    if (auto *UME = dyn_cast<UnresolvedMemberExpr>(Callee);
+        UME && !UME->isImplicitAccess()) {
+      Base = UME->getBase();
+      Member = UME->getMemberName();
+    } else if (auto *ME = dyn_cast<MemberExpr>(Callee)) {
+      Base = ME->getBase();
+      Member = ME->getMemberDecl()->getDeclName();
+    }
+    if (Base && !ME_IsArrow(Callee) && Member.isIdentifier() &&
+        Member.getAsIdentifierInfo()->isStr("visit") && ArgExprs.size() == 1) {
+      Expr *Variants[1] = {Base};
+      if (ExprResult Visited =
+              cppshVariantVisit(*this, ArgExprs[0], Variants, LParenLoc);
+          !Visited.isUnset())
+        return Visited;
+    }
+  }
 
   // cppsh: in a template's body, a call that may be specialized on a local's
   // value: a need met as the body is parsed.
