@@ -6864,9 +6864,18 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
 
   // cppsh: any other run-time template argument the user wrote -- a call's
   // value (input<int>()), written or a default substituted, for a function,
-  // class, variable or alias template alike.
-  if (CCE == CCEKind::TemplateArg && T->isIntegralOrEnumerationType()) {
-    llvm::APSInt Zero(Context.getIntWidth(T), T->isUnsignedIntegerOrEnumerationType());
+  // class, variable or alias template alike -- for a parameter of an integral
+  // type, or of one deduced from it (`auto N`).
+  const QualType CppshT =
+      T->isIntegralOrEnumerationType()
+          ? T
+          : T->getContainedDeducedType() &&
+                    E->getType()->isIntegralOrEnumerationType()
+                ? E->getType().getUnqualifiedType()
+                : QualType();
+  if (CCE == CCEKind::TemplateArg && !CppshT.isNull()) {
+    llvm::APSInt Zero(Context.getIntWidth(CppshT),
+                      CppshT->isUnsignedIntegerOrEnumerationType());
     // In a function body: a need -- evaluated where the body is cut, handed
     // over in the frame; meanwhile a zero, the statement being dropped.
     if (cppshExprNeedHere(*this, E)) {
