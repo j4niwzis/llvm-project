@@ -1510,10 +1510,26 @@ llvm::Error Interpreter::cppshSnapshot(ArrayRef<VarDecl *> Vars) {
 }
 
 namespace {
-// What staging changes while compiling for a frame, put back after.
+// What staging changes while compiling for a frame, put back after -- and
+// what the top-level declaration being staged around it has set (a staged
+// call hoisted out of `x = f();` runs f, whose staged code is compiled here):
+// none of it the units built for the frame's (each would be taken back as
+// that declaration is, IncrementalParser::FinishPTU).
 struct CppshFrameState {
   bool WasHoist = std::exchange(CppshInHoist, false);
-  ~CppshFrameState() { CppshInHoist = WasHoist; }
+  SourceLocation WasHoistBegin = std::exchange(CppshHoistBegin, SourceLocation());
+  SourceLocation WasHoistEnd = std::exchange(CppshHoistEnd, SourceLocation());
+  SourceLocation WasStageAt = std::exchange(CppshStageAt, SourceLocation());
+  bool WasTopNeed = std::exchange(CppshTopNeed, false);
+  std::vector<SourceRange> WasTopNeedExprs = std::exchange(CppshTopNeedExprs, {});
+  ~CppshFrameState() {
+    CppshInHoist = WasHoist;
+    CppshHoistBegin = WasHoistBegin;
+    CppshHoistEnd = WasHoistEnd;
+    CppshStageAt = WasStageAt;
+    CppshTopNeed = WasTopNeed;
+    CppshTopNeedExprs = std::move(WasTopNeedExprs);
+  }
 };
 } // namespace
 
