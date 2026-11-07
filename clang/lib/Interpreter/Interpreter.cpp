@@ -1460,31 +1460,6 @@ static ExprResult cppshShCallee(Sema &S, StringRef Name) {
   return S.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
 }
 
-// The global naming a live local in a frame, built: `T &Name = *(T *)Addr;`.
-static VarDecl *cppshFrameGlobal(Sema &S, IdentifierInfo *Name, QualType T,
-                                 void *Addr) {
-  ASTContext &Ctx = S.Context;
-  const SourceLocation Loc;
-  const QualType RefT = Ctx.getLValueReferenceType(T);
-  auto *VD = VarDecl::Create(Ctx, Ctx.getTranslationUnitDecl(), Loc, Loc, Name,
-                             RefT, Ctx.getTrivialTypeSourceInfo(RefT, Loc),
-                             SC_None);
-  Expr *Int = IntegerLiteral::Create(
-      Ctx, llvm::APInt(64, llvm::bit_cast<uintptr_t>(Addr)),
-      Ctx.UnsignedLongLongTy, Loc);
-  ExprResult Ptr = S.BuildCStyleCastExpr(
-      Loc, Ctx.getTrivialTypeSourceInfo(Ctx.getPointerType(T), Loc), Loc, Int);
-  ExprResult Obj = Ptr.isUsable()
-                       ? S.CreateBuiltinUnaryOp(Loc, UO_Deref, Ptr.get())
-                       : ExprError();
-  if (!Obj.isUsable())
-    return nullptr;
-  S.AddInitializerToDecl(VD, Obj.get(), /*DirectInit=*/false);
-  S.FinalizeDeclaration(VD);
-  S.PushOnScopeChains(VD, S.TUScope);
-  return VD;
-}
-
 static bool cppshReport(llvm::Error Err) {
   if (!Err)
     return true;
