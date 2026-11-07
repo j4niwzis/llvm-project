@@ -1829,6 +1829,11 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     }
     if (T.isTriviallyCopyableType(Ctx))
       B.Value = cppshValueAt(Ctx, T, static_cast<const unsigned char *>(Objects[I]));
+    if (cppshTraceStaging())
+      llvm::errs() << "cppsh-trace: value of " << Params[I]->getName() << " (slot "
+                   << I << ", " << T.getAsString() << " at " << Objects[I] << "): "
+                   << (B.Value ? B.Value->getAsString(Ctx, T) : std::string("none"))
+                   << "\n";
     if (B.Value) {
       B.Profile.AddInteger(1u);
       B.Value->Profile(B.Profile);
