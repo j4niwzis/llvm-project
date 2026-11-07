@@ -9832,8 +9832,11 @@ bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
   if (const VarDecl *PVD = VD; !Frame) {
     const QualType T = VD->getType().getNonReferenceType();
     if (auto Known = CppshParamValue.find(PVD); Known != CppshParamValue.end()) {
+      // A temporary of the evaluation, known by the expression naming the
+      // variable (of the object's type, as the value is): not by the
+      // variable, whose type is a reference.
       APValue &Slot = Info.CurrentCall->createTemporary(
-          PVD, T, ScopeKind::FullExpression, Result);
+          E, T, ScopeKind::FullExpression, Result);
       Slot = Known->second;
       return true;
     }
