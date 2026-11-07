@@ -1740,8 +1740,15 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
   Actions.ActOnAfterCompoundStatementLeadingPragmas();
 
   StmtVector Stmts;
-  // A function's body, where cppsh cuts (CppshCutNeeded).
-  const bool CppshBody = std::exchange(CppshNextCompoundIsBody, false);
+  // A function's body, where cppsh cuts (CppshCutNeeded) -- a lambda's as
+  // any: a need met in it makes staged code of its call operator, whatever
+  // is around the lambda (a top-level declaration's initializer has no body
+  // to cut, and the need would be left unmet: the placeholder compiled).
+  bool CppshBody = std::exchange(CppshNextCompoundIsBody, false);
+  if (!CppshBody && !isStmtExpr && getCurScope()->isFunctionScope())
+    if (DeclContext *DC = getCurScope()->getEntity();
+        DC && isLambdaCallOperator(DC))
+      CppshBody = true;
   const SourceLocation CppshSavedBodyOpen = CppshBodyOpen;
   const size_t CppshSavedRangeBase = CppshRangeBase;
   if (CppshBody) {
