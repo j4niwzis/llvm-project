@@ -1227,6 +1227,21 @@ void CodeGenModule::Release() {
   // here on (EmittedLinkOnceDecls).
   DeferredDecls.insert_range(EmittedDeferredDecls);
   EmittedDeferredDecls.clear();
+  // The linkonce ones, emitted here for the first and only time: plain
+  // external definitions, out of their COMDAT and visible, for the JIT to
+  // export to every later module (a linkonce definition in a COMDAT group
+  // it does not offer outside its own module). Only these: never emitted
+  // again, they are no second strong definition anywhere.
+  for (const auto &[Name, GD] : EmittedLinkOnceDecls)
+    if (llvm::GlobalValue *GV = GetGlobalValue(Name);
+        GV && !GV->isDeclaration() &&
+        (GV->hasLinkOnceLinkage() || GV->hasWeakLinkage())) {
+      GV->setLinkage(llvm::GlobalValue::ExternalLinkage);
+      GV->setVisibility(llvm::GlobalValue::DefaultVisibility);
+      GV->setDSOLocal(false);
+      if (auto *GO = dyn_cast<llvm::GlobalObject>(GV))
+        GO->setComdat(nullptr);
+    }
   EmittedLinkOnceDecls.clear();
   EmitVTablesOpportunistically();
   applyGlobalValReplacements();
