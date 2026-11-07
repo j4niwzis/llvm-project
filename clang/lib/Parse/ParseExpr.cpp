@@ -120,8 +120,23 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
   QualType FnTy = Fn->getType();
   if (FnTy.isNull())
     return LHS;
+  // A command is named: a function, an overload set, a method -- of a type
+  // not known yet as much as of one known (a template's, staged code's). A
+  // value whose type is not known yet -- a call's result, a variable -- is a
+  // value: `a.size() * 10` in staged code (`a` of a type its values give) is
+  // a product, not `a.size()` run with the words `*` and `10`.
+  auto NamesFunctions = [&] {
+    if (isa<UnresolvedLookupExpr, UnresolvedMemberExpr>(Fn))
+      return true;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(Fn))
+      return isa<FunctionDecl, FunctionTemplateDecl>(DRE->getDecl());
+    if (const auto *ME = dyn_cast<MemberExpr>(Fn))
+      return isa<CXXMethodDecl>(ME->getMemberDecl());
+    return false;
+  };
   bool IsCallable =
-      Fn->isTypeDependent() || FnTy == Actions.Context.OverloadTy ||
+      (Fn->isTypeDependent() && NamesFunctions()) ||
+      FnTy == Actions.Context.OverloadTy ||
       FnTy == Actions.Context.BoundMemberTy || FnTy->isFunctionType() ||
       FnTy->isFunctionPointerType() || FnTy->isFunctionReferenceType() ||
       FnTy->isRecordType();
