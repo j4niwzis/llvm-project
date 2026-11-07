@@ -1559,37 +1559,6 @@ static bool cppshFrameGlobals(Interpreter &Interp, Sema &S,
   return Ok;
 }
 
-// The function Name called with a frame's globals: a local it moves (one
-// with no copy) moved, as `static_cast<T &&>(global)`.
-static ExprResult cppshCallWithFrame(Sema &S, IdentifierInfo *Name,
-                                     ArrayRef<std::pair<const CppshCutLocal *, VarDecl *>> Globals) {
-  ASTContext &Ctx = S.Context;
-  const SourceLocation Loc;
-  LookupResult R(S, Name, Loc, Sema::LookupOrdinaryName);
-  S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl());
-  if (R.empty())
-    return ExprError();
-  CXXScopeSpec SS;
-  ExprResult Callee = S.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
-  if (!Callee.isUsable())
-    return ExprError();
-  SmallVector<Expr *, 8> Args;
-  for (const auto &Global : Globals) {
-    const CppshCutLocal &L = *Global.first;
-    ExprResult Ref = S.BuildDeclRefExpr(Global.second, L.Type, VK_LValue, Loc);
-    if (L.Move && !L.ByRef)
-      Ref = S.BuildCXXNamedCast(
-          Loc, tok::kw_static_cast,
-          Ctx.getTrivialTypeSourceInfo(Ctx.getRValueReferenceType(L.Type), Loc),
-          Ref.get(), SourceRange(Loc, Loc), SourceRange(Loc, Loc));
-    if (!Ref.isUsable())
-      return ExprError();
-    Args.push_back(Ref.get());
-  }
-  return S.BuildCallExpr(S.TUScope, Callee.get(), Loc, Args, Loc);
-}
-
-namespace {
 namespace {
 // What staging changes while compiling for a frame, put back after.
 struct CppshFrameState {
