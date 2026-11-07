@@ -8381,6 +8381,22 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                  PatFD->getReturnType()->getContainedAutoType();
         };
         const bool AnyValueCandidate = llvm::any_of(ovl->decls(), ValueCandidate);
+        if (cppshTraceStaging() && cppshInUserInput(*this, Fn->getBeginLoc()))
+          for (NamedDecl *ND : ovl->decls()) {
+            auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
+            FunctionDecl *PatFD = FTD ? FTD->getTemplatedDecl() : nullptr;
+            llvm::errs() << "cppsh-trace: candidate " << ND->getNameAsString()
+                         << (isa<UnresolvedMemberExpr>(ovl) ? " (member)" : "")
+                         << ": template " << (FTD ? "yes" : "no") << ", body "
+                         << (PatFD && PatFD->getBody() ? "yes" : "no")
+                         << ", deduced return "
+                         << (PatFD && PatFD->getReturnType()->getContainedAutoType()
+                                 ? "yes"
+                                 : "no")
+                         << ", dependent context "
+                         << (CurContext->isDependentContext() ? "yes" : "no")
+                         << "\n";
+          }
         // What each parameter had before this call set its value: put back
         // once the call is built.
         SmallVector<std::pair<ParmVarDecl *, std::optional<APValue>>, 4> SavedValues;
