@@ -45,6 +45,7 @@ class CXXRecordDecl;
 class Decl;
 class IncrementalParser;
 class Parser;
+class VarDecl;
 class IncrementalDeviceParser;
 
 /// The device language to offload to. \c Detect selects the vendor of the
@@ -190,6 +191,10 @@ public:
   llvm::Error cppshEndBuildAndExecute();
   /// cppsh: the parser, for code built from recorded tokens.
   Parser &cppshParser();
+  /// cppsh: the snapshots of these variables taken (std::sh::
+  /// __cppsh_snapshot), in a unit Sema builds -- safe between two top-level
+  /// declarations of an input.
+  llvm::Error cppshSnapshot(ArrayRef<VarDecl *> Vars);
 
   llvm::Expected<PartialTranslationUnit &> Parse(llvm::StringRef Code);
   llvm::Error Execute(PartialTranslationUnit &T);

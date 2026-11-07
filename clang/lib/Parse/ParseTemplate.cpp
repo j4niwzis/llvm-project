@@ -1395,7 +1395,7 @@ ParsedTemplateArgument Parser::ParseTemplateArgument() {
   // exists only as the function runs: a need now, whatever it is
   // instantiated with (the statement made a staged region).
   if (const VarDecl *Local = cppshTemplateLocalIn(Actions, ExprArg.get())) {
-    CppshCutNeeded = true;
+    cppshMeetNeed(Actions);
     CppshCutNeedVar = Local;
   }
 

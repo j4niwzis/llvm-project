@@ -178,9 +178,10 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
       Names.insert(Stmt.substr(I, J - I).str());
     I = J;
   }
-  // All of them in one input: one compile and one run of the JIT, not one
-  // for each variable named.
-  std::string Snapshots;
+  // All of them in one unit: one compile and one run of the JIT, not one
+  // for each variable named -- built, not parsed: this runs between two
+  // top-level declarations of an input being parsed.
+  std::vector<clang::VarDecl *> Snapshots;
   for (const std::string &Name : Names) {
     clang::LookupResult R(S, &Ctx.Idents.get(Name), clang::SourceLocation(),
                           clang::Sema::LookupOrdinaryName);
@@ -192,15 +193,14 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
         VD->getType()->isDependentType() ||
         VD->getType().getNonReferenceType().isTriviallyCopyableType(Ctx))
       continue;
-    Snapshots += std::string(Snapshots.empty() ? "" : ", ") + "std::sh::__cppsh_snapshot(" +
-                 Name + ")";
+    Snapshots.push_back(VD);
   }
   if (!Snapshots.empty())
     // One expression statement: the staging probe forks only for several.
   {
     auto Started = std::chrono::steady_clock::now();
     ++CppshSnapshotCompiles;
-    if (llvm::Error Err = Interp.ParseAndExecute("(" + Snapshots + ");"))
+    if (llvm::Error Err = Interp.cppshSnapshot(Snapshots))
       llvm::consumeError(std::move(Err));
     CppshSnapshotNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
                            std::chrono::steady_clock::now() - Started)

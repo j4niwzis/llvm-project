@@ -1365,15 +1365,18 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
                              SourceLocation Begin, bool AtBody) {
   // What it needs: a local's value, a run-time template argument's, or a
   // staged function's result -- one, the last a staged call leaves.
-  if (!R.isUsable() || CppshCutStagedCalls.size() > 1 ||
+  if (CppshCutStagedCalls.size() > 1 ||
       (!CppshCutNeedVar && CppshCutNeedExprs.empty() && CppshCutStagedCalls.empty()))
     return false;
+  // Its first parse may be invalid (what the need left unresolved): a
+  // statement, not a declaration, then.
+  const bool Declares = R.isUsable() && isa<DeclStmt>(R.get());
   std::optional<unsigned> B = cppshTokenIndex(Begin);
   // A region's first statement needing a value again: what it needs is no
   // local nor argument of it -- another region of it would be the same.
   if (!B || (CppshRegionBegin && *CppshRegionBegin == *B))
     return false;
-  if (isa<DeclStmt>(R.get()))
+  if (Declares)
     SkipUntil(tok::r_brace, StopBeforeMatch);
   std::optional<unsigned> E =
       !Tok.is(tok::eof) ? cppshTokenIndex(Tok.getLocation())
@@ -1399,7 +1402,7 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   const bool Staged = Returns && Function && !cppshIsRegion(Function) &&
                       Function->getReturnType()->isUndeducedType() &&
                       !cppshLeavesLoop(Toks) &&
-                      ((AtBody && isa<DeclStmt>(R.get())) || cppshAlwaysReturns(Toks));
+                      ((AtBody && Declares) || cppshAlwaysReturns(Toks));
   if (Returns && !Staged &&
       (!Function || cppshIsRegion(Function) ||
        Function->getReturnType()->isUndeducedType()))
@@ -1830,6 +1833,7 @@ void Parser::ParseCppshRegionStatements(StmtVector &Stmts, unsigned Begin,
     CppshCutNeedExprs.clear();
     CppshCutStagedCalls.clear();
     StmtResult R = ParseStatementOrDeclaration(Stmts, ParsedStmtContext::Compound);
+    cppshEndNeedDiagnostics(Actions);
     if (CppshCutNeeded) {
       CppshCutNeeded = false;
       if (CppshEmitRegion(Stmts, R, StmtBegin))
@@ -2018,6 +2022,8 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
     // a local's value, a run-time template argument's, a staged function's
     // result: the code from it a staged region (CppshEmitRegion), the
     // function going on in its frame -- or, where it cannot be, an error.
+    if (CppshCuts)
+      cppshEndNeedDiagnostics(Actions);
     if (CppshCuts && CppshCutNeeded) {
       CppshCutNeeded = false;
       if (CppshEmitRegion(Stmts, R, CppshStmtBegin, CppshBody)) {
@@ -3597,6 +3603,7 @@ void Parser::CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
                                     SmallVectorImpl<Stmt *> &Stmts,
                                     ExprResult E, SourceLocation Loc,
                                     unsigned Begin, unsigned End) {
+  cppshEndNeedDiagnostics(Actions);
   FunctionDecl *FD = Actions.getCurFunctionDecl();
   if (Saved.Cuts && CppshCutNeeded && FD) {
     // A need in it: the expression a staged region's, returned -- the

@@ -24,6 +24,7 @@
 #include "clang/Parse/RAIIObjectsForParser.h"
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Lookup.h"
+#include "clang/Sema/CppshStaging.h"
 #include "clang/Sema/ParsedAttr.h"
 #include "clang/Sema/ParsedTemplate.h"
 #include "clang/Sema/Scope.h"
@@ -5948,6 +5949,7 @@ Parser::DeclGroupPtrTy Parser::ParseTopLevelStmtDecl() {
   CppshCutNeedExprs.clear();
   CppshCutStagedCalls.clear();
   StmtResult R = ParseStatementOrDeclaration(Stmts, SubStmtCtx);
+  cppshEndNeedDiagnostics(Actions);
   if (CppshCutNeeded) {
     CppshCutNeeded = false;
     StmtVector Region;

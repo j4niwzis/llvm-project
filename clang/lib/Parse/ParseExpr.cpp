@@ -27,6 +27,7 @@
 #include "clang/Basic/PrettyStackTrace.h"
 #include "clang/Lex/LiteralSupport.h"
 #include "clang/Parse/Parser.h"
+#include "clang/Sema/CppshStaging.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Parse/RAIIObjectsForParser.h"
 #include "clang/Sema/DeclSpec.h"
@@ -43,6 +44,13 @@
 #include "llvm/ADT/SmallVector.h"
 #include <optional>
 using namespace clang;
+
+namespace clang {
+extern bool CppshCutNeeded;
+extern const VarDecl *CppshCutNeedVar;
+extern std::vector<Expr *> CppshCutNeedExprs;
+extern std::vector<Expr *> CppshCutStagedCalls;
+} // namespace clang
 
 ExprResult
 Parser::ParseExpression(TypoCorrectionTypeBehavior CorrectionBehavior) {
@@ -2411,8 +2419,19 @@ Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
         // (Parser::CppshEmitRegion).
         if (!CppshSuppliedExprs.empty() && LHS.isUsable())
           if (Expr *Supplied = CppshSuppliedExprs.lookup(
-                  LHS.get()->getBeginLoc().getRawEncoding()))
+                  LHS.get()->getBeginLoc().getRawEncoding())) {
+            // Sema met the staged call as it was built: no need any more,
+            // its value supplied.
+            const SourceLocation At = LHS.get()->getBeginLoc();
             LHS = Supplied;
+            llvm::erase_if(CppshCutStagedCalls,
+                           [&](Expr *Call) { return Call->getBeginLoc() == At; });
+            if (CppshCutStagedCalls.empty() && CppshCutNeedExprs.empty() &&
+                !CppshCutNeedVar) {
+              CppshCutNeeded = false;
+              cppshEndNeedDiagnostics(Actions);
+            }
+          }
       }
 
       break;

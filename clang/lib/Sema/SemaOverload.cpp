@@ -29,6 +29,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Initialization.h"
+#include "clang/Sema/CppshStaging.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Overload.h"
 #include "clang/Sema/SemaAMDGPU.h"
@@ -6853,7 +6854,7 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
   // dropped for the cut.
   if (CCE == CCEKind::TemplateArg && T->isIntegralOrEnumerationType())
     if (const VarDecl *Local = cppshRuntimeLocalIn(*this, E)) {
-      CppshCutNeeded = true;
+      cppshMeetNeed(*this);
       CppshCutNeedVar = Local;
       CppshCutNeedFunction = getCurFunctionDecl();
       Value = APValue(llvm::APSInt(Context.getIntWidth(T),
@@ -6869,7 +6870,7 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
     // In a function body: a need -- evaluated where the body is cut, handed
     // over in the frame; meanwhile a zero, the statement being dropped.
     if (cppshExprNeedHere(*this, E)) {
-      CppshCutNeeded = true;
+      cppshMeetNeed(*this);
       CppshCutNeedVar = nullptr;
       CppshCutNeedFunction = getCurFunctionDecl();
       CppshCutNeedExprs.push_back(E);
@@ -6879,6 +6880,7 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
     // At the top level: the statement compiled again inside a function.
     if (cppshTopNeedHere(*this, E)) {
       CppshTopNeed = true;
+      cppshHoldDiagnostics(*this);
       CppshTopNeedExprs.push_back(E->getSourceRange());
       Value = APValue(Zero);
       return ConstantExpr::Create(Context, E, Value);

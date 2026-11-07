@@ -109,6 +109,32 @@ SourceLocation CppshStageAt;
 // instantiated with the values as the function runs (Parser::
 // CppshEmitRegion).
 bool CppshCutNeeded = false;
+// Whether the diagnostics of the statement a need was met in are being held
+// back, and whether they were before.
+static bool CppshNeedHolding = false;
+static bool CppshNeedWasSuppressed = false;
+
+void cppshHoldDiagnostics(Sema &S) {
+  if (CppshNeedHolding)
+    return;
+  DiagnosticsEngine &Diags = S.getDiagnostics();
+  CppshNeedHolding = true;
+  CppshNeedWasSuppressed = Diags.getSuppressAllDiagnostics();
+  Diags.setSuppressAllDiagnostics(true);
+}
+
+void cppshMeetNeed(Sema &S) {
+  CppshCutNeeded = true;
+  cppshHoldDiagnostics(S);
+}
+
+void cppshEndNeedDiagnostics(Sema &S) {
+  if (!CppshNeedHolding)
+    return;
+  S.getDiagnostics().setSuppressAllDiagnostics(CppshNeedWasSuppressed);
+  CppshNeedHolding = false;
+}
+
 // The local whose value the need is for; none for a staged call.
 const VarDecl *CppshCutNeedVar = nullptr;
 // The expressions of run-time template arguments met in the statement being
@@ -480,7 +506,7 @@ void cppshNeedForTemplateCall(Sema &S, Expr *Fn, ArrayRef<Expr *> Args) {
     for (NamedDecl *ND : ULE->decls())
       if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
           FTD && cppshFoldsOn(FTD->getTemplatedDecl(), I)) {
-        CppshCutNeeded = true;
+        cppshMeetNeed(S);
         CppshCutNeedVar = VD;
         return;
       }
@@ -564,6 +590,7 @@ void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
   (void)Statements;
   CppshCutNeedExprs.clear();
   CppshCutStagedCalls.clear();
+  cppshEndNeedDiagnostics(S);
   S.Diag(At->getBeginLoc(),
          S.getDiagnostics().getCustomDiagID(
              DiagnosticsEngine::Error,
@@ -7557,7 +7584,7 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         cppshInUserInput(*this, CE->getBeginLoc())) {
       if (FunctionDecl *Cur = cppshNeedFunction(*this);
           Cur || cppshTopStatement(*this)) {
-        CppshCutNeeded = true; // a staged region's argument
+        cppshMeetNeed(*this); // a staged region's argument
         CppshCutNeedVar = nullptr;
         CppshCutNeedFunction = Cur;
         CppshCutStagedCalls.push_back(Call.get());
@@ -8374,7 +8401,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                       VD->getParentFunctionOrMethod() == NeedFD &&
                       !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)) &&
                       cppshInUserInput(*this, NeedFD->getLocation())) {
-                    CppshCutNeeded = true;
+                    cppshMeetNeed(*this);
                     CppshCutNeedVar = VD;
                     CppshCutNeedFunction = NeedFD;
                     CppshCutHere = true;

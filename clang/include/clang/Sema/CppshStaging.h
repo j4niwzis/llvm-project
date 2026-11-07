@@ -63,6 +63,16 @@ bool cppshIsRegion(const FunctionDecl *FD);
 /// as the argument is checked.
 const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E);
 
+/// A need met in the statement being parsed (CppshCutNeeded): what the rest
+/// of that statement's analysis says is held back -- it is parsed again,
+/// as a staged region's -- until cppshEndNeedDiagnostics, where the
+/// statement ends.
+void cppshMeetNeed(Sema &S);
+/// Diagnostics held back as above, without a need (a top-level
+/// declaration taken back to be parsed again).
+void cppshHoldDiagnostics(Sema &S);
+void cppshEndNeedDiagnostics(Sema &S);
+
 /// Whether what is being parsed is in a top-level statement (the REPL's),
 /// outside any function: a need met there makes a staged region too.
 bool cppshInTopStatement(Sema &S);

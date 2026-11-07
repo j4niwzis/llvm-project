@@ -1533,16 +1533,32 @@ static bool cppshFrameGlobals(Interpreter &Interp, Sema &S,
     return false;
   // The snapshots, in a unit of their own: a type that cannot be
   // snapshotted only loses its rebuilt value.
-  ASTContext &Ctx = S.Context;
-  const SourceLocation Loc;
-  ExprResult Snap = cppshShCallee(S, "__cppsh_snapshot");
   SmallVector<VarDecl *, 4> ToSnap;
   for (const auto &Global : Globals)
     if (!Global.first->Type->isDependentType() &&
-        !Global.first->Type.isTriviallyCopyableType(Ctx))
+        !Global.first->Type.isTriviallyCopyableType(S.Context))
       ToSnap.push_back(Global.second);
-  if (!ToSnap.empty() && Snap.isUsable() && cppshReport(Interp.cppshBeginBuild())) {
-    for (VarDecl *G : ToSnap) {
+  llvm::consumeError(Interp.cppshSnapshot(ToSnap));
+  return Ok;
+}
+
+// The snapshots of variables (std::sh::__cppsh_snapshot), taken now -- a unit
+// Sema builds: never text parsed in the middle of an input's tokens.
+llvm::Error Interpreter::cppshSnapshot(ArrayRef<VarDecl *> Vars) {
+  if (Vars.empty())
+    return llvm::Error::success();
+  Sema &S = getCompilerInstance()->getSema();
+  ASTContext &Ctx = S.Context;
+  const SourceLocation Loc;
+  ExprResult Snap = cppshShCallee(S, "__cppsh_snapshot");
+  if (!Snap.isUsable())
+    return llvm::make_error<llvm::StringError>("cppsh: no std::sh::__cppsh_snapshot",
+                                               std::error_code());
+  Interpreter &Interp = *this;
+  if (llvm::Error Err = cppshBeginBuild())
+    return Err;
+  {
+    for (VarDecl *G : Vars) {
       TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(S.TUScope);
       Expr *Ref = S.BuildDeclRefExpr(G, G->getType().getNonReferenceType(),
                                      VK_LValue, Loc);
@@ -1555,9 +1571,8 @@ static bool cppshFrameGlobals(Interpreter &Interp, Sema &S,
                                 : new (Ctx) NullStmt(Loc));
       Interp.cppshAddBuilt(Stmt);
     }
-    llvm::consumeError(Interp.cppshEndBuildAndExecute());
   }
-  return Ok;
+  return cppshEndBuildAndExecute();
 }
 
 namespace {
@@ -1727,6 +1742,7 @@ static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
                           ? S.BuildCallExpr(S.TUScope, Member.get(), Loc, Args, Loc)
                           : ExprError();
     // A need met as it was instantiated: a value it changes (no constant).
+    cppshEndNeedDiagnostics(S);
     if (CppshCutNeeded) {
       S.Diag(Pattern->getLocation(),
              S.getDiagnostics().getCustomDiagID(
@@ -1937,6 +1953,7 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
     llvm::Expected<TranslationUnitDecl *> TU =
         IncrParser->ParseNextTopLevel(First, Done);
     First = false;
+    cppshEndNeedDiagnostics(getCompilerInstance()->getSema());
     CppshParseNs += Since();
     if (Done) {
       if (!TU)
