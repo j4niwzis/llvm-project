@@ -1725,9 +1725,38 @@ static bool cppshHasDirective(llvm::StringRef Code) {
   return llvm::any_of(Lines, [](llvm::StringRef L) { return L.ltrim().starts_with("#"); });
 }
 
-// Whether an input names a function known to be staged (cut): a call of it
-// at the top level is hoisted -- run on its own, its result put in its place.
-static bool cppshMentionsStaged(llvm::StringRef Code) {
+// Whether an input names a function known to be staged (cut), or one of the
+// user's own (declared in what they typed) -- which becomes staged only as
+// its call is instantiated (an auto parameter): a call of it at the top level
+// is hoisted, run on its own, its result put in its place. The library's
+// functions are never staged.
+static bool cppshMentionsStaged(Sema &S, llvm::StringRef Code) {
+  ASTContext &Ctx = S.getASTContext();
+  SourceManager &SM = S.getSourceManager();
+  auto Ident = [](char C) { return std::isalnum(static_cast<unsigned char>(C)) || C == '_'; };
+  for (size_t I = 0; I < Code.size();) {
+    if (!Ident(Code[I]) || std::isdigit(static_cast<unsigned char>(Code[I])) ||
+        (I > 0 && (Ident(Code[I - 1]) || Code[I - 1] == '.'))) {
+      ++I;
+      continue;
+    }
+    size_t J = I;
+    while (J < Code.size() && Ident(Code[J]))
+      ++J;
+    LookupResult R(S, &Ctx.Idents.get(Code.slice(I, J)), SourceLocation(),
+                   Sema::LookupOrdinaryName);
+    R.suppressDiagnostics();
+    if (S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl()))
+      for (NamedDecl *D : R) {
+        D = D->getUnderlyingDecl();
+        if (!isa<FunctionDecl, FunctionTemplateDecl>(D))
+          continue;
+        SourceLocation L = SM.getFileLoc(D->getLocation());
+        if (L.isValid() && SM.getBufferName(L).starts_with("input_line_"))
+          return true;
+      }
+    I = J;
+  }
   for (const FunctionDecl *FD : CppshCutFunctions) {
     if (!FD->getIdentifier())
       continue;
@@ -1776,7 +1805,7 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
     // finds the call, to be run on its own first and its result put in its
     // place. Nothing else needs one.
     CppshStagePlan Plan;
-    if (!CppshNoProbe && cppshMentionsStaged(Code))
+    if (!CppshNoProbe && cppshMentionsStaged(getCompilerInstance()->getSema(), Code))
       Plan = (++CppshProbes, cppshProbe(*this, Code));
     const bool Hoisting = Plan.HoistEnd > Plan.HoistBegin;
 

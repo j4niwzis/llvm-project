@@ -330,6 +330,18 @@ namespace {
       if (!Diags.hasUnrecoverableErrorOccurred() && Builder)
         Builder->Release();
 
+      // Incremental: a linkonce or weak definition is linked to from later
+      // modules (CodeGenModule::EmittedLinkOnceDecls), so it must be
+      // exported -- hidden visibility (libc++'s _LIBCPP_HIDE_FROM_ABI) keeps
+      // it to its own module in the JIT, each module a linkage unit of its
+      // own. Default visibility for those definitions, and for the hidden
+      // declarations that reach them from here.
+      if (M && Ctx.getLangOpts().IncrementalExtensions)
+        for (llvm::GlobalValue &GV : M->global_values())
+          if (GV.hasHiddenVisibility() &&
+              (GV.isDeclaration() || GV.hasLinkOnceLinkage() || GV.hasWeakLinkage()))
+            GV.setVisibility(llvm::GlobalValue::DefaultVisibility);
+
       // If there are errors before or when releasing the Builder, reset
       // the module to stop here before invoking the backend.
       if (Diags.hasErrorOccurred()) {
