@@ -355,6 +355,60 @@ ExprResult cppshVariantMember(Sema &S, Expr *Base, const DeclarationNameInfo &Na
   return S.BuildCallExpr(nullptr, Fn.get(), Loc, CallArgs, Loc);
 }
 
+// `*v` on a std::variant the user typed: the value it holds, of the type of
+// the alternative it holds -- std::get<v.index()>(v), whose template
+// argument is read at run time: the statement staged there (a function's
+// rest compiled once the index is known; a top-level declaration compiled
+// again with it), the index then supplied where `*` is (CppshSuppliedExprs).
+// Nothing for a variant's own operator* (the standard has none), or one not
+// known yet (a template's, come back to as it is instantiated).
+ExprResult cppshVariantDeref(Sema &S, SourceLocation OpLoc, Expr *Input) {
+  if (!Input || !cppshInUserInput(S, OpLoc))
+    return ExprEmpty();
+  QualType T = Input->getType().getNonReferenceType();
+  if (T.isNull() || T->isDependentType())
+    return ExprEmpty();
+  auto *RD = T->getAsCXXRecordDecl();
+  if (!RD || !RD->getIdentifier() || RD->getName() != "variant" ||
+      !RD->isInStdNamespace())
+    return ExprEmpty();
+  NamespaceDecl *Std = S.getStdNamespace();
+  if (!Std)
+    return ExprEmpty();
+  Preprocessor &PP = S.getPreprocessor();
+  // (Supplied where the index expression begins: the variant's own start.)
+  Expr *Index = CppshSuppliedExprs.lookup(Input->getBeginLoc().getRawEncoding());
+  if (!Index) {
+    CXXScopeSpec SS;
+    DeclarationNameInfo IndexName(&PP.getIdentifierTable().get("index"), OpLoc);
+    ExprResult Member = S.BuildMemberReferenceExpr(
+        Input, Input->getType(), OpLoc, /*IsArrow=*/false, SS, SourceLocation(),
+        /*FirstQualifierInScope=*/nullptr, IndexName, /*TemplateArgs=*/nullptr,
+        /*S=*/nullptr);
+    ExprResult Call = Member.isUsable()
+                          ? S.BuildCallExpr(nullptr, Member.get(), OpLoc, {}, OpLoc)
+                          : ExprError();
+    if (!Call.isUsable())
+      return ExprEmpty();
+    Index = Call.get();
+  }
+  LookupResult R(S, &PP.getIdentifierTable().get("get"), OpLoc,
+                 Sema::LookupOrdinaryName);
+  S.LookupQualifiedName(R, Std);
+  if (R.empty())
+    return ExprEmpty();
+  TemplateArgumentListInfo Args(OpLoc, OpLoc);
+  Args.addArgument(
+      TemplateArgumentLoc(TemplateArgument(Index, /*IsCanonical=*/false), Index));
+  CXXScopeSpec SS;
+  ExprResult Fn =
+      S.BuildTemplateIdExpr(SS, SourceLocation(), R, /*RequiresADL=*/false, &Args);
+  if (!Fn.isUsable())
+    return ExprEmpty();
+  Expr *CallArgs[1] = {Input};
+  return S.BuildCallExpr(nullptr, Fn.get(), OpLoc, CallArgs, OpLoc);
+}
+
 // Whether a local of this type is handed over by moving it (cppsh): it has
 // no copy constructor to use.
 bool cppshMoveOnly(Sema &S, QualType T) {
@@ -18585,6 +18639,10 @@ bool Sema::isQualifiedMemberAccess(Expr *E) {
 ExprResult Sema::BuildUnaryOp(Scope *S, SourceLocation OpLoc,
                               UnaryOperatorKind Opc, Expr *Input,
                               bool IsAfterAmp) {
+  // cppsh: `*v` on a std::variant, the value it holds (cppshVariantDeref).
+  if (Opc == UO_Deref)
+    if (ExprResult Held = cppshVariantDeref(*this, OpLoc, Input); !Held.isUnset())
+      return Held;
   // First things first: handle placeholders so that the
   // overloaded-operator check considers the right type.
   if (const BuiltinType *pty = Input->getType()->getAsPlaceholderType()) {
