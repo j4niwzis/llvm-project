@@ -59,6 +59,7 @@
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Basic/TargetBuiltins.h"
 #include "clang/Basic/TargetInfo.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/APFixedPoint.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallBitVector.h"
@@ -91,6 +92,14 @@ llvm::DenseMap<const VarDecl *, const Expr *> CppshParamRebuild;
 // the parameter's Init, which holds its default argument -- uninstantiated,
 // on a specialization, until a call needs it.
 llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
+// Staged code's locals (the function its body is compiled into): their
+// values bound only while the body is instantiated (CppshStagedLive) -- what
+// Sema needs constant -- never as code is generated; one asked for there and
+// not bound is wanted (CppshStagedWanted): the body is instantiated again
+// with it bound.
+llvm::DenseSet<const VarDecl *> CppshStagedTracked;
+bool CppshStagedLive = false;
+llvm::SmallPtrSet<const VarDecl *, 8> CppshStagedWanted;
 } // namespace clang
 using llvm::APFixedPoint;
 using llvm::APInt;
@@ -9828,8 +9837,15 @@ bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
   // to an object holding the value it was specialized on -- or rebuilt from
   // the snapshot of what it refers to.
   // And a staged statement's local, compiled with the value it has as the
-  // statement runs (a reference to the function's object).
-  if (const VarDecl *PVD = VD; !Frame) {
+  // statement runs (a reference to the function's object) -- while its body
+  // is instantiated; one not bound, wanted.
+  const bool CppshStagedLocal =
+      !isa<ParmVarDecl>(VD) && CppshStagedTracked.count(VD);
+  if (CppshStagedLocal && CppshStagedLive && Info.InConstantContext &&
+      !CppshParamValue.count(VD) && !CppshParamRebuild.count(VD))
+    CppshStagedWanted.insert(VD);
+  if (const VarDecl *PVD = VD;
+      !Frame && (!CppshStagedLocal || CppshStagedLive)) {
     const QualType T = VD->getType().getNonReferenceType();
     if (auto Known = CppshParamValue.find(PVD); Known != CppshParamValue.end()) {
       // A temporary of the evaluation, known by the expression naming the

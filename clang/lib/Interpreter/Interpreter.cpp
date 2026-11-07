@@ -51,6 +51,7 @@
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/bit.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ModuleCache.h"
@@ -1426,6 +1427,9 @@ unsigned long long CppshParseNs = 0, CppshExecuteNs = 0;
 extern std::set<const FunctionDecl *> CppshCutFunctions;
 extern llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
 extern llvm::DenseMap<const VarDecl *, const Expr *> CppshParamRebuild;
+extern llvm::DenseSet<const VarDecl *> CppshStagedTracked;
+extern bool CppshStagedLive;
+extern llvm::SmallPtrSet<const VarDecl *, 8> CppshStagedWanted;
 bool cppshMutates(const Stmt *S, const VarDecl *VD);
 extern bool CppshTopNeed;
 extern bool CppshCutNeeded;
@@ -1666,11 +1670,24 @@ static Expr *cppshRebuildAt(Sema &S, QualType T, const void *Object,
 namespace {
 // A staged statement's instantiation for one set of values: its function.
 struct CppshStagedCompiled {
-  llvm::FoldingSetNodeID Values;
+  // The locals whose values it was compiled with -- those its instantiation
+  // wanted constant -- and those values; the staged result's type.
+  SmallVector<unsigned, 4> Wanted;
+  SmallVector<llvm::FoldingSetNodeID, 4> Profiles;
+  QualType Input;
   FunctionDecl *Function = nullptr;
   void *Address = nullptr;
   // A staged function's rest: the type of the result its returns give.
   QualType Result;
+};
+// A local's value as staged code is compiled with it: read from memory
+// (plain data) or rebuilt from its snapshot; its profile, for finding the
+// instantiation compiled with it again.
+struct CppshBound {
+  bool Done = false;
+  std::optional<APValue> Value;
+  Expr *Rebuild = nullptr;
+  llvm::FoldingSetNodeID Profile;
 };
 // Each time a staged function's result is kept: so that a staged statement
 // whose body left by a return knows whether code staged inside it kept one.
@@ -1748,45 +1765,59 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     Types.push_back(T);
   }
 
-  // The values it is compiled with: each local's it does not change.
+  // The values it may be compiled with: each local's, made only where an
+  // instantiation wants it constant -- one the body changes never (it is no
+  // constant there).
   Stmt *Body = SS->getBody();
-  llvm::FoldingSetNodeID Values;
-  SmallVector<std::optional<APValue>, 8> Known(N);
-  SmallVector<Expr *, 8> Rebuilt(N, nullptr);
-  if (!ResultType.isNull())
-    Values.AddPointer(Ctx.getCanonicalType(ResultType).getAsOpaquePtr());
-  for (unsigned I = 0; I < N; ++I) {
+  SmallVector<CppshBound, 8> Bounds(N);
+  auto ValueOf = [&](unsigned I) -> CppshBound & {
+    CppshBound &B = Bounds[I];
+    if (B.Done)
+      return B;
+    B.Done = true;
     const QualType T = Types[I];
-    if (!Objects[I] || cppshMutates(Body, Params[I]) || T->isIncompleteType()) {
-      Values.AddInteger(0u);
-      continue;
+    if (!Objects[I] || T->isIncompleteType() || cppshMutates(Body, Params[I])) {
+      B.Profile.AddInteger(0u);
+      return B;
     }
     if (T.isTriviallyCopyableType(Ctx))
-      Known[I] = cppshValueAt(Ctx, T, static_cast<const unsigned char *>(Objects[I]));
-    if (Known[I]) {
-      Values.AddInteger(1u);
-      Known[I]->Profile(Values);
-      continue;
+      B.Value = cppshValueAt(Ctx, T, static_cast<const unsigned char *>(Objects[I]));
+    if (B.Value) {
+      B.Profile.AddInteger(1u);
+      B.Value->Profile(B.Profile);
+      return B;
     }
     // Not plain data: rebuilt from the snapshot taken of it now.
     if (!T->getAs<PointerType>())
       cppshSnapshotAt(Interp, S, T, Objects[I]);
-    Rebuilt[I] = cppshRebuildAt(S, T, Objects[I], Params[I]->getLocation());
-    if (Rebuilt[I]) {
-      Values.AddInteger(2u);
-      Rebuilt[I]->Profile(Values, Ctx, /*Canonical=*/true);
+    B.Rebuild = cppshRebuildAt(S, T, Objects[I], Params[I]->getLocation());
+    if (B.Rebuild) {
+      B.Profile.AddInteger(2u);
+      B.Rebuild->Profile(B.Profile, Ctx, /*Canonical=*/true);
     } else {
-      Values.AddInteger(0u);
+      B.Profile.AddInteger(0u);
     }
-  }
+    return B;
+  };
 
+  // An instantiation compiled with the values the locals it wanted have now.
   static std::map<const CppshStagedStmt *, std::vector<CppshStagedCompiled>> Compiled;
   static unsigned Count = 0;
   std::vector<CppshStagedCompiled> &Instances = Compiled[Staged];
+  const QualType Input =
+      ResultType.isNull() ? QualType() : Ctx.getCanonicalType(ResultType);
   CppshStagedCompiled *Found = nullptr;
-  for (CppshStagedCompiled &C : Instances)
-    if (C.Values == Values)
+  for (CppshStagedCompiled &C : Instances) {
+    if (C.Input != Input)
+      continue;
+    bool Same = true;
+    for (unsigned K = 0; K < C.Wanted.size() && Same; ++K)
+      Same = ValueOf(C.Wanted[K]).Profile == C.Profiles[K];
+    if (Same) {
       Found = &C;
+      break;
+    }
+  }
 
   // The function around the statement: where its returns go, whose access
   // and `this` it has.
@@ -1797,10 +1828,11 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
   const bool WasNeeded = std::exchange(CppshCutNeeded, false);
   auto RestoreNeeded = llvm::scope_exit([&] { CppshCutNeeded = WasNeeded; });
   // Compiled for these values: `int __cppsh_stagedK(void **frame, void
-  // *slot)`, its body the statement's instantiated.
+  // *slot, int entry)`, its body the statement's instantiated -- first with
+  // no value bound; each local whose value an instantiation wanted constant
+  // bound in the next, until none more is wanted (those attempts quiet, what
+  // they queued dropped); a failure with nothing more wanted reported.
   if (!Found) {
-    if (!cppshReport(Interp.cppshBeginBuild()))
-      return Fail("no unit to compile it in");
     const QualType VoidPtrPtr = Ctx.getPointerType(Ctx.VoidPtrTy);
     // The interpreter's value printing, for a body whose last statement's
     // value is shown.
@@ -1813,92 +1845,177 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
       return *Shown;
     };
     llvm::function_ref<Expr *(Expr *)> PrintValue = PrintValueFn;
-    Sema::CppshStagedRun Run;
-    Run.KeepsResult = Keep;
-    Run.ReturnType = Keep ? QualType() : Outer ? Outer->getReturnType() : Ctx.VoidTy;
-    Run.AccessContext = Around;
-    Run.Staged = SS;
-    FunctionDecl *F = cppshDefineFunction(
-        S, "__cppsh_staged" + std::to_string(Count++), Ctx.IntTy,
-        {VoidPtrPtr, Ctx.VoidPtrTy, Ctx.IntTy},
-        [&](FunctionDecl *Fn, ArrayRef<ParmVarDecl *> Ps) -> Stmt * {
-          Run.Function = Fn;
-          Run.Slot = Ps[1];
-          Run.Entry = Ps[2];
-          Run.PrintValue = PrintValue;
-          // Known to code generation: staged code inside it leaves through
-          // it, and returns its value where its slot points.
-          Fn->addAttr(AnnotateAttr::CreateImplicit(Ctx, "cppsh.staged.run",
-                                                   nullptr, 0, SourceRange()));
-          SmallVector<Stmt *, 16> Stmts;
-          SmallVector<VarDecl *, 8> Locals;
-          // Each local: `T &name = *(T *)frame[I];`, its value bound.
-          for (unsigned I = 0; I < N; ++I) {
-            const QualType RefT = Ctx.getLValueReferenceType(Types[I]);
-            auto *L = VarDecl::Create(Ctx, Fn, Loc, Params[I]->getLocation(),
-                                      Params[I]->getIdentifier(), RefT,
-                                      Ctx.getTrivialTypeSourceInfo(RefT, Loc),
-                                      SC_None);
-            Expr *Ptr = cppshFrameEntry(S, Ps[0], I, Ctx.getPointerType(Types[I]));
-            ExprResult Obj =
-                Ptr ? S.CreateBuiltinUnaryOp(Loc, UO_Deref, Ptr) : ExprError();
-            if (!Obj.isUsable())
+    SmallVector<unsigned, 4> Want;
+    FunctionDecl *F = nullptr;
+    QualType KeptType;
+    for (bool Report = false;;) {
+      if (!cppshReport(Interp.cppshBeginBuild()))
+        return Fail("no unit to compile it in");
+      // A quiet attempt: its diagnostics counted (an error fails it), not
+      // shown.
+      DiagnosticsEngine &Diags = S.getDiagnostics();
+      IgnoringDiagConsumer Quiet;
+      DiagnosticConsumer *const Client = Diags.getClient();
+      const bool OwnsClient = Diags.ownsClient();
+      std::unique_ptr<DiagnosticConsumer> OwnedClient;
+      if (!Report) {
+        OwnedClient = Diags.takeClient();
+        Diags.setClient(&Quiet, /*ShouldOwnClient=*/false);
+      }
+      const size_t PendingBefore = S.PendingInstantiations.size();
+      const size_t LocalPendingBefore = S.PendingLocalImplicitInstantiations.size();
+      llvm::DenseMap<const VarDecl *, unsigned> IndexOf;
+      CppshStagedWanted.clear();
+      Sema::CppshStagedRun Run;
+      Run.KeepsResult = Keep;
+      Run.ReturnType =
+          Keep ? QualType() : Outer ? Outer->getReturnType() : Ctx.VoidTy;
+      Run.AccessContext = Around;
+      Run.Staged = SS;
+      F = cppshDefineFunction(
+          S, "__cppsh_staged" + std::to_string(Count++), Ctx.IntTy,
+          {VoidPtrPtr, Ctx.VoidPtrTy, Ctx.IntTy},
+          [&](FunctionDecl *Fn, ArrayRef<ParmVarDecl *> Ps) -> Stmt * {
+            Run.Function = Fn;
+            Run.Slot = Ps[1];
+            Run.Entry = Ps[2];
+            Run.PrintValue = PrintValue;
+            // Known to code generation: staged code inside it leaves through
+            // it, and returns its value where its slot points.
+            Fn->addAttr(AnnotateAttr::CreateImplicit(Ctx, "cppsh.staged.run",
+                                                     nullptr, 0, SourceRange()));
+            SmallVector<Stmt *, 16> Stmts;
+            SmallVector<VarDecl *, 8> Locals;
+            // Each local: `T &name = *(T *)frame[I];` -- its value bound
+            // where it is wanted.
+            for (unsigned I = 0; I < N; ++I) {
+              const QualType RefT = Ctx.getLValueReferenceType(Types[I]);
+              auto *L = VarDecl::Create(Ctx, Fn, Loc, Params[I]->getLocation(),
+                                        Params[I]->getIdentifier(), RefT,
+                                        Ctx.getTrivialTypeSourceInfo(RefT, Loc),
+                                        SC_None);
+              Expr *Ptr =
+                  cppshFrameEntry(S, Ps[0], I, Ctx.getPointerType(Types[I]));
+              ExprResult Obj =
+                  Ptr ? S.CreateBuiltinUnaryOp(Loc, UO_Deref, Ptr) : ExprError();
+              if (!Obj.isUsable())
+                return nullptr;
+              S.AddInitializerToDecl(L, Obj.get(), /*DirectInit=*/false);
+              if (L->isInvalidDecl())
+                return nullptr;
+              CppshStagedTracked.insert(L);
+              IndexOf[L] = I;
+              if (llvm::is_contained(Want, I)) {
+                CppshBound &B = ValueOf(I);
+                if (B.Value)
+                  CppshParamValue[L] = *B.Value;
+                else if (B.Rebuild)
+                  CppshParamRebuild[L] = B.Rebuild;
+              }
+              StmtResult DS =
+                  S.ActOnDeclStmt(S.ConvertDeclToDeclGroup(L), Loc, Loc);
+              if (!DS.isUsable())
+                return nullptr;
+              Stmts.push_back(DS.get());
+              Locals.push_back(L);
+            }
+            // `this`: `C *__cppsh_this = (C *)frame[N];`.
+            if (SD->usesThis()) {
+              const QualType ThisTy = SS->frame().back()->getType();
+              auto *This = VarDecl::Create(
+                  Ctx, Fn, Loc, Loc, &Idents.get("__cppsh_this"), ThisTy,
+                  Ctx.getTrivialTypeSourceInfo(ThisTy, Loc), SC_None);
+              Expr *Ptr = cppshFrameEntry(S, Ps[0], N, ThisTy);
+              if (!Ptr)
+                return nullptr;
+              S.AddInitializerToDecl(This, Ptr, /*DirectInit=*/false);
+              StmtResult DS =
+                  S.ActOnDeclStmt(S.ConvertDeclToDeclGroup(This), Loc, Loc);
+              if (!DS.isUsable())
+                return nullptr;
+              Stmts.push_back(DS.get());
+              Run.This = This;
+            }
+            // The values bound live while the body is instantiated: what
+            // Sema needs constant -- not as code is generated.
+            const bool WasLive = std::exchange(CppshStagedLive, true);
+            const unsigned ErrorsBefore = Diags.getNumErrors();
+            StmtResult Inst =
+                S.InstantiateCppshStaged(SS, Locals, ResultType, Run);
+            CppshStagedLive = WasLive;
+            cppshEndNeedDiagnostics(S);
+            if (!Inst.isUsable() || Diags.getNumErrors() != ErrorsBefore)
               return nullptr;
-            S.AddInitializerToDecl(L, Obj.get(), /*DirectInit=*/false);
-            if (L->isInvalidDecl())
-              return nullptr;
-            if (Known[I])
-              CppshParamValue[L] = *Known[I];
-            else if (Rebuilt[I])
-              CppshParamRebuild[L] = Rebuilt[I];
-            StmtResult DS = S.ActOnDeclStmt(S.ConvertDeclToDeclGroup(L), Loc, Loc);
-            if (!DS.isUsable())
-              return nullptr;
-            Stmts.push_back(DS.get());
-            Locals.push_back(L);
-          }
-          // `this`: `C *__cppsh_this = (C *)frame[N];`.
-          if (SD->usesThis()) {
-            const QualType ThisTy = SS->frame().back()->getType();
-            auto *This = VarDecl::Create(
-                Ctx, Fn, Loc, Loc, &Idents.get("__cppsh_this"), ThisTy,
-                Ctx.getTrivialTypeSourceInfo(ThisTy, Loc), SC_None);
-            Expr *Ptr = cppshFrameEntry(S, Ps[0], N, ThisTy);
-            if (!Ptr)
-              return nullptr;
-            S.AddInitializerToDecl(This, Ptr, /*DirectInit=*/false);
-            StmtResult DS =
-                S.ActOnDeclStmt(S.ConvertDeclToDeclGroup(This), Loc, Loc);
-            if (!DS.isUsable())
-              return nullptr;
-            Stmts.push_back(DS.get());
-            Run.This = This;
-          }
-          StmtResult Inst = S.InstantiateCppshStaged(SS, Locals, ResultType, Run);
-          cppshEndNeedDiagnostics(S);
-          if (!Inst.isUsable())
-            return nullptr;
-          Stmts.push_back(Inst.get());
-          Stmts.push_back(ReturnStmt::Create(
-              Ctx, Loc,
-              IntegerLiteral::Create(Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), 0),
-                                     Ctx.IntTy, Loc),
-              nullptr));
-          return CompoundStmt::Create(Ctx, Stmts, FPOptionsOverride(), Loc, Loc);
-        });
-    if (F)
-      Interp.cppshAddBuilt(F);
-    if (!cppshReport(Interp.cppshEndBuildAndExecute()) || !F)
-      return Fail("it did not compile for the values it runs with");
+            Stmts.push_back(Inst.get());
+            Stmts.push_back(ReturnStmt::Create(
+                Ctx, Loc,
+                IntegerLiteral::Create(
+                    Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), 0), Ctx.IntTy, Loc),
+                nullptr));
+            return CompoundStmt::Create(Ctx, Stmts, FPOptionsOverride(), Loc, Loc);
+          });
+      if (!Report) {
+        if (OwnsClient)
+          Diags.setClient(OwnedClient.release(), /*ShouldOwnClient=*/true);
+        else
+          Diags.setClient(Client, /*ShouldOwnClient=*/false);
+      }
+      // What it wanted that was not bound: bound next time.
+      bool More = false;
+      for (const VarDecl *VD : CppshStagedWanted)
+        if (auto It = IndexOf.find(VD);
+            It != IndexOf.end() && !llvm::is_contained(Want, It->second)) {
+          Want.push_back(It->second);
+          More = true;
+        }
+      if (F) {
+        Interp.cppshAddBuilt(F);
+        KeptType = Run.ReturnType;
+        if (!cppshReport(Interp.cppshEndBuildAndExecute()))
+          return Fail("it did not compile for the values it runs with");
+        break;
+      }
+      // Not compiled: what it queued for instantiation dropped (each function
+      // so dropped queued again by its next use), the unit ended empty.
+      for (size_t I = PendingBefore; I < S.PendingInstantiations.size(); ++I)
+        if (auto *FD = dyn_cast_or_null<FunctionDecl>(S.PendingInstantiations[I].first);
+            FD && !FD->isDefined()) {
+          if (FunctionTemplateSpecializationInfo *Info =
+                  FD->getTemplateSpecializationInfo())
+            Info->setPointOfInstantiation(SourceLocation());
+          else if (MemberSpecializationInfo *MSI = FD->getMemberSpecializationInfo())
+            MSI->setPointOfInstantiation(SourceLocation());
+        }
+      if (S.PendingInstantiations.size() > PendingBefore)
+        S.PendingInstantiations.resize(PendingBefore);
+      if (S.PendingLocalImplicitInstantiations.size() > LocalPendingBefore)
+        S.PendingLocalImplicitInstantiations.resize(LocalPendingBefore);
+      llvm::consumeError(Interp.cppshEndBuildAndExecute());
+      if (Report)
+        return Fail("it did not compile for the values it runs with");
+      // Nothing more to bind: the failure is the code's -- reported.
+      if (!More)
+        Report = true;
+    }
     llvm::Expected<llvm::orc::ExecutorAddr> Addr =
         Interp.getSymbolAddress(GlobalDecl(F));
     if (!Addr) {
       llvm::consumeError(Addr.takeError());
       return Fail("its compiled function is not found");
     }
-    Instances.push_back({Values, F, Addr->toPtr<void *>(), Run.ReturnType});
+    CppshStagedCompiled C;
+    C.Wanted = Want;
+    for (unsigned I : Want)
+      C.Profiles.push_back(ValueOf(I).Profile);
+    C.Input = Input;
+    C.Function = F;
+    C.Address = Addr->toPtr<void *>();
+    C.Result = KeptType;
+    Instances.push_back(std::move(C));
     Found = &Instances.back();
   }
+  if (!Found->Address)
+    return Fail("its compiled function is not found");
   if (!Found->Address)
     return Fail("its compiled function is not found");
 
