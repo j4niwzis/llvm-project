@@ -414,17 +414,14 @@ bool cppshIsRegion(const FunctionDecl *FD) {
   return false;
 }
 
-// The function a need would be met in: the one being written -- or the
-// staged region (a lambda's call operator, and a template's body) it is in.
+// The function a need would be met in: the one being written -- a lambda's
+// call operator as any other (staged code of it compiled as it runs, as a
+// function's) -- not a template's body (cppshTemplateLocalIn's).
 static FunctionDecl *cppshNeedFunction(Sema &S) {
   FunctionDecl *Inner = S.getCurFunctionDecl(/*AllowLambda=*/true);
-  if (cppshIsRegion(Inner))
-    return Inner;
-  FunctionDecl *Cur = S.getCurFunctionDecl();
-  if (!Cur || isLambdaCallOperator(Cur) || Cur->isDependentContext() ||
-      Inner != Cur)
+  if (!Inner || Inner->isDependentContext())
     return nullptr;
-  return Cur;
+  return Inner;
 }
 
 // The top-level statement (the REPL's) being written, outside any function.
@@ -442,7 +439,6 @@ bool cppshInTopStatement(Sema &S) { return cppshTopStatement(S) != nullptr; }
 const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E) {
   FunctionDecl *Cur = S.getCurFunctionDecl(/*AllowLambda=*/true);
   if (!E || !Cur || !E->isValueDependent() || !Cur->isDependentContext() ||
-      (isLambdaCallOperator(Cur) && !cppshIsRegion(Cur)) ||
       !cppshInUserInput(S, Cur->getLocation()))
     return nullptr;
   auto Find = [&](const Stmt *X, auto &Self) -> const VarDecl * {
@@ -501,7 +497,6 @@ void cppshNeedForTemplateCall(Sema &S, Expr *Fn, ArrayRef<Expr *> Args) {
   auto *ULE = dyn_cast<UnresolvedLookupExpr>(Fn->IgnoreParens());
   FunctionDecl *Cur = S.getCurFunctionDecl(/*AllowLambda=*/true);
   if (!ULE || !Cur || !Cur->isDependentContext() ||
-      (isLambdaCallOperator(Cur) && !cppshIsRegion(Cur)) ||
       !cppshInUserInput(S, Cur->getLocation()))
     return;
   for (unsigned I = 0; I < Args.size(); ++I) {

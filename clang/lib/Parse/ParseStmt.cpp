@@ -1178,17 +1178,14 @@ static size_t CppshRangeBase = 0;
 
 SourceLocation &Parser::CppshTopBodyOpen() { return CppshBodyOpen; }
 
-// Whether a need met in a block parsed in this scope makes a staged region:
-// in the body of a function (not a lambda's, but a region's), or of a
-// top-level statement.
+// Whether a need met in a block parsed in this scope makes staged code: in
+// the body of a function -- a lambda's as any -- or of a top-level statement.
 
 static bool cppshCutsIn(Sema &S, Scope *Sc) {
-  FunctionDecl *FD = S.getCurFunctionDecl();
   FunctionDecl *Inner = S.getCurFunctionDecl(/*AllowLambda=*/true);
-  // A top-level statement's blocks too: no function, a staged region alike.
+  // A top-level statement's blocks too: no function, staged code alike.
   const bool Top = !Inner && cppshInTopStatement(S);
-  if ((!FD && !Top) || (FD && Inner != FD && !cppshIsRegion(Inner)) ||
-      CppshBodyOpen.isInvalid())
+  if ((!Inner && !Top) || CppshBodyOpen.isInvalid())
     return false;
   while (Sc && !(Sc->getFlags() & Scope::FnScope))
     Sc = Sc->getParent();
