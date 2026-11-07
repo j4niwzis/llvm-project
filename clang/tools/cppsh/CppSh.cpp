@@ -54,6 +54,7 @@
 #include <pwd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 #endif
 
@@ -1499,6 +1500,20 @@ int main(int argc, const char **argv) {
   }
 
   if (OptInputs.empty()) {
+#if !defined(_WIN32)
+    // A shell with job control, as bash is one: Ctrl+Z, and reading or
+    // setting the terminal from the background, are for the jobs it runs,
+    // not for it (they get them back as defaults when spawned); and it is
+    // the terminal's foreground group of its own while at its prompt.
+    if (::isatty(0)) {
+      ::signal(SIGTSTP, SIG_IGN);
+      ::signal(SIGTTIN, SIG_IGN);
+      ::signal(SIGTTOU, SIG_IGN);
+      if (::getpgrp() != ::getpid())
+        ::setpgid(0, 0);
+      ::tcsetpgrp(0, ::getpgrp());
+    }
+#endif
     llvm::LineEditor LE("cppsh");
     std::string Input;
     bool LastFailed = false;

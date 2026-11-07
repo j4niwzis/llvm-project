@@ -45,6 +45,7 @@
 #  include <signal.h>
 #  include <spawn.h>
 #  include <sys/wait.h>
+#  include <termios.h>
 #  include <thread>
 #  include <unistd.h>
 extern "C" char **environ;
@@ -1036,8 +1037,13 @@ inline pid_t __cppsh_spawn(const std::vector<std::string> &argv, int in, int out
 }
 
 // The terminal given to a foreground group while it runs, and taken back.
+// Its modes too, as the shell had them: what a job set on the terminal (a
+// pager raw, an editor without echo) and left so when it stopped or died is
+// not the prompt's.
 struct __cppsh_foreground {
   bool tty = ::isatty(0);
+  termios modes{};
+  bool have_modes = tty && ::tcgetattr(0, &modes) == 0;
   explicit __cppsh_foreground(pid_t group) {
     if (tty && group > 0)
       ::tcsetpgrp(0, group);
@@ -1048,6 +1054,8 @@ struct __cppsh_foreground {
     // Taking it back from the background is a SIGTTOU: ignored for that.
     void (*was)(int) = ::signal(SIGTTOU, SIG_IGN);
     ::tcsetpgrp(0, ::getpgrp());
+    if (have_modes)
+      ::tcsetattr(0, TCSADRAIN, &modes);
     ::signal(SIGTTOU, was);
   }
 };
