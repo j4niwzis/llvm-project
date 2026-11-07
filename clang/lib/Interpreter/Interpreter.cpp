@@ -2480,6 +2480,28 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
   Parser &P = cppshParser();
   Sema &S = getCompilerInstance()->getSema();
   ASTContext &Ctx = S.Context;
+  if (cppshTraceStaging()) {
+    auto Text = [&](SourceRange R) {
+      return Lexer::getSourceText(CharSourceRange::getTokenRange(R),
+                                  S.getSourceManager(), S.getLangOpts())
+          .str();
+    };
+    llvm::errs() << "cppsh-trace: top-level declaration taken back ("
+                 << (Hoist ? "a staged call" : "run-time template arguments")
+                 << "), tokens " << Begin << ".." << End << "\n";
+    if (Hoist)
+      llvm::errs() << "cppsh-trace:   the call run first: '"
+                   << Text({CppshHoistBegin, CppshHoistEnd}) << "'\n";
+    else
+      for (SourceRange Need : CppshTopNeedExprs)
+        llvm::errs() << "cppsh-trace:   argument run first: '" << Text(Need)
+                     << "'"
+                     << (CppshVariantIndexNeeds.count(
+                             Need.getBegin().getRawEncoding())
+                             ? " (its .index())"
+                             : "")
+                     << "\n";
+  }
   auto Fail = [](llvm::StringRef Why) {
     return llvm::make_error<llvm::StringError>(Why, std::error_code());
   };
