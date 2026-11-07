@@ -1283,8 +1283,20 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   if (!CppshCutNeedVar && CppshCutNeedExprs.empty() && CppshCutStagedCalls.empty())
     return Refuse("nothing it needs is known");
   // Its first parse may be invalid (what the need left unresolved): a
-  // statement, not a declaration, then.
-  const bool Declares = R.isUsable() && isa<DeclStmt>(R.get());
+  // statement, not a declaration, then. Under a label (`case 0: T a;`), the
+  // declaration it labels.
+  const Stmt *Labelled = R.isUsable() ? R.get() : nullptr;
+  while (Labelled) {
+    if (const auto *SC = dyn_cast<SwitchCase>(Labelled))
+      Labelled = SC->getSubStmt();
+    else if (const auto *LS = dyn_cast<LabelStmt>(Labelled))
+      Labelled = LS->getSubStmt();
+    else if (const auto *AS = dyn_cast<AttributedStmt>(Labelled))
+      Labelled = AS->getSubStmt();
+    else
+      break;
+  }
+  const bool Declares = isa_and_nonnull<DeclStmt>(Labelled);
   std::optional<unsigned> B = cppshTokenIndex(Begin);
   // A staged statement's first statement needing a value again: what it
   // needs is no local of it -- another staged statement would be the same.
