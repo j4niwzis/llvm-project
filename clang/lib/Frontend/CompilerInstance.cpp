@@ -2473,6 +2473,27 @@ void CompilerInstance::createModuleFromSource(SourceLocation ImportLoc,
       if (!llvm::sys::fs::rename(ModuleFileName, CachedPcmPath)) {
         BuiltModules[std::string(ModuleName)] =
             std::string(CachedPcmPath.str());
+        // The module built for an earlier compiler or earlier headers is
+        // never read again (the key holds both): gone, rather than 30 MB
+        // left behind for every build of cppsh.
+        SmallString<256> CacheDir(CachedPcmPath);
+        llvm::sys::path::remove_filename(CacheDir);
+        std::string Prefix = (CleanModuleName + "_").str();
+        std::error_code DirEC;
+        for (llvm::sys::fs::directory_iterator It(CacheDir, DirEC), End;
+             It != End && !DirEC; It.increment(DirEC)) {
+          StringRef Name = llvm::sys::path::filename(It->path());
+          if (!Name.starts_with(Prefix) ||
+              !(Name.ends_with(".pcm") || Name.ends_with(".map")))
+            continue;
+          // Not this one, nor a longer module name sharing the prefix
+          // (std_ for std_sh_): the rest is the hash alone.
+          StringRef Hash = Name.drop_front(Prefix.size()).drop_back(4);
+          if (Hash.contains('_') || It->path() == CachedPcmPath.str() ||
+              It->path() == CachedMapPath.str())
+            continue;
+          llvm::sys::fs::remove(It->path());
+        }
         return;
       }
     }
