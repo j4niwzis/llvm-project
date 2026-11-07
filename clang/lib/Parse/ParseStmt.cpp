@@ -1590,6 +1590,19 @@ void Parser::CppshDropPendingSince(const CppshPending &Since) {
     Actions.PendingInstantiations.resize(Since.Global);
   if (Actions.PendingLocalImplicitInstantiations.size() > Since.Local)
     Actions.PendingLocalImplicitInstantiations.resize(Since.Local);
+  // Each function dropped not instantiated as if never used: the next use
+  // (the staged statement's, or its body's as it is compiled at run time)
+  // queues it again -- a point of instantiation set, it would not be.
+  for (const CppshDroppedPending &D : CppshDropped) {
+    auto *FD = dyn_cast_or_null<FunctionDecl>(D.second.first);
+    if (!FD || FD->isDefined())
+      continue;
+    if (FunctionTemplateSpecializationInfo *Info =
+            FD->getTemplateSpecializationInfo())
+      Info->setPointOfInstantiation(SourceLocation());
+    else if (MemberSpecializationInfo *MSI = FD->getMemberSpecializationInfo())
+      MSI->setPointOfInstantiation(SourceLocation());
+  }
 }
 
 namespace {
