@@ -1387,11 +1387,10 @@ ParsedTemplateArgument Parser::ParseTemplateArgument() {
   }
   // cppsh: in a staged region, a run-time template argument of its first
   // statement: supplied by the region's parameter for it (CppshEmitRegion).
-  if (!CppshRegionArgs.empty())
-    if (ParmVarDecl *P = CppshRegionArgs.lookup(
+  if (!CppshSuppliedExprs.empty())
+    if (Expr *Supplied = CppshSuppliedExprs.lookup(
             ExprArg.get()->getBeginLoc().getRawEncoding()))
-      ExprArg = Actions.BuildDeclRefExpr(P, P->getType().getNonReferenceType(),
-                                         VK_LValue, Loc);
+      ExprArg = Supplied;
   // cppsh: in a template's body, an argument naming a local whose value
   // exists only as the function runs: a need now, whatever it is
   // instantiated with (the statement made a staged region).

@@ -60,6 +60,7 @@ extern const FunctionDecl *CppshCutNeedFunction;
 const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E);
 extern std::vector<Expr *> CppshCutNeedExprs;
 extern bool CppshTopNeed;
+extern std::vector<SourceRange> CppshTopNeedExprs;
 bool cppshExprNeedHere(Sema &S, const Expr *E);
 bool cppshTopNeedHere(Sema &S, const Expr *E);
 std::optional<APValue> cppshKnownNeed(Sema &S);
@@ -6887,6 +6888,7 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
     // At the top level: the statement compiled again inside a function.
     if (cppshTopNeedHere(*this, E)) {
       CppshTopNeed = true;
+      CppshTopNeedExprs.push_back(E->getSourceRange());
       Value = APValue(Zero);
       return ConstantExpr::Create(Context, E, Value);
     }

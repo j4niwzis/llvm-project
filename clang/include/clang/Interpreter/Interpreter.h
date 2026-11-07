@@ -167,9 +167,10 @@ public:
   CompilerInstance *getCompilerInstance();
   llvm::Expected<IncrementalExecutor &> getExecutionEngine();
 
-  /// cppsh: one statement as it is, its staging included (ParseAndExecute,
-  /// past the split and the retry of a top-level run-time template argument).
-  llvm::Error cppshParseAndExecuteOnce(llvm::StringRef Code, Value *V);
+  /// cppsh: a top-level declaration taken back for its staging, made ready
+  /// to be parsed again from its recorded tokens [Begin, End), what it needs
+  /// run first (ParseAndExecute).
+  llvm::Error cppshStageDecl(unsigned Begin, unsigned End, bool Hoist);
 
   /// cppsh: code compiled and run as any input is -- its module compiled to
   /// an object file too, returned with the external symbols it defines, for

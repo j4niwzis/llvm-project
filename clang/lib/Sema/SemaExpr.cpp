@@ -123,6 +123,9 @@ std::vector<Expr *> CppshCutStagedCalls;
 // A top-level statement met a run-time template argument: it is compiled
 // again inside a function (Interpreter::ParseAndExecute).
 bool CppshTopNeed = false;
+// Where each of those arguments is: evaluated first, then the declaration
+// parsed again with its value (Interpreter::cppshStageDecl).
+std::vector<SourceRange> CppshTopNeedExprs;
 // The values of those arguments, for the continuation being compiled -- each
 // taken by the next run-time template argument met in it, in order
 // (__cppsh_cut_run sets them).

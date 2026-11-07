@@ -1431,6 +1431,7 @@ extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
 bool cppshMutates(const Stmt *S, const VarDecl *VD);
 extern std::vector<std::string> CppshCutLoopRests;
 extern bool CppshTopNeed;
+extern std::vector<SourceRange> CppshTopNeedExprs;
 extern std::vector<APValue> CppshActiveNeeds;
 extern size_t CppshActiveNeedsTaken;
 extern SourceLocation CppshHoistBegin, CppshHoistEnd;
@@ -1957,372 +1958,130 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
     CppshLastResult = "__cppsh_res" + Tag;
 }
 
-// A shell command at I -- `$(...)`, or a line beginning with `$` -- is one
-// token (the lexer's), nothing in it C++: the offset of its last character,
-// and whether it is a command line (a statement of its own). npos: none.
-static size_t cppshCommandAt(llvm::StringRef Code, size_t I, bool &Line) {
-  Line = false;
-  if (Code[I] != '$' || I + 1 >= Code.size())
-    return llvm::StringRef::npos;
-  if (Code[I + 1] == '(') {
-    int Depth = 1;
-    char Quote = 0;
-    for (size_t J = I + 2; J < Code.size() && Code[J] != '\n'; ++J) {
-      const char D = Code[J];
-      if (Quote) {
-        if (D == '\\' && Quote == '"')
-          ++J;
-        else if (D == Quote)
-          Quote = 0;
-      } else if (D == '\'' || D == '"') {
-        Quote = D;
-      } else if (D == '(') {
-        ++Depth;
-      } else if (D == ')' && --Depth == 0) {
-        return J;
-      }
-    }
-    return llvm::StringRef::npos;
+// An expression parsed from the recorded tokens [Begin, End), compiled and
+// run in a unit of its own: the value it gives kept in a global, __cppsh_vK,
+// where Keep (a run-time template argument's), or discarded (a staged call,
+// which leaves its own result).
+static VarDecl *cppshRunTokens(Interpreter &Interp, unsigned Begin, unsigned End,
+                               bool Keep, bool &Ok) {
+  static unsigned Values = 0;
+  Sema &S = Interp.getCompilerInstance()->getSema();
+  ASTContext &Ctx = S.Context;
+  const SourceLocation Loc;
+  Ok = cppshReport(Interp.cppshBeginBuild());
+  if (!Ok)
+    return nullptr;
+  VarDecl *Value = nullptr;
+  ExprResult E;
+  {
+    TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(S.TUScope);
+    E = Interp.cppshParser().CppshParseTokens(Begin, End);
+    ExprResult Full = E.isUsable() && !Keep
+                          ? S.ActOnFinishFullExpr(E.get(), /*DiscardedValue=*/true)
+                          : ExprError();
+    S.ActOnFinishTopLevelStmtDecl(
+        Stmt, Full.isUsable() ? static_cast<clang::Stmt *>(Full.get())
+                              : new (Ctx) NullStmt(Loc));
+    Interp.cppshAddBuilt(Stmt);
   }
-  const size_t P = I == 0 ? llvm::StringRef::npos : Code.find_last_not_of(" \t", I - 1);
-  if (P != llvm::StringRef::npos && Code[P] != '\n')
-    return llvm::StringRef::npos;
-  if (Code[I + 1] == '\n' || Code[I + 1] == '\r')
-    return llvm::StringRef::npos;
-  Line = true;
-  const size_t E = Code.find('\n', I);
-  return (E == llvm::StringRef::npos ? Code.size() : E) - 1;
+  if (Keep && E.isUsable()) {
+    const QualType T = E.get()->getType().getNonReferenceType().getUnqualifiedType();
+    Value = VarDecl::Create(
+        Ctx, Ctx.getTranslationUnitDecl(), Loc, Loc,
+        &S.getPreprocessor().getIdentifierTable().get("__cppsh_v" +
+                                                      std::to_string(Values++)),
+        T, Ctx.getTrivialTypeSourceInfo(T, Loc), SC_None);
+    S.AddInitializerToDecl(Value, E.get(), /*DirectInit=*/false);
+    S.FinalizeDeclaration(Value);
+    S.PushOnScopeChains(Value, S.TUScope);
+    Interp.cppshAddBuilt(Value);
+  }
+  Ok = cppshReport(Interp.cppshEndBuildAndExecute()) && E.isUsable();
+  return Ok ? Value : nullptr;
 }
 
-// Whether an input may need staging: it holds more than one top-level
-// statement (a `;` at the top, with more after it, outside literals and
-// comments). One statement never needs a value it defines itself.
-static bool cppshSeveralStatements(llvm::StringRef Code) {
-  int Depth = 0;
-  for (size_t I = 0; I < Code.size(); ++I) {
-    char C = Code[I];
-    bool Line = false;
-    if (size_t Last = cppshCommandAt(Code, I, Line); Last != llvm::StringRef::npos) {
-      if (Line && Depth == 0 && !Code.substr(Last + 1).trim().empty())
-        return true;
-      I = Last;
-      continue;
-    }
-    if (C == '"' || (C == '\'' && !(I > 0 && std::isalnum(static_cast<unsigned char>(Code[I - 1]))))) {
-      for (++I; I < Code.size() && Code[I] != C; ++I)
-        if (Code[I] == '\\')
-          ++I;
-      continue;
-    }
-    if (C == '/' && I + 1 < Code.size() && Code[I + 1] == '/') {
-      while (I < Code.size() && Code[I] != '\n')
-        ++I;
-      continue;
-    }
-    if (C == '/' && I + 1 < Code.size() && Code[I + 1] == '*') {
-      size_t End = Code.find("*/", I + 2);
-      I = End == llvm::StringRef::npos ? Code.size() : End + 1;
-      continue;
-    }
-    if (C == '(' || C == '[' || C == '{')
-      ++Depth;
-    else if ((C == ')' || C == ']' || C == '}') && Depth > 0)
-      --Depth;
-    else if (C == ';' && Depth == 0 && !Code.substr(I + 1).trim().empty())
-      return true;
-  }
-  return false;
-}
-
-// Where an input is to be staged, as a probe found it: the offset to run up
-// to (0: nowhere), and the call to hoist there, where one is ([0, 0): none).
-namespace {
-struct CppshStagePlan {
-  size_t Split = 0, HoistBegin = 0, HoistEnd = 0;
-  // Whether there is a stage point at all (Split may be 0: a statement's
-  // own call of a staged function, hoisted before it).
-  bool Staged = false;
-};
-} // namespace
-
-// The probe: the input compiled in a fork of the shell -- never in the
-// session, whose AST and code generator an undone compilation does not leave
-// as they were (an undone function stayed deferred in the code generator, and
-// came back beside its own redefinition) -- its diagnostics nowhere, the
-// stage point and the hoisted call sent back down a pipe.
-static CppshStagePlan cppshProbe(Interpreter &Interp, llvm::StringRef Code) {
-  CppshStagePlan Plan;
-#if defined(_WIN32)
-  (void)Interp;
-  (void)Code;
-  return Plan;
-#else
-  int Fds[2];
-  if (::pipe(Fds) != 0)
-    return Plan;
-  pid_t Child = ::fork();
-  if (Child < 0) {
-    ::close(Fds[0]);
-    ::close(Fds[1]);
-    return Plan;
-  }
-  if (Child == 0) {
-    ::close(Fds[0]);
-    CompilerInstance &CI = *Interp.getCompilerInstance();
-    CI.getDiagnostics().setClient(new IgnoringDiagConsumer(), /*ShouldOwnClient=*/true);
-    CppshStageAt = SourceLocation();
-    CppshHoistBegin = CppshHoistEnd = SourceLocation();
-    if (auto PTU = Interp.Parse(Code); !PTU)
-      llvm::consumeError(PTU.takeError());
-    CppshStagePlan Found;
-    if (CppshStageAt.isValid()) {
-      SourceManager &SM = CI.getSourceManager();
-      SourceLocation Need = SM.getFileLoc(CppshStageAt);
-      FileID In = SM.getFileID(Need);
-      unsigned NeedOffset = SM.getFileOffset(Need);
-      for (SourceLocation Start : CppshTopLevelStarts) {
-        if (Start.isInvalid())
-          continue;
-        Start = SM.getFileLoc(Start);
-        if (SM.getFileID(Start) != In)
-          continue;
-        unsigned Offset = SM.getFileOffset(Start);
-        if (Offset <= NeedOffset && Offset >= Found.Split && Offset < Code.size()) {
-          Found.Split = Offset;
-          Found.Staged = true;
-        }
-      }
-      if (Found.Staged && CppshHoistBegin.isValid() && CppshHoistEnd.isValid()) {
-        SourceLocation B = SM.getFileLoc(CppshHoistBegin), E = SM.getFileLoc(CppshHoistEnd);
-        size_t BOff = SM.getFileOffset(B);
-        size_t EOff = SM.getFileOffset(E) +
-                      Lexer::MeasureTokenLength(E, SM, CI.getLangOpts());
-        if (BOff >= Found.Split && EOff <= Code.size() && BOff < EOff) {
-          Found.HoistBegin = BOff;
-          Found.HoistEnd = EOff;
-        }
-      }
-    }
-    std::string Out = std::to_string(Found.Split) + " " + std::to_string(Found.HoistBegin) +
-                      " " + std::to_string(Found.HoistEnd) + " " +
-                      std::to_string(Found.Staged ? 1 : 0) + "\n";
-    ssize_t Ignored = ::write(Fds[1], Out.data(), Out.size());
-    (void)Ignored;
-    ::_exit(0);
-  }
-  ::close(Fds[1]);
-  std::string Got;
-  char Buf[128];
-  for (;;) {
-    ssize_t N = ::read(Fds[0], Buf, sizeof Buf);
-    if (N < 0 && errno == EINTR)
-      continue;
-    if (N <= 0)
-      break;
-    Got.append(Buf, static_cast<size_t>(N));
-  }
-  ::close(Fds[0]);
-  while (::waitpid(Child, nullptr, 0) < 0 && errno == EINTR) {
-  }
-  unsigned long long S = 0, B = 0, E = 0, T = 0;
-  if (std::sscanf(Got.c_str(), "%llu %llu %llu %llu", &S, &B, &E, &T) == 4) {
-    Plan.Split = S;
-    Plan.HoistBegin = B;
-    Plan.HoistEnd = E;
-    Plan.Staged = T != 0;
-  }
-  return Plan;
-#endif
-}
-
-// The top-level statements of an input, as written: split at a ';' outside
-// brackets, literals and comments -- not before an `else` (an if's statement
-// with its else), nor inside `do ... while (...);`.
-static std::vector<llvm::StringRef> cppshStatements(llvm::StringRef Code) {
-  std::vector<llvm::StringRef> Out;
-  auto word = [&](size_t I, llvm::StringRef W) {
-    if (!Code.substr(I).starts_with(W))
-      return false;
-    size_t E = I + W.size();
-    auto Ident = [](char C) { return std::isalnum(static_cast<unsigned char>(C)) || C == '_'; };
-    return !(I > 0 && Ident(Code[I - 1])) && !(E < Code.size() && Ident(Code[E]));
+// A top-level declaration taken back for its staging, made ready to be parsed
+// again from its tokens -- [Begin, End) of the recorded ones -- with what it
+// needed supplied: a staged function's call it made (Hoist), run first, its
+// result in its place; each run-time template argument of it, evaluated
+// first, its value in its place.
+llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist) {
+  Parser &P = cppshParser();
+  Sema &S = getCompilerInstance()->getSema();
+  ASTContext &Ctx = S.Context;
+  auto Fail = [](llvm::StringRef Why) {
+    return llvm::make_error<llvm::StringError>(Why, std::error_code());
   };
-  auto nextWordAt = [&](size_t I) {
-    while (I < Code.size() && std::isspace(static_cast<unsigned char>(Code[I])))
-      ++I;
-    return I;
-  };
-  int Depth = 0, OpenDo = 0;
-  size_t Begin = 0;
-  for (size_t I = 0; I < Code.size(); ++I) {
-    char C = Code[I];
-    bool Line = false;
-    if (size_t Last = cppshCommandAt(Code, I, Line); Last != llvm::StringRef::npos) {
-      if (Line && Depth == 0 && OpenDo == 0) {
-        if (!Code.slice(Begin, Last + 1).trim().empty())
-          Out.push_back(Code.slice(Begin, Last + 1));
-        Begin = Last + 1;
-      }
-      I = Last;
-      continue;
-    }
-    if (C == '"' || (C == '\'' && !(I > 0 && std::isalnum(static_cast<unsigned char>(Code[I - 1]))))) {
-      for (++I; I < Code.size() && Code[I] != C; ++I)
-        if (Code[I] == '\\')
-          ++I;
-      continue;
-    }
-    if (C == '/' && I + 1 < Code.size() && Code[I + 1] == '/') {
-      while (I < Code.size() && Code[I] != '\n')
-        ++I;
-      continue;
-    }
-    if (C == '/' && I + 1 < Code.size() && Code[I + 1] == '*') {
-      size_t End = Code.find("*/", I + 2);
-      I = End == llvm::StringRef::npos ? Code.size() : End + 1;
-      continue;
-    }
-    if (C == '(' || C == '[' || C == '{')
-      ++Depth;
-    else if ((C == ')' || C == ']' || C == '}') && Depth > 0)
-      --Depth;
-    else if (Depth == 0 && word(I, "do"))
-      ++OpenDo;
-    else if (Depth == 0 && word(I, "while") && OpenDo > 0)
-      --OpenDo;
-    else if (C == ';' && Depth == 0 && OpenDo == 0 && !word(nextWordAt(I + 1), "else")) {
-      if (!Code.slice(Begin, I + 1).trim().empty())
-        Out.push_back(Code.slice(Begin, I + 1));
-      Begin = I + 1;
+  if (Hoist) {
+    std::optional<unsigned> B = cppshTokenIndex(CppshHoistBegin);
+    std::optional<unsigned> E = cppshTokenIndex(CppshHoistEnd);
+    const SourceLocation At = CppshHoistBegin;
+    if (!B || !E)
+      return Fail("cppsh: the staged call's tokens are not known");
+    CppshLastResult.clear();
+    CppshInHoist = true;
+    bool Ok = false;
+    cppshRunTokens(*this, *B, *E + 1, /*Keep=*/false, Ok);
+    CppshInHoist = false;
+    if (!Ok)
+      return Fail("cppsh: the staged call failed");
+    LookupResult R(S, &S.getPreprocessor().getIdentifierTable().get(CppshLastResult),
+                   SourceLocation(), Sema::LookupOrdinaryName);
+    auto *Result = !CppshLastResult.empty() &&
+                           S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl())
+                       ? R.getAsSingle<VarDecl>()
+                       : nullptr;
+    if (!Result)
+      return Fail("cppsh: the staged call left no result");
+    P.CppshSuppliedExprs[At.getRawEncoding()] = S.BuildDeclRefExpr(
+        Result, Result->getType().getNonReferenceType(), VK_LValue, At);
+  } else {
+    for (SourceRange Need : CppshTopNeedExprs) {
+      std::optional<unsigned> B = cppshTokenIndex(Need.getBegin());
+      std::optional<unsigned> E = cppshTokenIndex(Need.getEnd());
+      if (!B || !E)
+        return Fail("cppsh: the run-time template argument's tokens are not known");
+      bool Ok = false;
+      VarDecl *Value = cppshRunTokens(*this, *B, *E + 1, /*Keep=*/true, Ok);
+      std::optional<APValue> Now = Value ? cppshRuntimeValueOf(Value) : std::nullopt;
+      if (!Now || !Now->isInt())
+        return Fail("cppsh: the run-time template argument gave no integer");
+      const QualType T = Value->getType();
+      P.CppshSuppliedExprs[Need.getBegin().getRawEncoding()] =
+          IntegerLiteral::Create(Ctx, Now->getInt(), T, Need.getBegin());
     }
   }
-  if (!Code.substr(Begin).trim().empty())
-    Out.push_back(Code.substr(Begin));
-  return Out;
+  P.CppshRewind(Begin, End);
+  return llvm::Error::success();
 }
 
-// Whether an input holds a preprocessor directive (a line beginning with
-// `#`): its statements are not split -- an #if may open in one and close in
-// another (the interpreter's own runtime prelude does).
-static bool cppshHasDirective(llvm::StringRef Code) {
-  llvm::SmallVector<llvm::StringRef, 16> Lines;
-  Code.split(Lines, '\n');
-  return llvm::any_of(Lines, [](llvm::StringRef L) { return L.ltrim().starts_with("#"); });
-}
-
-// Whether an input names a function known to be staged (cut), or one of the
-// user's own (declared in what they typed) -- which becomes staged only as
-// its call is instantiated (an auto parameter): a call of it at the top level
-// is hoisted, run on its own, its result put in its place. The library's
-// functions are never staged.
-static bool cppshMentionsStaged(Sema &S, llvm::StringRef Code) {
-  ASTContext &Ctx = S.getASTContext();
-  SourceManager &SM = S.getSourceManager();
-  auto Ident = [](char C) { return std::isalnum(static_cast<unsigned char>(C)) || C == '_'; };
-  for (size_t I = 0; I < Code.size();) {
-    if (!Ident(Code[I]) || std::isdigit(static_cast<unsigned char>(Code[I])) ||
-        (I > 0 && (Ident(Code[I - 1]) || Code[I - 1] == '.'))) {
-      ++I;
-      continue;
-    }
-    size_t J = I;
-    while (J < Code.size() && Ident(Code[J]))
-      ++J;
-    if (Code.slice(I, J).starts_with("__cppsh_top")) {
-      I = J;
-      continue;
-    }
-    LookupResult R(S, &Ctx.Idents.get(Code.slice(I, J)), SourceLocation(),
-                   Sema::LookupOrdinaryName);
-    R.suppressDiagnostics();
-    if (S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl()))
-      for (NamedDecl *D : R) {
-        D = D->getUnderlyingDecl();
-        if (!isa<FunctionDecl, FunctionTemplateDecl>(D))
-          continue;
-        SourceLocation L = SM.getFileLoc(D->getLocation());
-        if (L.isValid() && SM.getBufferName(L).starts_with("input_line_"))
-          return true;
-      }
-    I = J;
-  }
-  for (const FunctionDecl *FD : CppshCutFunctions) {
-    if (!FD->getIdentifier())
-      continue;
-    llvm::StringRef Name = FD->getName();
-    for (size_t At = Code.find(Name); At != llvm::StringRef::npos;
-         At = Code.find(Name, At + 1)) {
-      auto Ident = [](char C) { return std::isalnum(static_cast<unsigned char>(C)) || C == '_'; };
-      size_t End = At + Name.size();
-      if (!(At > 0 && Ident(Code[At - 1])) && !(End < Code.size() && Ident(Code[End])))
-        return true;
-    }
-  }
-  return false;
-}
-
-// Staged: where the value specialization needs the value of a variable an
-// input defines, or the result of a staged function it calls (as a probe
-// finds out, in a fork), the input is run up to the top-level declaration
-// holding that need -- staged itself, as it may need its own -- a hoisted
-// call run on its own and its result put in its place, and the rest compiled
-// then, the values known: `o = read_opts(); ls o | take 2` on one line, a
-// script, alike. Each piece is compiled in the session once, for real.
+// Code run as the user typed it: its top-level declarations one at a time --
+// each compiled and run before the next is parsed, so that each sees the
+// values the ones before it made. One that needs the result of a staged
+// function's call, or the value of a run-time template argument, of its own
+// is taken back, what it needs run, and parsed again with it supplied.
 llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
-  // Several top-level statements: each compiled and run in turn, so that
-  // each sees what the ones before it made -- their values known as it is
-  // compiled, no stage point to find, nothing parsed twice. (Not for what
-  // the interpreter lays out itself: a continuation is whole.)
-  if (!CppshNoProbe && cppshSeveralStatements(Code) && !cppshHasDirective(Code)) {
-    for (llvm::StringRef Statement : cppshStatements(Code))
-      if (llvm::Error Err = ParseAndExecute(Statement, V))
+  if (DeviceParser) {
+    auto PTU = Parse(Code);
+    if (!PTU)
+      return PTU.takeError();
+    if (PTU->TheModule)
+      if (llvm::Error Err = Execute(*PTU))
         return Err;
+    if (LastValue.isValid()) {
+      if (!V) {
+        LastValue.dump();
+        LastValue.clear();
+      } else
+        *V = std::move(LastValue);
+    }
     return llvm::Error::success();
   }
-  // A top-level statement that met a run-time template argument: compiled
-  // again inside a function -- a need there, staged as in any. A plain
-  // statement its body; an expression shown its return; `x = init` its
-  // initializer a function's result, the call hoisted as any staged one.
-  if (!CppshNoProbe) {
-    CppshTopNeed = false;
-    llvm::Error Err = cppshParseAndExecuteOnce(Code, V);
-    if (!CppshTopNeed)
-      return Err;
-    llvm::consumeError(std::move(Err));
-    CppshTopNeed = false;
-    static unsigned Inits = 0;
-    llvm::StringRef S = Code.trim();
-    std::string Wrapped;
-    size_t Eq = S.find('=');
-    bool IsInit = S.ends_with(";") && Eq != llvm::StringRef::npos && Eq > 0 &&
-                  !S.substr(Eq).starts_with("==") &&
-                  llvm::all_of(S.take_front(Eq).trim(), [](char C) {
-                    return std::isalnum(static_cast<unsigned char>(C)) || C == '_';
-                  });
-    if (IsInit) {
-      std::string Name = "__cppsh_init" + std::to_string(Inits++);
-      Wrapped = "auto " + Name + "() { return (" +
-                S.substr(Eq + 1).drop_back().trim().str() + "); }\n" +
-                S.take_front(Eq).trim().str() + " = " + Name + "();";
-    } else if (S.ends_with(";")) {
-      std::string Name = "__cppsh_topstmt" + std::to_string(Inits++);
-      Wrapped = "auto " + Name + "() {\n" + S.str() + "\n}\n" + Name + "();";
-    } else {
-      std::string Name = "__cppsh_init" + std::to_string(Inits++);
-      Wrapped = "auto " + Name + "() { return (" + S.str() + "); }\n" + Name + "()";
-    }
-    return ParseAndExecute(Wrapped, V);
-  }
-  return cppshParseAndExecuteOnce(Code, V);
-}
-
-// One statement as it is (ParseAndExecute: the rest of it).
-llvm::Error Interpreter::cppshParseAndExecuteOnce(llvm::StringRef Code, Value *V) {
-  // (A top-level loop, if, switch or block needs no function around it: a
-  // need in it makes a staged region, as in a function's body.)
-  // The input as staging rewrites it: a hoisted call replaced by its result.
-  std::string Rewritten;
-  for (;;) {
+  if (llvm::Error Err = IncrParser->BeginInput(Code))
+    return Err;
+  Parser &P = cppshParser();
+  unsigned Redos = 0;
+  for (bool First = true;;) {
     // Off while it runs: what it compiles (the snapshots) names the same
     // variables, and would snapshot them again, without end.
     if (auto *Hook = CppshBeforeChunk) {
@@ -2330,73 +2089,77 @@ llvm::Error Interpreter::cppshParseAndExecuteOnce(llvm::StringRef Code, Value *V
       Hook(*this, Code);
       CppshBeforeChunk = Hook;
     }
-
-    // A statement calling a function already known to be staged: the probe
-    // finds the call, to be run on its own first and its result put in its
-    // place. Nothing else needs one.
-    CppshStagePlan Plan;
-    if (!CppshNoProbe && cppshMentionsStaged(getCompilerInstance()->getSema(), Code))
-      Plan = (++CppshProbes, cppshProbe(*this, Code));
-    const bool Hoisting = Plan.HoistEnd > Plan.HoistBegin;
-
-    if (!Plan.Staged || (Plan.Split == 0 && !Hoisting)) {
-      // As it is: compiled, run, its value shown.
-      auto Started = std::chrono::steady_clock::now();
-      auto Since = [&] {
-        auto Now = std::chrono::steady_clock::now();
-        unsigned long long Ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(Now - Started).count();
-        Started = Now;
-        return Ns;
-      };
-      auto PTU = Parse(Code);
-      CppshParseNs += Since();
-      if (!PTU)
-        return PTU.takeError();
-      if (PTU->TheModule) {
-        llvm::Error Err = Execute(*PTU);
-        CppshExecuteNs += Since();
-        if (Err)
-          return Err;
-      }
-      if (LastValue.isValid()) {
-        if (!V) {
-          // What the input's own code wrote (stdio, buffered where the
-          // output is a pipe or a file) first, then the value (llvm::outs):
-          // otherwise the value came out before what was printed ahead of it.
-          std::fflush(nullptr);
-          LastValue.dump();
-          llvm::outs().flush();
-          LastValue.clear();
-        } else
-          *V = std::move(LastValue);
-      }
-      return llvm::Error::success();
+    CppshStageAt = SourceLocation();
+    CppshHoistBegin = CppshHoistEnd = SourceLocation();
+    CppshTopNeed = false;
+    CppshTopNeedExprs.clear();
+    auto Started = std::chrono::steady_clock::now();
+    auto Since = [&] {
+      auto Now = std::chrono::steady_clock::now();
+      unsigned long long Ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(Now - Started).count();
+      Started = Now;
+      return Ns;
+    };
+    bool Done = false;
+    llvm::Expected<TranslationUnitDecl *> TU =
+        IncrParser->ParseNextTopLevel(First, Done);
+    First = false;
+    CppshParseNs += Since();
+    if (Done) {
+      if (!TU)
+        return TU.takeError();
+      break;
     }
-
-    // What comes before the need, run first.
-    if (Plan.Split > 0)
-      if (llvm::Error Err = ParseAndExecute(Code.substr(0, Plan.Split), nullptr))
+    const bool Hoist = CppshHoistBegin.isValid() && CppshHoistEnd.isValid();
+    if (!TU && (Hoist || CppshTopNeed) && Redos++ < 4) {
+      llvm::consumeError(TU.takeError());
+      std::optional<unsigned> Begin =
+          CppshTopLevelStarts.empty() ? std::nullopt
+                                      : cppshTokenIndex(CppshTopLevelStarts.back());
+      std::optional<unsigned> End =
+          P.getCurToken().is(tok::eof)
+              ? std::optional<unsigned>(CppshInputTokens.size())
+              : cppshTokenIndex(P.getCurToken().getLocation());
+      llvm::Error Err = Begin && End && *Begin < *End
+                            ? cppshStageDecl(*Begin, *End, Hoist)
+                            : llvm::make_error<llvm::StringError>(
+                                  "cppsh: the declaration's tokens are not known",
+                                  std::error_code());
+      if (Err) {
+        IncrParser->SkipInput();
         return Err;
-
-    // A call of a staged function the need was: run on its own, its result
-    // -- the continuation's global -- in its place for the rest.
-    std::string Rest = Code.substr(Plan.Split).str();
-    if (Plan.HoistEnd > Plan.HoistBegin) {
-      std::string Call = Code.substr(Plan.HoistBegin, Plan.HoistEnd - Plan.HoistBegin).str();
-      CppshLastResult.clear();
-      CppshInHoist = true;
-      llvm::Error Err = ParseAndExecute(Call + ";", nullptr);
-      CppshInHoist = false;
-      if (Err)
-        return Err;
-      if (!CppshLastResult.empty())
-        Rest = Rest.substr(0, Plan.HoistBegin - Plan.Split) + CppshLastResult +
-               Rest.substr(Plan.HoistEnd - Plan.Split);
+      }
+      continue;
     }
-    Rewritten = std::move(Rest);
-    Code = Rewritten;
+    Redos = 0;
+    P.CppshSuppliedExprs.clear();
+    if (!TU) {
+      IncrParser->SkipInput();
+      return TU.takeError();
+    }
+    PartialTranslationUnit &PTU = IncrParser->RegisterPTU(*TU);
+    if (PTU.TheModule) {
+      llvm::Error Err = Execute(PTU);
+      CppshExecuteNs += Since();
+      if (Err) {
+        IncrParser->SkipInput();
+        return Err;
+      }
+    }
+    if (LastValue.isValid()) {
+      if (!V) {
+        // What the input's own code wrote (stdio, buffered where the output
+        // is a pipe or a file) first, then the value (llvm::outs).
+        std::fflush(nullptr);
+        LastValue.dump();
+        llvm::outs().flush();
+        LastValue.clear();
+      } else
+        *V = std::move(LastValue);
+    }
   }
+  return llvm::Error::success();
 }
 
 llvm::Expected<llvm::orc::ExecutorAddr>

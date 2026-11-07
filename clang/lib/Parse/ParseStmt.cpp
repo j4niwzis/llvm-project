@@ -2023,10 +2023,11 @@ ExprResult Parser::ParseCppshRegionLambda(ArrayRef<CppshCutLocal> Frame,
 
   // Its code: the arguments of the statement's run-time template arguments
   // its parameters; a need met in it a region of its own.
-  auto SavedArgs = std::exchange(CppshRegionArgs, {});
+  auto SavedArgs = std::exchange(CppshSuppliedExprs, {});
   for (size_t I = 0; I < NeedLocs.size(); ++I)
-    if (NeedParams[I])
-      CppshRegionArgs[NeedLocs[I].getRawEncoding()] = NeedParams[I];
+    if (ParmVarDecl *Param = NeedParams[I])
+      CppshSuppliedExprs[NeedLocs[I].getRawEncoding()] = Actions.BuildDeclRefExpr(
+          Param, Param->getType().getNonReferenceType(), VK_LValue, NeedLocs[I]);
   const std::optional<unsigned> SavedRegionBegin =
       std::exchange(CppshRegionBegin, Begin);
   const SourceLocation SavedOpen = std::exchange(CppshBodyOpen, Loc);
@@ -2046,7 +2047,7 @@ ExprResult Parser::ParseCppshRegionLambda(ArrayRef<CppshCutLocal> Frame,
     Body = Actions.ActOnCompoundStmt(Loc, CppshInputTokens[End - 1].getEndLoc(),
                                      Stmts, /*isStmtExpr=*/false);
   }
-  CppshRegionArgs = std::move(SavedArgs);
+  CppshSuppliedExprs = std::move(SavedArgs);
   CppshRegionBegin = SavedRegionBegin;
   CppshBodyOpen = SavedOpen;
   CppshRangeBase = SavedRangeBase;
@@ -2091,6 +2092,28 @@ void Parser::ParseCppshRegionStatements(StmtVector &Stmts, unsigned Begin,
   }
   ConciseEndReplay(Mark);
   CppshReplayEnd = SavedEnd;
+}
+
+ExprResult Parser::CppshParseTokens(unsigned Begin, unsigned End) {
+  if (Begin >= End || End > CppshInputTokens.size())
+    return ExprError();
+  const void *Mark = &Begin;
+  ConciseReplay(ArrayRef<Token>(CppshInputTokens).slice(Begin, End - Begin), Mark);
+  ExprResult E = ParseExpression();
+  ConciseEndReplay(Mark);
+  return E;
+}
+
+void Parser::CppshRewind(unsigned Begin, unsigned End) {
+  if (Begin >= End || End > CppshInputTokens.size())
+    return;
+  ArrayRef<Token> Toks = ArrayRef<Token>(CppshInputTokens).slice(Begin, End - Begin);
+  auto Buf = std::make_unique<Token[]>(Toks.size() + 1);
+  llvm::copy(Toks, Buf.get());
+  Buf[Toks.size()] = Tok;
+  PP.EnterTokenStream(std::move(Buf), Toks.size() + 1,
+                      /*DisableMacroExpansion=*/true, /*IsReinject=*/true);
+  ConsumeAnyToken(/*ConsumeCodeCompletionTok=*/true);
 }
 
 void Parser::CppshRegionError(SourceLocation Loc) {

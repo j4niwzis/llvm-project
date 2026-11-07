@@ -69,6 +69,13 @@ public:
   /// cppsh: the parser, for code built from recorded tokens.
   Parser &getParser() { return *P; }
 
+  /// cppsh: an input parsed one top-level declaration at a time, each a unit
+  /// of its own -- begun, then each in turn (Done once there is none left);
+  /// the rest of it skipped where one failed.
+  llvm::Error BeginInput(llvm::StringRef Input);
+  llvm::Expected<TranslationUnitDecl *> ParseNextTopLevel(bool First, bool &Done);
+  void SkipInput();
+
   /// cppsh: a unit built by Sema rather than parsed -- begun, each
   /// declaration of it handed over, then finished as a parsed one is.
   llvm::Error BeginBuild();
@@ -93,6 +100,8 @@ private:
 
   /// The consumer rejected a declaration of the unit being built.
   bool ConsumerFailed = false;
+  /// Parsing an input one top-level declaration at a time, past its first.
+  bool StepwiseInput = false;
   /// The instantiation scopes of the unit being built.
   std::optional<Sema::GlobalEagerInstantiationScope> BuildGlobalInstantiations;
   std::optional<Sema::LocalEagerInstantiationScope> BuildLocalInstantiations;

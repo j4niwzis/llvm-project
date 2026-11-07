@@ -2409,11 +2409,10 @@ Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
         // cppsh: in a staged region, the call of a staged function its first
         // statement made: the value it gave, the region's parameter for it
         // (Parser::CppshEmitRegion).
-        if (!CppshRegionArgs.empty() && LHS.isUsable())
-          if (ParmVarDecl *P = CppshRegionArgs.lookup(
+        if (!CppshSuppliedExprs.empty() && LHS.isUsable())
+          if (Expr *Supplied = CppshSuppliedExprs.lookup(
                   LHS.get()->getBeginLoc().getRawEncoding()))
-            LHS = Actions.BuildDeclRefExpr(P, P->getType().getNonReferenceType(),
-                                           VK_LValue, LHS.get()->getBeginLoc());
+            LHS = Supplied;
       }
 
       break;
