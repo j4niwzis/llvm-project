@@ -63,7 +63,6 @@ extern bool CppshTopNeed;
 extern std::vector<SourceRange> CppshTopNeedExprs;
 bool cppshExprNeedHere(Sema &S, const Expr *E);
 bool cppshTopNeedHere(Sema &S, const Expr *E);
-std::optional<APValue> cppshKnownNeed(Sema &S);
 } // namespace clang
 using namespace sema;
 
@@ -6867,14 +6866,6 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
   // class, variable or alias template alike.
   if (CCE == CCEKind::TemplateArg && T->isIntegralOrEnumerationType()) {
     llvm::APSInt Zero(Context.getIntWidth(T), T->isUnsignedIntegerOrEnumerationType());
-    // In a continuation: the value the cut handed over, in order.
-    if (std::optional<APValue> Known = cppshKnownNeed(*this); Known && Known->isInt()) {
-      llvm::APSInt V = Known->getInt();
-      V = V.extOrTrunc(Context.getIntWidth(T));
-      V.setIsUnsigned(T->isUnsignedIntegerOrEnumerationType());
-      Value = APValue(V);
-      return ConstantExpr::Create(Context, E, Value);
-    }
     // In a function body: a need -- evaluated where the body is cut, handed
     // over in the frame; meanwhile a zero, the statement being dropped.
     if (cppshExprNeedHere(*this, E)) {

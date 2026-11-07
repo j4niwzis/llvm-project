@@ -101,15 +101,13 @@ extern llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
 // ParseAndExecute).
 SourceLocation CppshStageAt;
 
-// Staged functions (cppsh): a function body is cut where the value
-// specialization needs the value of a local of it -- or a call of it calls a
-// staged function -- which only running it gives. The parser cuts the body's
-// outermost block at the statement that needed it (CppshCutNeeded, set here
-// while that statement is analysed, its diagnostics held off until then:
-// what it gives without the value is not what it will be), keeps the rest as
-// text, and returns from there through std::sh::__cppsh_cut, which compiles
-// and runs the rest with the locals' values known (a continuation). The
-// cuts: the rest of each body, and its live locals' names and types.
+// Staged regions (cppsh): a statement needs a value only running its function
+// gives -- a local's, a run-time template argument's, a staged function's
+// result (CppshCutNeeded, set here while the statement is analysed, its
+// diagnostics held off until then: what it gives without the value is not
+// what it will be). The parser makes the code from it a staged region,
+// instantiated with the values as the function runs (Parser::
+// CppshEmitRegion).
 bool CppshCutNeeded = false;
 // The local whose value the need is for; none for a staged call.
 const VarDecl *CppshCutNeedVar = nullptr;
@@ -126,21 +124,11 @@ bool CppshTopNeed = false;
 // Where each of those arguments is: evaluated first, then the declaration
 // parsed again with its value (Interpreter::cppshStageDecl).
 std::vector<SourceRange> CppshTopNeedExprs;
-// The values of those arguments, for the continuation being compiled -- each
-// taken by the next run-time template argument met in it, in order
-// (__cppsh_cut_run sets them).
-std::vector<APValue> CppshActiveNeeds;
-size_t CppshActiveNeedsTaken = 0;
 
 // The function the need arose in: the one whose type is not deduced from
 // the return the cut replaces (SemaStmt).
 const FunctionDecl *CppshCutNeedFunction = nullptr;
 std::set<const FunctionDecl *> CppshCutFunctions;
-std::vector<std::string> CppshCutRemainders;
-// Per cut: where it was made in a loop, the loop run on from its next step,
-// and what follows it (__cppsh_loopK); empty otherwise.
-std::vector<std::string> CppshCutLoopRests;
-std::vector<std::vector<CppshCutLocal>> CppshCutLocals;
 
 std::vector<Token> CppshInputTokens;
 // Where each recorded token is, by its location (each token's own, macro
@@ -379,25 +367,6 @@ bool cppshMutates(const Stmt *S, const VarDecl *VD) {
   return false;
 }
 
-// Where text taken from what the user typed came from, for the continuation it
-// goes into (cppsh): a #line naming its buffer and line, and spaces to its
-// column -- so that an error in the continuation points at the line typed,
-// not at the generated text. (Only what a location presumes: the staging
-// itself reads the real buffers' offsets.)
-static std::string cppshLineMark(SourceManager &SM, SourceLocation Loc) {
-  PresumedLoc P = SM.getPresumedLoc(SM.getFileLoc(Loc));
-  if (P.isInvalid())
-    return "";
-  std::string File;
-  for (char C : llvm::StringRef(P.getFilename())) {
-    if (C == '"' || C == '\\')
-      File += '\\';
-    File += C;
-  }
-  return "\n#line " + std::to_string(P.getLine()) + " \"" + File + "\"\n" +
-         std::string(P.getColumn() > 0 ? P.getColumn() - 1 : 0, ' ');
-}
-
 // The local an expression reads whose value exists only as the function being
 // written runs (cppsh): one of its own locals, outside a lambda, in a body the
 // user typed (or instantiated from one), not a parameter whose value is known
@@ -498,7 +467,8 @@ const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
 }
 
 // Whether a run-time template argument here is a need of the function being
-// written: a body the user typed, outside a lambda, not a template's pattern.
+// written (or of a top-level statement, or a staged region): a body the user
+// typed, outside a lambda, not a template's pattern.
 bool cppshExprNeedHere(Sema &S, const Expr *E) {
   FunctionDecl *Cur = cppshNeedFunction(S);
   return E && (Cur ? cppshInUserInput(S, Cur->getLocation())
@@ -513,34 +483,6 @@ bool cppshTopNeedHere(Sema &S, const Expr *E) {
          !E->isValueDependent() && !E->containsErrors() &&
          cppshInUserInput(S, E->getBeginLoc());
 }
-// In a continuation, the value of the next run-time template argument met
-// in it, as the cut handed it over; none where they are all taken.
-std::optional<APValue> cppshKnownNeed(Sema &S) {
-  FunctionDecl *Cur = S.getCurFunctionDecl();
-  if (!Cur || !Cur->getIdentifier() || !Cur->getName().starts_with("__cppsh_cont") ||
-      CppshActiveNeedsTaken >= CppshActiveNeeds.size())
-    return std::nullopt;
-  return CppshActiveNeeds[CppshActiveNeedsTaken++];
-}
-
-// std::sh::<Name>, as an expression to call.
-static ExprResult cppshShCallee(Sema &S, StringRef Name, SourceLocation Loc) {
-  NamespaceDecl *Std = S.getStdNamespace();
-  if (!Std)
-    return ExprError();
-  Preprocessor &PP = S.getPreprocessor();
-  LookupResult ShR(S, &PP.getIdentifierTable().get("sh"), Loc, Sema::LookupNamespaceName);
-  S.LookupQualifiedName(ShR, Std);
-  auto *Sh = ShR.getAsSingle<NamespaceDecl>();
-  if (!Sh)
-    return ExprError();
-  LookupResult R(S, &PP.getIdentifierTable().get(Name), Loc, Sema::LookupOrdinaryName);
-  S.LookupQualifiedName(R, Sh);
-  if (R.empty())
-    return ExprError();
-  CXXScopeSpec SS;
-  return S.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
-}
 
 // Whether a compound statement being instantiated is the body of a function
 // instantiated from what the user typed (`f(auto d) = {...}`): cut, as the
@@ -554,82 +496,20 @@ bool cppshCutsInstantiatedBody(Sema &S, const CompoundStmt *Body) {
   return Pattern && Pattern->getBody() == Body && cppshInUserInput(S, FD->getLocation());
 }
 
-// The cut of an instantiated body at its statement At: the rest as written
-// kept for the continuation; the parameters and the locals instantiated so
-// far handed over, by their instantiated types; the function returning
-// through std::sh::__cppsh_cut.
+// A need met in a body instantiated from what the user typed, which no
+// staged region holds (its statement had none as the template was parsed):
+// an error -- nothing compiled with a value it does not have.
 void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
                            SmallVectorImpl<Stmt *> &Statements) {
-  FunctionDecl *FD = S.getCurFunctionDecl();
-  SourceManager &SM = S.getSourceManager();
-  SourceLocation Loc = At->getBeginLoc();
-  // A continuation cut at its very start would be cut to the same
-  // continuation again, without end: what it needs could not be made a
-  // value it is compiled with (a pointer into the running program).
-  if (Statements.empty() && FD->getIdentifier() &&
-      FD->getName().starts_with("__cppsh_cont")) {
-    unsigned ID = S.getDiagnostics().getCustomDiagID(
-        DiagnosticsEngine::Error,
-        "this needs a value only running the function gives, and it cannot be "
-        "made a value the rest is compiled with: not staged");
-    S.Diag(Loc, ID);
-    return;
-  }
-  StringRef Rest = Lexer::getSourceText(
-      CharSourceRange::getCharRange(Loc, Body->getRBracLoc()), SM, S.getLangOpts());
-  SmallVector<VarDecl *, 8> Live;
-  for (ParmVarDecl *P : FD->parameters())
-    if (P->getIdentifier())
-      Live.push_back(P);
-  for (Stmt *St : Statements)
-    if (auto *DS = dyn_cast<DeclStmt>(St))
-      for (Decl *D : DS->decls())
-        if (auto *VD = dyn_cast<VarDecl>(D);
-            VD && VD->hasLocalStorage() && VD->getIdentifier())
-          Live.push_back(VD);
-  std::vector<CppshCutLocal> Locals;
-  for (VarDecl *VD : Live)
-    Locals.push_back({VD->getIdentifier(),
-                      VD->getType().getNonReferenceType().getUnqualifiedType(),
-                      cppshMoveOnly(S, VD->getType())});
-  // The run-time template arguments, their values as long long.
-  SmallVector<Expr *, 4> NeedArgs;
-  for (size_t I = 0; I < CppshCutNeedExprs.size(); ++I) {
-    ExprResult AsLL = S.BuildCStyleCastExpr(
-        Loc, S.Context.getTrivialTypeSourceInfo(S.Context.LongLongTy, Loc), Loc,
-        CppshCutNeedExprs[I]);
-    if (!AsLL.isUsable())
-      continue;
-    Locals.push_back({nullptr, S.Context.LongLongTy, false});
-    NeedArgs.push_back(AsLL.get());
-  }
+  (void)Body;
+  (void)Statements;
   CppshCutNeedExprs.clear();
-  unsigned Id = CppshCutRemainders.size();
-  CppshCutRemainders.push_back(cppshLineMark(SM, Loc) + Rest.str());
-  CppshCutLoopRests.emplace_back();
-  CppshCutLocals.push_back(std::move(Locals));
-  CppshCutFunctions.insert(FD->getCanonicalDecl());
-  ExprResult Frame = cppshShCallee(S, "__cppsh_frame", Loc);
-  ExprResult Cut = cppshShCallee(S, "__cppsh_cut", Loc);
-  if (!Frame.isUsable() || !Cut.isUsable())
-    return;
-  SmallVector<Expr *, 8> Refs;
-  for (VarDecl *VD : Live)
-    Refs.push_back(S.BuildDeclRefExpr(VD, VD->getType().getNonReferenceType(),
-                                      VK_LValue, Loc));
-  Refs.append(NeedArgs.begin(), NeedArgs.end());
-  ExprResult FrameCall = S.BuildCallExpr(nullptr, Frame.get(), Loc, Refs, Loc);
-  if (!FrameCall.isUsable())
-    return;
-  Expr *IdLit = IntegerLiteral::Create(S.Context, llvm::APInt(32, Id),
-                                       S.Context.UnsignedIntTy, Loc);
-  Expr *CutArgs[2] = {IdLit, FrameCall.get()};
-  ExprResult CutCall = S.BuildCallExpr(nullptr, Cut.get(), Loc, CutArgs, Loc);
-  if (!CutCall.isUsable())
-    return;
-  StmtResult Ret = S.BuildReturnStmt(Loc, CutCall.get());
-  if (Ret.isUsable())
-    Statements.push_back(Ret.get());
+  CppshCutStagedCalls.clear();
+  S.Diag(At->getBeginLoc(),
+         S.getDiagnostics().getCustomDiagID(
+             DiagnosticsEngine::Error,
+             "this needs a value only known as the function runs, met only as "
+             "the template is instantiated: not staged"));
 }
 } // namespace clang
 
@@ -8369,13 +8249,9 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             continue;
           const FunctionDecl *BodyFD = nullptr;
           Stmt *PatBody = PatFD->getBody(BodyFD);
-          // A continuation (cppsh: the rest of a staged function) is
-          // specialized on its locals' values whatever its body holds.
-          bool Continuation = PatFD->getIdentifier() &&
-                              PatFD->getName().starts_with("__cppsh_cont");
           IfOwner = PatFD;
           if (!PatBody || !PatFD->getReturnType()->getContainedAutoType() ||
-              (!Continuation && !stmtHasIf(PatBody, stmtHasIf)))
+              !stmtHasIf(PatBody, stmtHasIf))
             continue;
           for (unsigned I = 0;
                I < PatFD->getNumParams() && I < ArgExprs.size(); ++I) {
@@ -8461,12 +8337,9 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                   // Not plain data: rebuilt from its snapshot, by an
                   // expression the parameter keeps (a parameter taken by
                   // value: a reference would bind to the rebuilt copy).
-                  // (A continuation's reference parameter -- one it does
-                  // not change -- is folded by the constant evaluator alone;
-                  // what it refers to is the one changed at run time.)
                   ParmVarDecl *P = PatFD->getParamDecl(I);
                   if (!Ok && CppshRuntimeRebuildOf && VD->hasGlobalStorage() &&
-                      (Continuation || !P->getType()->isReferenceType()))
+                      !P->getType()->isReferenceType())
                     if (Expr *Rebuild = CppshRuntimeRebuildOf(*this, VD)) {
                       SavedRebuilds.push_back({P, CppshParamRebuild.lookup(P)});
                       CppshParamRebuild[P] = Rebuild;
@@ -8483,7 +8356,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             if (Ok && EV.Val.hasValue()) {
               ParmVarDecl *P = PatFD->getParamDecl(I);
               QualType PT = P->getType();
-              if (PT->isReferenceType() && !Continuation)
+              if (PT->isReferenceType())
                 continue;
               if (PT->isDependentType()) {
                 QualType AT = ArgE->getType();

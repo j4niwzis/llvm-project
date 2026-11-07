@@ -8692,11 +8692,6 @@ private:
   /// std::sh::__cppsh_shell_line (run as a statement), with its text.
   ExprResult ParseCppshCommand();
 
-  /// cppsh: the cut of a function body (ParseStmt.cpp) -- the function
-  /// returns through std::sh::__cppsh_cut, its rest run with its live
-  /// locals' values.
-  unsigned CppshEmitCut(SmallVectorImpl<Stmt *> &Stmts, StringRef Rest,
-                        SourceLocation Loc, FunctionDecl *FD);
   /// A return statement built here rather than read in a block (a concise
   /// function's `= expression`, its forwarder), cut like a block's would be.
   struct CppshBuiltBody {
@@ -8712,9 +8707,33 @@ private:
   /// (std::sh::__cppsh_region); false where it cannot be.
   bool CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
                        SourceLocation Begin, bool AtBody = false);
+  /// cppsh: what a region's body is: statements of recorded tokens; an
+  /// expression of them, returned (a concise function's `= e`); or the call
+  /// a forwarder makes (CppshForward), built.
+  enum class CppshRegionBody { Statements, Expression, Forward };
+  struct CppshForward {
+    Decl *Template = nullptr;
+    IdentifierInfo *Name = nullptr;
+    SourceLocation Loc;
+    /// Each template argument: a type, or the value of the region's
+    /// parameter of that name.
+    struct Arg {
+      bool IsType = false;
+      QualType Type;
+      IdentifierInfo *II = nullptr;
+    };
+    SmallVector<Arg, 4> Args;
+  };
   ExprResult ParseCppshRegionLambda(ArrayRef<CppshCutLocal> Frame,
                                     ArrayRef<SourceLocation> NeedLocs,
-                                    unsigned Begin, unsigned End);
+                                    unsigned Begin, unsigned End,
+                                    CppshRegionBody Kind = CppshRegionBody::Statements,
+                                    const CppshForward *Forward = nullptr);
+  /// cppsh: the function returns what a staged region gives (a staged
+  /// function's result), the region handed Args.
+  bool CppshReturnStagedRegion(SmallVectorImpl<Stmt *> &Stmts,
+                               SourceLocation Loc, ExprResult Lambda,
+                               ArrayRef<Expr *> Args);
   void ParseCppshRegionStatements(StmtVector &Stmts, unsigned Begin,
                                   unsigned End);
   void CppshRegionError(SourceLocation Loc);
@@ -8753,7 +8772,7 @@ private:
   CppshBuiltBody CppshBeginBuiltReturn(SourceLocation Open);
   void CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
                               SmallVectorImpl<Stmt *> &Stmts, ExprResult E,
-                              SourceLocation Loc, StringRef Rest);
+                              SourceLocation Loc, unsigned Begin, unsigned End);
   ExprResult MaybeParseUnparenthesizedCallArgs(ExprResult LHS);
 
   /// isCXXSimpleDeclaration - C++-specialized function that disambiguates

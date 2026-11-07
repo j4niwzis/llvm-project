@@ -41,8 +41,6 @@ struct CppshCutLocal {
   bool ByRef = false;
 };
 
-/// Per cut, its frame, in order.
-extern std::vector<std::vector<CppshCutLocal>> CppshCutLocals;
 
 /// Every token of what the user typed (the REPL's input buffers), as the
 /// preprocessor gave it, each once and in order -- what code compiled later

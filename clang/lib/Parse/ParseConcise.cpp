@@ -764,13 +764,16 @@ Decl *Parser::ParseConciseForwarder(IdentifierInfo *Name, SourceLocation Loc,
     Sema::CompoundScopeRAII CompoundScope(Actions);
     SmallVector<Stmt *, 8> Stmts;
     TemplateArgumentListInfo TemplateArgs(Loc, Loc);
-    // The call again as the text of a continuation, where it is cut at
-    // (the continuations are text yet).
-    std::string Rest = "return " + Name->getName().str() + "<";
+    // The call, where a default is a value: a staged region's -- each value
+    // a local of here, its parameter.
+    CppshForward Forward;
+    Forward.Template = Template;
+    Forward.Name = Name;
+    Forward.Loc = CutLoc;
+    std::vector<CppshCutLocal> Frame;
+    SmallVector<Expr *, 4> Values;
     bool Ok = true;
     for (ConciseForwardArg &A : Args) {
-      if (&A != &Args.front())
-        Rest += ", ";
       if (A.IsType) {
         ConciseReplay(A.Default, &A);
         TypeResult Ty = ParseTypeName();
@@ -795,8 +798,7 @@ Decl *Parser::ParseConciseForwarder(IdentifierInfo *Name, SourceLocation Loc,
           if (S.isUsable())
             Stmts.push_back(S.get());
         }
-        Rest += TypeName::getFullyQualifiedName(QT, Context, Policy,
-                                                /*WithGlobalNsPrefix=*/true);
+        Forward.Args.push_back({true, QT, A.II});
         continue;
       }
       // `Type n = default;`, auto where no type is said.
@@ -834,15 +836,17 @@ Decl *Parser::ParseConciseForwarder(IdentifierInfo *Name, SourceLocation Loc,
           V, V->getType().getNonReferenceType(), VK_LValue, A.Loc);
       TemplateArgs.addArgument(TemplateArgumentLoc(
           TemplateArgument(Ref, /*IsCanonical=*/false), Ref));
-      Rest += A.II->getName().str();
+      Forward.Args.push_back({false, QualType(), A.II});
+      Frame.push_back({A.II, V->getType().getNonReferenceType(), false, /*ByRef=*/true});
+      Values.push_back(Actions.BuildDeclRefExpr(V, V->getType().getNonReferenceType(),
+                                                VK_LValue, A.Loc));
     }
-    Rest += ">();";
-    if (Ok) {
+    if (Ok && Frame.empty()) {
+      // Types alone: nothing to wait for -- return Name<T...>();
       LookupResult R(Actions, DeclarationNameInfo(Name, Loc),
                      Sema::LookupOrdinaryName);
       R.addDecl(cast<NamedDecl>(Template));
       R.resolveKind();
-      CppshBuiltBody Saved = CppshBeginBuiltReturn(Loc);
       CXXScopeSpec SS;
       ExprResult Callee = Actions.BuildTemplateIdExpr(
           SS, SourceLocation(), R, /*RequiresADL=*/false, &TemplateArgs);
@@ -851,7 +855,18 @@ Decl *Parser::ParseConciseForwarder(IdentifierInfo *Name, SourceLocation Loc,
               ? Actions.ActOnCallExpr(getCurScope(), Callee.get(), Loc,
                                       MultiExprArg(), Loc)
               : ExprError();
-      CppshFinishBuiltReturn(Saved, Stmts, Call, CutLoc, Rest);
+      StmtResult Ret = Call.isUsable()
+                           ? Actions.ActOnReturnStmt(Loc, Call.get(), getCurScope())
+                           : StmtError();
+      if (Ret.isUsable())
+        Stmts.push_back(Ret.get());
+    } else if (Ok &&
+               !CppshReturnStagedRegion(
+                   Stmts, Loc,
+                   ParseCppshRegionLambda(Frame, {}, 0, 0, CppshRegionBody::Forward,
+                                          &Forward),
+                   Values)) {
+      CppshRegionError(Loc);
     }
     Body = Actions.ActOnCompoundStmt(Loc, Loc, Stmts, /*isStmtExpr=*/false);
   }
