@@ -557,8 +557,7 @@ constexpr auto __cppsh_variant_get(V &&v) {
 
 // `obj.f(...)` on a variant, f a member function of its alternatives: the
 // member bound to the variant -- called, it calls f on the alternative held
-// (each alternative's f giving the same type); where a value is wanted
-// (`if (e.is_dir)`), what it gives called with nothing.
+// (each alternative's f giving the same type). Never called but as written.
 template <typename V, char... Cs>
 struct __cppsh_variant_method {
   V v;
@@ -573,13 +572,6 @@ struct __cppsh_variant_method {
               static_cast<Args &&>(args)...);
         },
         static_cast<V>(v));
-  }
-  template <typename R>
-    requires requires(const __cppsh_variant_method &m) {
-      { m() } -> std::convertible_to<R>;
-    }
-  constexpr operator R() const {
-    return (*this)();
   }
 };
 template <char... Cs, typename V>

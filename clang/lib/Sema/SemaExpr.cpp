@@ -314,9 +314,8 @@ ExprResult cppshVariantMember(Sema &S, Expr *Base, const DeclarationNameInfo &Na
     return ExprEmpty();
   // A member function of the alternatives (`obj.size(…)`, `obj.is_dir()`):
   // the member bound to the variant, a callable that calls it on the
-  // alternative held (std::sh::__cppsh_variant_method) -- converting, where a
-  // value is wanted, to what it gives called with nothing. A field: its
-  // value (std::sh::__cppsh_variant_get).
+  // alternative held (std::sh::__cppsh_variant_method), called only as
+  // written. A field: its value (std::sh::__cppsh_variant_get).
   bool IsMethod = false;
   if (const auto *Spec = dyn_cast<ClassTemplateSpecializationDecl>(RD))
     if (Spec->getTemplateArgs().size() &&

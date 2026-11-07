@@ -5,8 +5,6 @@ std::sh::fs_entry e = std::sh::dir_entry{"x"}; std::println("name {}", e.name);
 // CHECK: name x
 
 // A member function of every alternative called through the variant: the
-// alternative's own; named where a value is wanted, what it gives.
+// alternative's own.
 std::println("dir {}", e.is_dir());
 // CHECK: dir true
-if (e.is_dir) std::println("is a directory");
-// CHECK: is a directory
