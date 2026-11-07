@@ -1884,6 +1884,11 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
             // it, and returns its value where its slot points.
             Fn->addAttr(AnnotateAttr::CreateImplicit(Ctx, "cppsh.staged.run",
                                                      nullptr, 0, SourceRange()));
+            // An inline function (kept: used): a static local of its code,
+            // and its guard, shared by every function its code is compiled
+            // into (Sema::CppshStagedStatics), as the linker merges them.
+            Fn->setInlineSpecified(true);
+            Fn->addAttr(UsedAttr::CreateImplicit(Ctx));
             SmallVector<Stmt *, 16> Stmts;
             SmallVector<VarDecl *, 8> Locals;
             // Each local: `T &name = *(T *)frame[I];` -- its value bound

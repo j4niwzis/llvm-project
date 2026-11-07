@@ -1794,7 +1794,23 @@ Decl *TemplateDeclInstantiator::VisitDecompositionDecl(DecompositionDecl *D) {
 }
 
 Decl *TemplateDeclInstantiator::VisitVarDecl(VarDecl *D) {
-  return VisitVarDecl(D, /*InstantiatingVarTemplate=*/false);
+  // cppsh: a static local of staged code compiled as its function runs, of a
+  // type its values do not change: the variable its first compile made --
+  // one object for the function, initialized once (the compiled functions
+  // inline ones, so that it and its guard are shared by all of them).
+  const bool CppshShared = SemaRef.CurrentCppshStagedRun && D->isStaticLocal() &&
+                           !D->getType()->isDependentType() &&
+                           D->getDeclContext()->isCppshStaged();
+  if (CppshShared)
+    if (VarDecl *Shared = SemaRef.CppshStagedStatics.lookup(D)) {
+      SemaRef.CurrentInstantiationScope->InstantiatedLocal(D, Shared);
+      return Shared;
+    }
+  Decl *Inst = VisitVarDecl(D, /*InstantiatingVarTemplate=*/false);
+  if (CppshShared)
+    if (auto *Var = dyn_cast_or_null<VarDecl>(Inst))
+      SemaRef.CppshStagedStatics[D] = Var;
+  return Inst;
 }
 
 Decl *TemplateDeclInstantiator::VisitVarDecl(VarDecl *D,

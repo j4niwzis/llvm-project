@@ -16121,6 +16121,11 @@ public:
   };
   CppshStagedRun *CurrentCppshStagedRun = nullptr;
 
+  /// A static local of staged code (of a type its values do not change),
+  /// each time the code is compiled the same variable: the one its first
+  /// compile made -- one object, initialized once, as the function's own.
+  llvm::DenseMap<const VarDecl *, VarDecl *> CppshStagedStatics;
+
   /// Begin a staged statement at Loc, its body to be parsed in BodyScope: its
   /// context entered, a staged parameter declared there for each of Locals
   /// (and for the result of StagedCall, a staged function's, whose type is a
