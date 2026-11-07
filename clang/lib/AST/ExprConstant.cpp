@@ -98,6 +98,9 @@ llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
 // not bound is wanted (CppshStagedWanted): the body is instantiated again
 // with it bound.
 llvm::DenseSet<const VarDecl *> CppshStagedTracked;
+// How many times a bound value (a parameter's, a staged local's) has been
+// read: an `if` whose condition reads one is folded (TransformIfStmt).
+unsigned CppshBindingReads = 0;
 bool CppshStagedLive = false;
 llvm::SmallPtrSet<const VarDecl *, 8> CppshStagedWanted;
 } // namespace clang
@@ -3562,10 +3565,12 @@ static bool evaluateVarDeclInit(EvalInfo &Info, const Expr *E,
   if (isa<ParmVarDecl>(VD)) {
     if (auto Known = CppshParamValue.find(cast<ParmVarDecl>(VD));
         Known != CppshParamValue.end()) {
+      ++CppshBindingReads;
       Result = &Known->second;
       return true;
     }
     if (const Expr *Rebuild = CppshParamRebuild.lookup(cast<ParmVarDecl>(VD))) {
+      ++CppshBindingReads;
       LValue Where;
       APValue &Slot = Info.CurrentCall->createTemporary(
           Rebuild, Rebuild->getType(), ScopeKind::FullExpression, Where);
@@ -9848,6 +9853,7 @@ bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
       !Frame && (!CppshStagedLocal || CppshStagedLive)) {
     const QualType T = VD->getType().getNonReferenceType();
     if (auto Known = CppshParamValue.find(PVD); Known != CppshParamValue.end()) {
+      ++CppshBindingReads;
       // A temporary of the evaluation, known by the expression naming the
       // variable (of the object's type, as the value is): not by the
       // variable, whose type is a reference.
@@ -9857,6 +9863,7 @@ bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
       return true;
     }
     if (const Expr *Rebuild = CppshParamRebuild.lookup(PVD)) {
+      ++CppshBindingReads;
       APValue &Slot = Info.CurrentCall->createTemporary(
           Rebuild, Rebuild->getType(), ScopeKind::FullExpression, Result);
       return EvaluateInPlace(Slot, Info, Result, Rebuild);

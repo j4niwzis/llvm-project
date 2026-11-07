@@ -55,6 +55,8 @@
 using namespace llvm::omp;
 
 namespace clang {
+// cppsh: how many bound values have been read (ExprConstant.cpp).
+extern unsigned CppshBindingReads;
 // cppsh: cuts in instantiated bodies (SemaExpr.cpp).
 extern bool CppshCutNeeded;
 extern std::vector<Expr *> CppshCutNeedExprs;
@@ -8594,13 +8596,17 @@ TreeTransform<Derived>::TransformIfStmt(IfStmt *S) {
   std::optional<bool> ConstexprConditionValue;
   if (S->isConstexpr())
     ConstexprConditionValue = Cond.getKnownValue();
-  else if (!getSema().PP.getSourceManager().isInSystemHeader(S->getIfLoc())) {
-    if (Expr *CondE = Cond.get().second) {
-      if (!CondE->isValueDependent()) {
-        bool CondBool = false;
-        if (CondE->EvaluateAsBooleanCondition(CondBool, getSema().Context))
-          ConstexprConditionValue = CondBool;
-      }
+  else if (Expr *CondE = Cond.get().second) {
+    // cppsh: a plain `if` whose condition reads a value the code is compiled
+    // with (a value specialization's parameter, a staged local's), known:
+    // the other branch is not compiled -- its returns may differ in type.
+    // Any other plain `if` is compiled whole, as C++ says.
+    if (!CondE->isValueDependent()) {
+      const unsigned ReadsBefore = CppshBindingReads;
+      bool CondBool = false;
+      if (CondE->EvaluateAsBooleanCondition(CondBool, getSema().Context) &&
+          CppshBindingReads != ReadsBefore)
+        ConstexprConditionValue = CondBool;
     }
   }
 
