@@ -9,6 +9,7 @@
 //
 //===----------------------------------------------------------------------===/
 
+#include <unordered_map>
 #include "TreeTransform.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -2992,6 +2993,11 @@ static QualType adjustFunctionTypeForInstantiation(ASTContext &Context,
 ///   1) instantiating function templates
 ///   2) substituting friend and local function declarations
 ///   3) substituting deduction guide declarations for nested class templates
+// cppsh: the specializations on argument values made so far, by the hash of
+// what makes each (TemplateDeclInstantiator::VisitFunctionDecl).
+static std::unordered_multimap<unsigned, std::pair<llvm::FoldingSetNodeID, FunctionDecl *>>
+    CppshSpecializations;
+
 Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     FunctionDecl *D, TemplateParameterList *TemplateParams,
     RewriteKind FunctionRewriteKind) {
@@ -3024,6 +3030,37 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
       HasCppshConstParam = true;
       break;
     }
+  }
+
+  // cppsh: a specialization on argument values made once for each set of
+  // them -- the template, its template arguments, its parameters' values --
+  // and found again: a repeated `ls` with the same options, f(1) twice, the
+  // one made before (each call instantiated a new one, ~80 ms).
+  llvm::FoldingSetNodeID CppshKey;
+  if (FunctionTemplate && !TemplateParams && HasCppshConstParam) {
+    CppshKey.AddPointer(FunctionTemplate->getCanonicalDecl());
+    for (const TemplateArgument &A : TemplateArgs.getInnermost())
+      A.Profile(CppshKey, SemaRef.Context);
+    for (const ParmVarDecl *P : D->parameters()) {
+      if (auto Known = CppshParamValue.find(P); Known != CppshParamValue.end()) {
+        CppshKey.AddInteger(1u);
+        Known->second.Profile(CppshKey);
+      } else if (const Expr *Rebuild = CppshParamRebuild.lookup(P)) {
+        CppshKey.AddInteger(2u);
+        Rebuild->Profile(CppshKey, SemaRef.Context, /*Canonical=*/true);
+      } else if (const APValue *V = P->hasConstantInitialization()
+                                        ? P->getEvaluatedValue()
+                                        : nullptr) {
+        CppshKey.AddInteger(3u);
+        V->Profile(CppshKey);
+      } else {
+        CppshKey.AddInteger(0u);
+      }
+    }
+    for (auto [It, End] = CppshSpecializations.equal_range(CppshKey.ComputeHash()); It != End;
+         ++It)
+      if (It->second.first == CppshKey && !It->second.second->isInvalidDecl())
+        return It->second.second;
   }
 
   if (FunctionTemplate && !TemplateParams && !HasCppshConstParam) {
@@ -3236,6 +3273,9 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
         SpecTemplate,
         TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost),
         /*InsertToken=*/{});
+    if (HasCppshConstParam)
+      CppshSpecializations.emplace(CppshKey.ComputeHash(),
+                                   std::make_pair(CppshKey, Function));
   } else if (isFriend && D->isThisDeclarationADefinition()) {
     // Do not connect the friend to the template unless it's actually a
     // definition. We don't want non-template functions to be marked as being

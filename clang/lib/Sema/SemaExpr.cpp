@@ -8124,10 +8124,30 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         }
         if (!Rearranged.empty())
           ArgExprs = Rearranged;
-        auto stmtHasIf = [](const Stmt *S, auto &Self) -> bool {
+        // What a specialization on the arguments' values gains anything
+        // from: a plain `if` whose condition reads one of the parameters
+        // (folded, so that its branches may differ in type). An `if
+        // constexpr`, or an `if` on anything else, gains nothing -- and
+        // every call specialized made a new instantiation of its own
+        // (std::println: an if constexpr, its every call ~90 ms).
+        auto readsParam = [](const Stmt *S, const FunctionDecl *FD, auto &Self) -> bool {
           if (!S)
             return false;
-          if (isa<IfStmt>(S))
+          if (auto *DRE = dyn_cast<DeclRefExpr>(S))
+            if (auto *P = dyn_cast<ParmVarDecl>(DRE->getDecl()))
+              return llvm::is_contained(FD->parameters(), P);
+          for (const Stmt *C : S->children())
+            if (Self(C, FD, Self))
+              return true;
+          return false;
+        };
+        const FunctionDecl *IfOwner = nullptr;
+        auto stmtHasIf = [&](const Stmt *S, auto &Self) -> bool {
+          if (!S)
+            return false;
+          if (auto *If = dyn_cast<IfStmt>(S);
+              If && !If->isConstexpr() && IfOwner &&
+              readsParam(If->getCond(), IfOwner, readsParam))
             return true;
           for (const Stmt *C : S->children())
             if (C && Self(C, Self))
@@ -8161,6 +8181,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
           // specialized on its locals' values whatever its body holds.
           bool Continuation = PatFD->getIdentifier() &&
                               PatFD->getName().starts_with("__cppsh_cont");
+          IfOwner = PatFD;
           if (!PatBody || !PatFD->getReturnType()->getContainedAutoType() ||
               (!Continuation && !stmtHasIf(PatBody, stmtHasIf)))
             continue;
