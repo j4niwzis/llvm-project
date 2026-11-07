@@ -9,6 +9,8 @@
 //
 //===----------------------------------------------------------------------===/
 
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include <unordered_map>
 #include "TreeTransform.h"
 #include "clang/AST/ASTConsumer.h"
@@ -42,6 +44,7 @@ using namespace clang;
 namespace clang {
 extern llvm::DenseMap<const VarDecl *, const Expr *> CppshParamRebuild;
 extern llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
+extern llvm::DenseSet<const VarDecl *> CppshBindingsRead;
 } // namespace clang
 
 static bool isDeclWithinFunction(const Decl *D) {
@@ -3009,10 +3012,60 @@ static QualType adjustFunctionTypeForInstantiation(ASTContext &Context,
 ///   1) instantiating function templates
 ///   2) substituting friend and local function declarations
 ///   3) substituting deduction guide declarations for nested class templates
-// cppsh: the specializations on argument values made so far, by the hash of
-// what makes each (TemplateDeclInstantiator::VisitFunctionDecl).
-static std::unordered_multimap<unsigned, std::pair<llvm::FoldingSetNodeID, FunctionDecl *>>
+// cppsh: the specializations on argument values made so far
+// (TemplateDeclInstantiator::VisitFunctionDecl), by the hash of their
+// template and template arguments. Each keeps the value each parameter was
+// bound to (none: not bound, the parameter a run-time one) and which of them
+// its making read -- its declaration and its body: a specialization is the
+// one for another call whose values agree on those it read; the others it
+// takes at run time (they are unbound once its body is made).
+namespace {
+struct CppshValueSpec {
+  llvm::FoldingSetNodeID Head;
+  FunctionDecl *Function = nullptr;
+  SmallVector<std::optional<llvm::FoldingSetNodeID>, 4> Params;
+  llvm::SmallBitVector Read;
+  // Its body made: Read is all it reads.
+  bool ReadKnown = false;
+
+  bool matches(const llvm::FoldingSetNodeID &OtherHead,
+               ArrayRef<std::optional<llvm::FoldingSetNodeID>> Other) const {
+    if (Head != OtherHead || Function->isInvalidDecl() ||
+        Other.size() != Params.size())
+      return false;
+    for (unsigned I = 0; I < Params.size(); ++I) {
+      // Made with it unbound, or never reading it: any value does.
+      if (!Params[I] || (ReadKnown && !Read.test(I)))
+        continue;
+      if (!Other[I] || *Other[I] != *Params[I])
+        return false;
+    }
+    return true;
+  }
+};
+
+// The bindings read while a specialization is made: those read before kept
+// aside, the set empty for it, and put back after (with what it read: a
+// specialization made inside another reads what that one's making does).
+struct CppshReadWindow {
+  llvm::DenseSet<const VarDecl *> Outer;
+  CppshReadWindow() : Outer(std::move(CppshBindingsRead)) {
+    CppshBindingsRead.clear();
+  }
+  CppshReadWindow(const CppshReadWindow &) = delete;
+  CppshReadWindow &operator=(const CppshReadWindow &) = delete;
+  static void note(CppshValueSpec &Spec, ArrayRef<ParmVarDecl *> Ps) {
+    for (unsigned I = 0; I < Ps.size() && I < Spec.Read.size(); ++I)
+      if (Ps[I] && CppshBindingsRead.count(Ps[I]))
+        Spec.Read.set(I);
+  }
+  ~CppshReadWindow() { CppshBindingsRead.insert(Outer.begin(), Outer.end()); }
+};
+} // namespace
+
+static std::unordered_multimap<unsigned, std::unique_ptr<CppshValueSpec>>
     CppshSpecializations;
+static llvm::DenseMap<const FunctionDecl *, CppshValueSpec *> CppshSpecOf;
 
 Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     FunctionDecl *D, TemplateParameterList *TemplateParams,
@@ -3049,35 +3102,48 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
   }
 
   // cppsh: a specialization on argument values made once for each set of
-  // them -- the template, its template arguments, its parameters' values --
-  // and found again: a repeated `ls` with the same options, f(1) twice, the
-  // one made before (each call instantiated a new one, ~80 ms).
-  llvm::FoldingSetNodeID CppshKey;
+  // the values it reads -- its template, its template arguments, the values
+  // of the parameters it read -- and found again: a repeated `ls` with the
+  // same options, f(1) twice, the one made before (each call instantiated a
+  // new one, ~80 ms).
+  llvm::FoldingSetNodeID CppshHead;
+  SmallVector<std::optional<llvm::FoldingSetNodeID>, 4> CppshParams;
+  // What is read as it is made (none of it a hit's).
+  std::optional<CppshReadWindow> CppshWindow;
+  CppshValueSpec *CppshMade = nullptr;
   if (FunctionTemplate && !TemplateParams && HasCppshConstParam) {
-    CppshKey.AddPointer(FunctionTemplate->getCanonicalDecl());
+    CppshHead.AddPointer(FunctionTemplate->getCanonicalDecl());
     for (const TemplateArgument &A : TemplateArgs.getInnermost())
-      A.Profile(CppshKey, SemaRef.Context);
+      A.Profile(CppshHead, SemaRef.Context);
     for (const ParmVarDecl *P : D->parameters()) {
+      std::optional<llvm::FoldingSetNodeID> &K = CppshParams.emplace_back();
       if (auto Known = CppshParamValue.find(P); Known != CppshParamValue.end()) {
-        CppshKey.AddInteger(1u);
-        Known->second.Profile(CppshKey);
+        K.emplace().AddInteger(1u);
+        Known->second.Profile(*K);
       } else if (const Expr *Rebuild = CppshParamRebuild.lookup(P)) {
-        CppshKey.AddInteger(2u);
-        Rebuild->Profile(CppshKey, SemaRef.Context, /*Canonical=*/true);
-      } else if (const APValue *V = P->hasConstantInitialization()
+        K.emplace().AddInteger(2u);
+        Rebuild->Profile(*K, SemaRef.Context, /*Canonical=*/true);
+      } else if (const APValue *V = P && P->hasConstantInitialization()
                                         ? P->getEvaluatedValue()
                                         : nullptr) {
-        CppshKey.AddInteger(3u);
-        V->Profile(CppshKey);
-      } else {
-        CppshKey.AddInteger(0u);
+        K.emplace().AddInteger(3u);
+        V->Profile(*K);
       }
     }
-    for (auto [It, End] = CppshSpecializations.equal_range(CppshKey.computeHash()); It != End;
-         ++It)
-      if (It->second.first == CppshKey && !It->second.second->isInvalidDecl())
-        return It->second.second;
+    for (auto [It, End] = CppshSpecializations.equal_range(CppshHead.computeHash());
+         It != End; ++It)
+      if (It->second->matches(CppshHead, CppshParams))
+        return It->second->Function;
+    CppshWindow.emplace();
   }
+  // What this making read, noted before the window closes (declared after
+  // it: run first).
+  auto CppshNoteReads = llvm::scope_exit([&] {
+    if (CppshMade) {
+      CppshReadWindow::note(*CppshMade, D->parameters());
+      CppshReadWindow::note(*CppshMade, CppshMade->Function->parameters());
+    }
+  });
 
   if (FunctionTemplate && !TemplateParams && !HasCppshConstParam) {
     ArrayRef<TemplateArgument> Innermost = TemplateArgs.getInnermost();
@@ -3295,9 +3361,16 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
         SpecTemplate,
         TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost),
         /*InsertToken=*/{});
-    if (HasCppshConstParam)
-      CppshSpecializations.emplace(CppshKey.computeHash(),
-                                   std::make_pair(CppshKey, Function));
+    if (HasCppshConstParam) {
+      auto Spec = std::make_unique<CppshValueSpec>();
+      Spec->Head = CppshHead;
+      Spec->Function = Function;
+      Spec->Params.assign(CppshParams.begin(), CppshParams.end());
+      Spec->Read.resize(CppshParams.size());
+      CppshMade = Spec.get();
+      CppshSpecOf[Function] = Spec.get();
+      CppshSpecializations.emplace(CppshHead.computeHash(), std::move(Spec));
+    }
   } else if (isFriend && D->isThisDeclarationADefinition()) {
     // Do not connect the friend to the template unless it's actually a
     // definition. We don't want non-template functions to be marked as being
@@ -6438,6 +6511,13 @@ void Sema::InstantiateFunctionDefinition(SourceLocation PointOfInstantiation,
       ActOnSkippedFunctionBody(Function);
       Body = nullptr;
     } else {
+      // cppsh: a specialization on argument values -- what its body reads of
+      // them noted; the parameters it does not read unbound after, taken at
+      // run time (it is the one for any call agreeing on the others).
+      CppshValueSpec *CppshSpec = CppshSpecOf.lookup(Function);
+      std::optional<CppshReadWindow> CppshWindow;
+      if (CppshSpec)
+        CppshWindow.emplace();
       if (CXXConstructorDecl *Ctor = dyn_cast<CXXConstructorDecl>(Function)) {
         // If this is a constructor, instantiate the member initializers.
         InstantiateMemInitializers(Ctor, cast<CXXConstructorDecl>(PatternDecl),
@@ -6454,6 +6534,17 @@ void Sema::InstantiateFunctionDefinition(SourceLocation PointOfInstantiation,
 
       // Instantiate the function body.
       Body = SubstStmt(Pattern, TemplateArgs);
+      if (CppshSpec) {
+        CppshReadWindow::note(*CppshSpec, Function->parameters());
+        CppshReadWindow::note(*CppshSpec, PatternDecl->parameters());
+        CppshSpec->ReadKnown = true;
+        CppshWindow.reset();
+        for (unsigned I = 0; I < Function->getNumParams(); ++I)
+          if (I < CppshSpec->Read.size() && !CppshSpec->Read.test(I)) {
+            CppshParamValue.erase(Function->getParamDecl(I));
+            CppshParamRebuild.erase(Function->getParamDecl(I));
+          }
+      }
       for (ParmVarDecl *FP : Function->parameters()) {
         if (FP) {
           if (EvaluatedStmt *ES = FP->getEvaluatedStmt()) {

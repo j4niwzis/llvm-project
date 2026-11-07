@@ -101,6 +101,9 @@ llvm::DenseSet<const VarDecl *> CppshStagedTracked;
 // How many times a bound value (a parameter's, a staged local's) has been
 // read: an `if` whose condition reads one is folded (TransformIfStmt).
 unsigned CppshBindingReads = 0;
+// Which bound values have been read (a value specialization keeps bound,
+// and is told apart by, only the parameters its making read).
+llvm::DenseSet<const VarDecl *> CppshBindingsRead;
 bool CppshStagedLive = false;
 llvm::SmallPtrSet<const VarDecl *, 8> CppshStagedWanted;
 } // namespace clang
@@ -3566,11 +3569,13 @@ static bool evaluateVarDeclInit(EvalInfo &Info, const Expr *E,
     if (auto Known = CppshParamValue.find(cast<ParmVarDecl>(VD));
         Known != CppshParamValue.end()) {
       ++CppshBindingReads;
+      CppshBindingsRead.insert(VD);
       Result = &Known->second;
       return true;
     }
     if (const Expr *Rebuild = CppshParamRebuild.lookup(cast<ParmVarDecl>(VD))) {
       ++CppshBindingReads;
+      CppshBindingsRead.insert(VD);
       LValue Where;
       APValue &Slot = Info.CurrentCall->createTemporary(
           Rebuild, Rebuild->getType(), ScopeKind::FullExpression, Where);
@@ -3582,6 +3587,7 @@ static bool evaluateVarDeclInit(EvalInfo &Info, const Expr *E,
     if (VD->hasConstantInitialization()) {
       if (APValue *EvalVal = const_cast<APValue *>(VD->getEvaluatedValue())) {
         if (EvalVal->hasValue()) {
+          CppshBindingsRead.insert(VD);
           Result = EvalVal;
           return true;
         }
@@ -9854,6 +9860,7 @@ bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
     const QualType T = VD->getType().getNonReferenceType();
     if (auto Known = CppshParamValue.find(PVD); Known != CppshParamValue.end()) {
       ++CppshBindingReads;
+      CppshBindingsRead.insert(PVD);
       // A temporary of the evaluation, known by the expression naming the
       // variable (of the object's type, as the value is): not by the
       // variable, whose type is a reference.
@@ -9864,6 +9871,7 @@ bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
     }
     if (const Expr *Rebuild = CppshParamRebuild.lookup(PVD)) {
       ++CppshBindingReads;
+      CppshBindingsRead.insert(PVD);
       APValue &Slot = Info.CurrentCall->createTemporary(
           Rebuild, Rebuild->getType(), ScopeKind::FullExpression, Result);
       return EvaluateInPlace(Slot, Info, Result, Rebuild);
