@@ -24,6 +24,7 @@
 #include "clang/Interpreter/PartialTranslationUnit.h"
 #include "clang/Parse/Parser.h"
 #include "clang/Sema/CppshStaging.h"
+#include "clang/Sema/Scope.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Module.h"
@@ -411,6 +412,22 @@ class ASTDeclUnmerger : public DeclVisitor<ASTDeclUnmerger> {
     if (D->getDeclName().isIdentifier() && D->getDeclName().getFETokenInfo() &&
         !D->getLangOpts().ObjC && !D->getLangOpts().CPlusPlus)
       S.IdResolver.RemoveDecl(D);
+    // cppsh: in C++ too, one the translation unit's scope holds (a top-level
+    // declaration taken back for its staging, parsed again next): out of
+    // that scope and of its name's chain, which unqualified lookup at the
+    // top level reads before the translation unit's own table.
+    else if (D->getLangOpts().CPlusPlus && S.TUScope &&
+             S.TUScope->isDeclScope(D)) {
+      S.TUScope->RemoveDecl(D);
+      bool OnChain = false;
+      if (D->getDeclName().getFETokenInfo())
+        for (auto I = S.IdResolver.begin(D->getDeclName()),
+                  E = S.IdResolver.end();
+             I != E && !OnChain; ++I)
+          OnChain = *I == D;
+      if (OnChain)
+        S.IdResolver.RemoveDecl(D);
+    }
 
     ExternCContextDecl *ECCD = S.getASTContext().getExternCContextDecl();
     if (StoredDeclsMap *Map = ECCD->getPrimaryContext()->getLookupPtr()) {
