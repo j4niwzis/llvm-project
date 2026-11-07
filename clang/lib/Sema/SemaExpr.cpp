@@ -292,6 +292,15 @@ bool cppshHideCommandNamedC(Sema &S, LookupResult &R, const IdentifierInfo *II,
 // 'a', 'm', 'e'>(e), the `_` projections' own variant access: the field
 // where every alternative has it, an optional or a variant where not.
 // Nothing where the variant itself has that member (index, emplace).
+static SmallVector<QualType, 4> cppshVariantAlternatives(QualType T);
+ExprResult cppshVariantVisit(Sema &S, Expr *F, ArrayRef<Expr *> Variants,
+                             SourceLocation Loc);
+
+// `v.visit` on a std::variant of a library without the member (before
+// C++26): the variant it is of, for the call (`v.visit(f)`: std::visit(f, v),
+// cppshVariantVisit's where f's types differ by alternative).
+llvm::DenseMap<const Expr *, Expr *> CppshVariantVisitOf;
+
 ExprResult cppshVariantMember(Sema &S, Expr *Base, const DeclarationNameInfo &NameInfo,
                               SourceLocation OpLoc) {
   if (!Base || !NameInfo.getName().isIdentifier() || !cppshInUserInput(S, OpLoc))
@@ -306,6 +315,23 @@ ExprResult cppshVariantMember(Sema &S, Expr *Base, const DeclarationNameInfo &Na
   S.LookupQualifiedName(Own, RD);
   if (!Own.empty())
     return ExprEmpty();
+  // No member visit of its own, and none of an alternative's: a bound
+  // member, to be called (BuildCallExpr) -- C++26's variant::visit.
+  if (NameInfo.getName().getAsIdentifierInfo()->isStr("visit")) {
+    bool AltHas = false;
+    for (QualType Alt : cppshVariantAlternatives(BT))
+      if (auto *AltRD = Alt->getAsCXXRecordDecl()) {
+        LookupResult Member(S, NameInfo, Sema::LookupMemberName);
+        S.LookupQualifiedName(Member, AltRD);
+        AltHas |= !Member.empty();
+      }
+    if (!AltHas) {
+      auto *Bound = new (S.Context)
+          OpaqueValueExpr(NameInfo.getLoc(), S.Context.BoundMemberTy, VK_PRValue);
+      CppshVariantVisitOf[Bound] = Base;
+      return Bound;
+    }
+  }
   NamespaceDecl *Std = S.getStdNamespace();
   if (!Std)
     return ExprEmpty();
@@ -7887,6 +7913,33 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
   // alternative: f called on the values held (cppshVariantVisit).
   if (getLangOpts().CPlusPlus) {
     Expr *Callee = Fn->IgnoreParens();
+    if (Expr *VisitBase = CppshVariantVisitOf.lookup(Callee)) {
+      CppshVariantVisitOf.erase(Callee);
+      if (ArgExprs.size() != 1) {
+        Diag(LParenLoc, getDiagnostics().getCustomDiagID(
+                            DiagnosticsEngine::Error,
+                            "visit takes one argument, the function to call"));
+        return ExprError();
+      }
+      Expr *Variants[1] = {VisitBase};
+      if (ExprResult Visited =
+              cppshVariantVisit(*this, ArgExprs[0], Variants, LParenLoc);
+          !Visited.isUnset())
+        return Visited;
+      // One type for every alternative: std::visit(f, v), as written.
+      LookupResult R(*this, &PP.getIdentifierTable().get("visit"), LParenLoc,
+                     LookupOrdinaryName);
+      if (NamespaceDecl *Std = getStdNamespace())
+        LookupQualifiedName(R, Std);
+      if (R.empty())
+        return ExprError();
+      CXXScopeSpec SS;
+      ExprResult VisitFn = BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
+      if (!VisitFn.isUsable())
+        return ExprError();
+      Expr *Args[2] = {ArgExprs[0], VisitBase};
+      return BuildCallExpr(Scope, VisitFn.get(), LParenLoc, Args, RParenLoc);
+    }
     DeclarationName Name;
     if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(Callee))
       Name = ULE->getName();
