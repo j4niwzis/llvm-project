@@ -8258,7 +8258,11 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
       Fn = result.get();
     }
 
-    if (Fn->getType() == Context.BoundMemberTy) {
+    // (Not a set of member functions: an UnresolvedMemberExpr of non-static
+    // ones is of the bound-member type too, its candidates may be
+    // specialized on the arguments' values -- below, as any overload set.)
+    if (Fn->getType() == Context.BoundMemberTy &&
+        !isa<UnresolvedMemberExpr>(Fn->IgnoreParens())) {
       return BuildCallToMemberFunction(Scope, Fn, LParenLoc, ArgExprs,
                                        RParenLoc, ExecConfig, IsExecConfig,
                                        AllowRecovery);
@@ -8266,8 +8270,21 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
   }
 
   // Check for overloaded calls.  This can happen even in C due to extensions.
-  if (Fn->getType() == Context.OverloadTy) {
-    OverloadExpr::FindResult find = OverloadExpr::find(Fn);
+  // (cppsh: and calls of a set of non-static member functions, of the
+  // bound-member type: `obj.pick(o)`.)
+  const bool CppshMemberSet = getLangOpts().CPlusPlus &&
+                              Fn->getType() == Context.BoundMemberTy &&
+                              isa<UnresolvedMemberExpr>(Fn->IgnoreParens());
+  if (Fn->getType() == Context.OverloadTy || CppshMemberSet) {
+    OverloadExpr::FindResult find;
+    if (CppshMemberSet) {
+      find.Expression = cast<UnresolvedMemberExpr>(Fn->IgnoreParens());
+      find.IsAddressOfOperand = false;
+      find.IsAddressOfOperandWithParen = false;
+      find.HasFormOfMemberPointer = false;
+    } else {
+      find = OverloadExpr::find(Fn);
+    }
 
     // We aren't supposed to apply this logic if there's an '&' involved.
     if (!find.HasFormOfMemberPointer || find.IsAddressOfOperandWithParen) {
