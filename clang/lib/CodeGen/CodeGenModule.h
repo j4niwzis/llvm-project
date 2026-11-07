@@ -447,6 +447,14 @@ private:
   /// away after all (an error at the end of its input).
   std::vector<std::pair<std::string, GlobalDecl>> ExportedThisModule;
 
+  /// And what each unit's module made external, by the unit: taken back from
+  /// IncrementalExported, and deferred again, where the unit is undone after
+  /// its module ran (a failed input taken back whole) -- the next module that
+  /// uses one emits it again, its definition gone with that module.
+  llvm::DenseMap<const TranslationUnitDecl *,
+                 std::vector<std::pair<std::string, GlobalDecl>>>
+      ExportedByUnit;
+
   void addEmittedDeferredDecl(GlobalDecl GD) {
     // Reemission is only needed in incremental mode.
     if (!Context.getLangOpts().IncrementalExtensions)

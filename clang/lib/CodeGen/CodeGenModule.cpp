@@ -1238,6 +1238,8 @@ void CodeGenModule::Release() {
         (GV->hasLinkOnceLinkage() || GV->hasWeakLinkage()) &&
         IncrementalExported.insert(Name).second) {
       ExportedThisModule.emplace_back(Name.str(), GD);
+      ExportedByUnit[getContext().getTranslationUnitDecl()].emplace_back(
+          Name.str(), GD);
       GV->setLinkage(llvm::GlobalValue::ExternalLinkage);
       GV->setVisibility(llvm::GlobalValue::DefaultVisibility);
       GV->setDSOLocal(false);
@@ -9047,6 +9049,7 @@ void CodeGenModule::moveLazyEmissionStates(CodeGenModule *NewBuilder) {
          "Newly created module should not have manglings");
   NewBuilder->Manglings = std::move(Manglings);
   NewBuilder->IncrementalExported = std::move(IncrementalExported);
+  NewBuilder->ExportedByUnit = std::move(ExportedByUnit);
 
   NewBuilder->WeakRefReferences = std::move(WeakRefReferences);
 
@@ -9071,10 +9074,21 @@ void CodeGenModule::discardIncrementalModule() {
     DeferredDecls[getMangledName(GD)] = GD;
   }
   ExportedThisModule.clear();
+  ExportedByUnit.erase(getContext().getTranslationUnitDecl());
 }
 
 void CodeGenModule::forgetIncrementalUnit(const TranslationUnitDecl *TU) {
   auto InUnit = [&](const Decl *D) { return D && D->getTranslationUnitDecl() == TU; };
+  // What its module exported: no longer there to link to -- deferred again
+  // (emitted where next used), unless it is the unit's own.
+  if (auto It = ExportedByUnit.find(TU); It != ExportedByUnit.end()) {
+    for (auto &[Name, GD] : It->second) {
+      IncrementalExported.erase(Name);
+      if (!InUnit(GD.getDecl()))
+        DeferredDecls[getMangledName(GD)] = GD;
+    }
+    ExportedByUnit.erase(It);
+  }
   llvm::SmallVector<StringRef, 8> Deferred;
   for (const auto &[Name, GD] : DeferredDecls)
     if (InUnit(GD.getDecl()))
