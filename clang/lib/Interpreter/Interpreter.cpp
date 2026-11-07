@@ -66,6 +66,7 @@
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "llvm/ExecutionEngine/Orc/EPCDynamicLibrarySearchGenerator.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/Errc.h"
@@ -1402,6 +1403,35 @@ llvm::Error Interpreter::Execute(PartialTranslationUnit &T) {
     auto Err = CreateExecutor();
     if (Err)
       return Err;
+  }
+  // cppsh: CPPSH_TRACE_MODULE: each module added, what it defines and the
+  // global variables it uses from elsewhere, with the functions using them.
+  if (::getenv("CPPSH_TRACE_MODULE")) {
+    llvm::Module &M = *T.TheModule;
+    llvm::errs() << "cppsh-module: " << M.getName() << " defines:";
+    for (llvm::GlobalValue &G : M.global_values())
+      if (!G.isDeclaration())
+        llvm::errs() << " " << G.getName();
+    llvm::errs() << "\n";
+    for (llvm::GlobalVariable &G : M.globals()) {
+      if (!G.isDeclaration())
+        continue;
+      llvm::errs() << "cppsh-module:   uses variable " << G.getName() << " in:";
+      llvm::SmallVector<llvm::User *, 8> Work(G.users());
+      llvm::SmallPtrSet<llvm::User *, 16> Seen;
+      while (!Work.empty()) {
+        llvm::User *U = Work.pop_back_val();
+        if (!Seen.insert(U).second)
+          continue;
+        if (auto *I = llvm::dyn_cast<llvm::Instruction>(U))
+          llvm::errs() << " " << I->getFunction()->getName();
+        else if (auto *GV = llvm::dyn_cast<llvm::GlobalValue>(U))
+          llvm::errs() << " " << GV->getName();
+        else
+          Work.append(U->user_begin(), U->user_end());
+      }
+      llvm::errs() << "\n";
+    }
   }
   // FIXME: Add a callback to retain the llvm::Module once the JIT is done.
   if (auto Err = IncrExecutor->addModule(T))
