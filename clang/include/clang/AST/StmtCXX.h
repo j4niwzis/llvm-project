@@ -1139,6 +1139,7 @@ class CppshStagedStmt final
   unsigned NumTargets = 0;
   Stmt **Entries = nullptr;
   unsigned NumEntries = 0;
+  bool PrintsValue = false;
 
   // Trailing: the body, then the frame.
   CppshStagedStmt(EmptyShell Empty, unsigned NumFrame)
@@ -1194,6 +1195,11 @@ public:
   /// run starting there.
   ArrayRef<Stmt *> entries() const { return {Entries, NumEntries}; }
   void setEntries(const ASTContext &C, ArrayRef<Stmt *> E);
+
+  /// Whether its body's last statement is an expression whose value is
+  /// shown (the last of an input, its `;` not written).
+  bool printsValue() const { return PrintsValue; }
+  void setPrintsValue(bool V) { PrintsValue = V; }
 
   SourceLocation getBeginLoc() const { return BeginLoc; }
   SourceLocation getEndLoc() const { return EndLoc; }

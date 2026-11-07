@@ -1853,6 +1853,7 @@ void ASTStmtWriter::VisitCppshStagedStmt(CppshStagedStmt *S) {
   Record.push_back(S->entries().size());
   for (Stmt *E : S->entries())
     Record.AddStmt(E);
+  Record.push_back(S->printsValue());
   Code = serialization::STMT_CPPSH_STAGED;
 }
 

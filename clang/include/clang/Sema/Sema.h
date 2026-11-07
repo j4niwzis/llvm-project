@@ -16112,6 +16112,9 @@ public:
     /// the statement's I-th entry), and the label each entry is in it.
     ParmVarDecl *Entry = nullptr;
     SmallVector<LabelDecl *, 4> EntryLabels;
+    /// What shows an expression's value (the interpreter's), for a body
+    /// whose last statement's value is shown.
+    llvm::function_ref<Expr *(Expr *)> PrintValue;
   };
   CppshStagedRun *CurrentCppshStagedRun = nullptr;
 

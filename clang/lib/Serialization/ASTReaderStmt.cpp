@@ -1837,6 +1837,7 @@ void ASTStmtReader::VisitCppshStagedStmt(CppshStagedStmt *S) {
   for (unsigned I = 0, E = Record.readInt(); I < E; ++I)
     Entries.push_back(Record.readSubStmt());
   S->setEntries(Record.getContext(), Entries);
+  S->setPrintsValue(Record.readInt());
 }
 
 void ASTStmtReader::VisitCppshStagedExitStmt(CppshStagedExitStmt *S) {

@@ -1798,6 +1798,17 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     if (!cppshReport(Interp.cppshBeginBuild()))
       return Fail("no unit to compile it in");
     const QualType VoidPtrPtr = Ctx.getPointerType(Ctx.VoidPtrTy);
+    // The interpreter's value printing, for a body whose last statement's
+    // value is shown.
+    auto PrintValueFn = [&](Expr *E) -> Expr * {
+      llvm::Expected<Expr *> Shown = Interp.convertExprToValue(E);
+      if (!Shown) {
+        llvm::consumeError(Shown.takeError());
+        return nullptr;
+      }
+      return *Shown;
+    };
+    llvm::function_ref<Expr *(Expr *)> PrintValue = PrintValueFn;
     Sema::CppshStagedRun Run;
     Run.KeepsResult = Keep;
     Run.ReturnType = Keep ? QualType() : Outer ? Outer->getReturnType() : Ctx.VoidTy;
@@ -1810,6 +1821,7 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
           Run.Function = Fn;
           Run.Slot = Ps[1];
           Run.Entry = Ps[2];
+          Run.PrintValue = PrintValue;
           // Known to code generation: staged code inside it leaves through
           // it, and returns its value where its slot points.
           Fn->addAttr(AnnotateAttr::CreateImplicit(Ctx, "cppsh.staged.run",

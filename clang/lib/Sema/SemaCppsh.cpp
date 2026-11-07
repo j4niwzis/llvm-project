@@ -528,6 +528,13 @@ StmtResult Sema::InstantiateCppshStaged(CppshStagedStmt *S,
   StmtResult Body = SubstStmt(S->getBody(), Args);
   if (Body.isInvalid())
     return Body;
+  // Its last statement's value shown (the last of an input, its `;` not
+  // written): as the interpreter shows any.
+  if (S->printsValue() && Run.PrintValue)
+    if (auto *C = dyn_cast<CompoundStmt>(Body.get()); C && !C->body_empty())
+      if (auto *Last = dyn_cast<Expr>(C->body_back()))
+        if (Expr *Shown = Run.PrintValue(Last))
+          C->body_begin()[C->size() - 1] = Shown;
   // Entered elsewhere than at its start: `if (entry == I + 1) goto L;` for
   // each entry, L the label it is in the body compiled -- a label's own
   // instantiation, a case's made of it (ActOnCppshStagedEntry).

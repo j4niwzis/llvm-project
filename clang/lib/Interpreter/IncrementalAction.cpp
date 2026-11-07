@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/AST/StmtCXX.h"
 #include "IncrementalAction.h"
 
 #include "clang/AST/ASTConsumer.h"
@@ -154,6 +155,17 @@ bool InProcessPrintingASTConsumer::HandleTopLevelDecl(DeclGroupRef DGR) {
   for (Decl *D : DGR)
     if (auto *TLSD = llvm::dyn_cast<TopLevelStmtDecl>(D))
       if (TLSD && TLSD->isSemiMissing()) {
+        // cppsh: a staged statement (alone, or after the locals made for
+        // it): its last statement's value shown as it runs.
+        Stmt *St = TLSD->getStmt();
+        if (auto *C = dyn_cast_or_null<CompoundStmt>(St); C && !C->body_empty())
+          St = C->body_back();
+        if (auto *Staged = dyn_cast_or_null<CppshStagedStmt>(St)) {
+          Staged->setPrintsValue(true);
+          continue;
+        }
+        if (!isa_and_nonnull<Expr>(TLSD->getStmt()))
+          continue;
         auto ExprOrErr = Interp.convertExprToValue(cast<Expr>(TLSD->getStmt()));
         if (llvm::Error E = ExprOrErr.takeError()) {
           llvm::logAllUnhandledErrors(std::move(E), llvm::errs(),
