@@ -1772,6 +1772,18 @@ static thread_local std::vector<CppshRunInFlight> CppshRunsInFlight;
 // it, called by the code that reached it.
 static std::recursive_mutex CppshInterpreterLock;
 
+// The code each staged statement was last reached and run with, and the
+// bytes of the locals it was compiled for: where they are the same again,
+// that code at once, nothing else looked at (__cppsh_staged_prepare) -- the
+// cost of reaching compiled staged code a lock and a comparison. Only code
+// keeping no result and using no staged call's: its frame then the one it is
+// handed, as it is; and only locals of plain data.
+struct CppshLastRun {
+  void *Address = nullptr;
+  SmallVector<std::pair<unsigned, std::string>, 4> Bytes;
+};
+static llvm::DenseMap<const CppshStagedStmt *, CppshLastRun> CppshLastRuns;
+
 static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
                           void *Slot, int Entry, void *OuterPromise = nullptr,
                           void **HandleOut = nullptr, void **FnOut = nullptr,
@@ -2267,6 +2279,25 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     *FnOut = Found->Address;
     *SlotOut = Slot;
     CppshRunsInFlight.push_back({SS, Keep, ResultName, CppshKeptResults, Entry});
+    // Remembered for the next time, where it can be.
+    CppshLastRun Last;
+    Last.Address = Found->Address;
+    bool Plain = !Keep && SD->resultTypeParms().empty();
+    for (unsigned I : Found->Wanted) {
+      if (!Plain)
+        break;
+      if (I >= N || !Objects[I] || !Types[I].isTriviallyCopyableType(Ctx)) {
+        Plain = false;
+        break;
+      }
+      const size_t Size = Ctx.getTypeSizeInChars(Types[I]).getQuantity();
+      Last.Bytes.push_back(
+          {I, std::string(static_cast<const char *>(Objects[I]), Size)});
+    }
+    if (Plain)
+      CppshLastRuns[SS] = std::move(Last);
+    else
+      CppshLastRuns.erase(SS);
     return 0;
   }
   using StagedFn = int (*)(void **, void *, int);
@@ -2314,6 +2345,17 @@ extern "C" void *__cppsh_staged_prepare(const void *Node, void *const *Frame,
     return nullptr;
   }
   std::lock_guard<std::recursive_mutex> Lock(CppshInterpreterLock);
+  // Reached with the values it was last run with: that code.
+  if (auto It = CppshLastRuns.find(static_cast<const CppshStagedStmt *>(Node));
+      It != CppshLastRuns.end() &&
+      llvm::all_of(It->second.Bytes, [&](const auto &Saved) {
+        const void *Object = Frame[Saved.first];
+        return Object &&
+               std::memcmp(Object, Saved.second.data(), Saved.second.size()) == 0;
+      })) {
+    *SlotOut = Slot;
+    return It->second.Address;
+  }
   void *Fn = nullptr;
   *SlotOut = nullptr;
   cppshRunStaged(static_cast<const CppshStagedStmt *>(Node), Frame, Slot, Entry,
@@ -2497,6 +2539,8 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
 // forgotten -- the statements those units held, and the code compiled into
 // them for any statement.
 static void cppshForgetCompiledIn(ArrayRef<const TranslationUnitDecl *> Gone) {
+  // (The code last run of each: none to be trusted now.)
+  CppshLastRuns.clear();
   auto IsGone = [&](const Decl *D) {
     return D && llvm::is_contained(Gone, D->getTranslationUnitDecl());
   };

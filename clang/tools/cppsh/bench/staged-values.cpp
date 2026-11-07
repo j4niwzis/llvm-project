@@ -17,6 +17,6 @@ template <class F> double ms(F f) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-{ long t = 0; same(0); double d = ms([&] { for (int i = 0; i < 100000; ++i) t += same(i); }); std::println("same  {:8.1f} ms ({:.2f} us each) {}", d, d * 10, t); }
-{ long t = 0; double d = ms([&] { for (int i = 0; i < 100000; ++i) t += plain(i); }); std::println("plain {:8.1f} ms ({:.4f} us each) {}", d, d * 10, t); }
+{ long t = 0; same(0); double d = ms([&] { for (int i = 0; i < 100000; ++i) t += same(i); }); std::println("same  {:8.1f} ms ({:.3f} us each) {}", d, d / 100, t); }
+{ long t = 0; double d = ms([&] { for (int i = 0; i < 100000; ++i) t += plain(i); }); std::println("plain {:8.1f} ms ({:.4f} us each) {}", d, d / 100, t); }
 { long t = 0; double d = ms([&] { for (int i = 1; i <= 50; ++i) t += many(i); }); std::println("many  {:8.1f} ms ({:.1f} ms each) {}", d, d / 50, t); }
