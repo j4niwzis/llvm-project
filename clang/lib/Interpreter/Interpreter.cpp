@@ -1701,6 +1701,9 @@ struct CppshStagedCompiled {
   // A staged function's rest: the type of the result its returns give.
   QualType Result;
 };
+// The code compiled for each staged statement, by the values it was compiled
+// for (cppshRunStaged).
+std::map<const CppshStagedStmt *, std::vector<CppshStagedCompiled>> CppshCompiled;
 // A local's value as staged code is compiled with it: read from memory
 // (plain data) or rebuilt from its snapshot; its profile, for finding the
 // instantiation compiled with it again.
@@ -1845,7 +1848,8 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
   };
 
   // An instantiation compiled with the values the locals it wanted have now.
-  static std::map<const CppshStagedStmt *, std::vector<CppshStagedCompiled>> Compiled;
+  std::map<const CppshStagedStmt *, std::vector<CppshStagedCompiled>> &Compiled =
+      CppshCompiled;
   static unsigned Count = 0;
   std::vector<CppshStagedCompiled> &Instances = Compiled[Staged];
   const QualType Input =
@@ -2338,6 +2342,25 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
 // values the ones before it made. One that needs the result of a staged
 // function's call, or the value of a run-time template argument, of its own
 // is taken back, what it needs run, and parsed again with it supplied.
+// What was compiled of staged code in units taken back (a failed input's):
+// forgotten -- the statements those units held, and the code compiled into
+// them for any statement.
+static void cppshForgetCompiledIn(ArrayRef<const TranslationUnitDecl *> Gone) {
+  auto IsGone = [&](const Decl *D) {
+    return D && llvm::is_contained(Gone, D->getTranslationUnitDecl());
+  };
+  for (auto It = CppshCompiled.begin(); It != CppshCompiled.end();) {
+    if (IsGone(It->first->getStagedDecl())) {
+      It = CppshCompiled.erase(It);
+      continue;
+    }
+    llvm::erase_if(It->second, [&](const CppshStagedCompiled &C) {
+      return IsGone(C.Function);
+    });
+    ++It;
+  }
+}
+
 llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
   if (DeviceParser) {
     auto PTU = Parse(Code);
@@ -2359,6 +2382,24 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
     return Err;
   Parser &P = cppshParser();
   unsigned Redos = 0;
+  // A failed input taken back whole: each unit it made before the one that
+  // failed -- run one top-level declaration at a time, they were compiled and
+  // run -- out of the AST and the JIT, as Undo takes one back; what was
+  // compiled of staged code in them forgotten. (What their code did as it ran
+  // is done.)
+  const size_t PTUsBefore = PTUs.size();
+  auto Failed = [&](llvm::Error Err) -> llvm::Error {
+    IncrParser->SkipInput();
+    if (PTUs.size() > PTUsBefore) {
+      std::vector<const TranslationUnitDecl *> Gone;
+      for (auto It = std::next(PTUs.begin(), PTUsBefore); It != PTUs.end(); ++It)
+        Gone.push_back(It->TUPart);
+      if (llvm::Error UndoErr = Undo(PTUs.size() - PTUsBefore))
+        Err = llvm::joinErrors(std::move(Err), std::move(UndoErr));
+      cppshForgetCompiledIn(Gone);
+    }
+    return Err;
+  };
   for (bool First = true;;) {
     // Off while it runs: what it compiles (the snapshots) names the same
     // variables, and would snapshot them again, without end.
@@ -2405,26 +2446,20 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
                             : llvm::make_error<llvm::StringError>(
                                   "cppsh: the declaration's tokens are not known",
                                   std::error_code());
-      if (Err) {
-        IncrParser->SkipInput();
-        return Err;
-      }
+      if (Err)
+        return Failed(std::move(Err));
       continue;
     }
     Redos = 0;
     CppshSuppliedExprs.clear();
-    if (!TU) {
-      IncrParser->SkipInput();
-      return TU.takeError();
-    }
+    if (!TU)
+      return Failed(TU.takeError());
     PartialTranslationUnit &PTU = IncrParser->RegisterPTU(*TU);
     if (PTU.TheModule) {
       llvm::Error Err = Execute(PTU);
       CppshExecuteNs += Since();
-      if (Err) {
-        IncrParser->SkipInput();
-        return Err;
-      }
+      if (Err)
+        return Failed(std::move(Err));
     }
     if (LastValue.isValid()) {
       if (!V) {
