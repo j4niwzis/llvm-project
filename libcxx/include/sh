@@ -997,9 +997,19 @@ void __cppsh_word(std::vector<std::string> &out, const T &v) {
 }
 
 #if __has_include(<spawn.h>)
+// Whether the shell does job control: an interactive one, the leader of its
+// own process group and the terminal's foreground group (what cppsh makes
+// itself at its prompt). A script, or a test piped in, leaves the terminal
+// and the process groups alone, as bash running a script does -- a crash
+// then never leaves the terminal to a group of its own.
+inline bool __cppsh_job_control() {
+  return ::isatty(0) && ::getpgrp() == ::getpid() && ::tcgetpgrp(0) == ::getpgrp();
+}
+
 // A process started: argv, its stdin/stdout/stderr the descriptors given
 // (-1: the shell's own), in the process group `group` (0: a new one, its
-// own). The descriptors the shell keeps for other stages are closed in it.
+// own; without job control, the shell's). The descriptors the shell keeps
+// for other stages are closed in it.
 inline pid_t __cppsh_spawn(const std::vector<std::string> &argv, int in, int out,
                            int err, pid_t group, const std::vector<int> &close_fds) {
   posix_spawn_file_actions_t fa;
@@ -1014,7 +1024,8 @@ inline pid_t __cppsh_spawn(const std::vector<std::string> &argv, int in, int out
     posix_spawn_file_actions_addclose(&fa, fd);
   posix_spawnattr_t at;
   posix_spawnattr_init(&at);
-  posix_spawnattr_setpgroup(&at, group);
+  const bool own_group = __cppsh_job_control();
+  posix_spawnattr_setpgroup(&at, own_group ? group : ::getpgrp());
   // The signals the shell catches or ignores, as a program finds them.
   sigset_t def;
   sigemptyset(&def);
@@ -1041,7 +1052,7 @@ inline pid_t __cppsh_spawn(const std::vector<std::string> &argv, int in, int out
 // pager raw, an editor without echo) and left so when it stopped or died is
 // not the prompt's.
 struct __cppsh_foreground {
-  bool tty = ::isatty(0);
+  bool tty = __cppsh_job_control();
   termios modes{};
   bool have_modes = tty && ::tcgetattr(0, &modes) == 0;
   explicit __cppsh_foreground(pid_t group) {
