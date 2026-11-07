@@ -1631,8 +1631,11 @@ void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
     else if (InRun)
       Leave(1, [&] { LeaveRun(1); });
   }
+  // (A switch around it has the continue of the loop around the switch --
+  // none where that loop is outside the staged code it is compiled in.)
   if (S.leaves(CppshStagedStmt::LeavesByContinue)) {
-    if (!BreakContinueStack.empty())
+    if (!BreakContinueStack.empty() &&
+        BreakContinueStack.back().ContinueBlock.isValid())
       Leave(2, [&] { EmitBranchThroughCleanup(BreakContinueStack.back().ContinueBlock); });
     else if (InRun)
       Leave(2, [&] { LeaveRun(2); });
