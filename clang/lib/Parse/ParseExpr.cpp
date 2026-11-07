@@ -174,9 +174,15 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
                        tok::unknown);
     };
     bool Shell = shellOnly(Tok) || isPathStart();
+    // A name glued to a '-', '/' or '.' -- `clang-format`, `test/a.cpp`,
+    // `notes.txt` -- a word too, where the name is none C++ knows (below):
+    // `n-1`, `a/b`, `e.name` with n, a, e declared stay C++.
+    const bool Named = Tok.is(tok::identifier);
     unsigned Glued = 0;
     while (!endsWord(GetLookAheadToken(Glued + 1))) {
-      Shell = Shell || shellOnly(GetLookAheadToken(Glued + 1));
+      const Token &Next = GetLookAheadToken(Glued + 1);
+      Shell = Shell || shellOnly(Next) ||
+              (Named && Next.isOneOf(tok::minus, tok::slash, tok::period));
       ++Glued;
     }
     // A word of one token is one only where it is a path's mark alone
@@ -998,6 +1004,50 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
     if (!Sym.isUsable())
       return ExprError();
     return Sym;
+  }
+
+  // cppsh: a command named with a '-', '/' or '.' in it -- `llvm-lit`,
+  // `clang-format`, `tools/run`, `run.sh` -- as an expression's first word,
+  // in what the user typed, where its first part is a name C++ does not know:
+  // the symbol of the word as written, as a path is above. `n-1` with n
+  // declared stays a subtraction.
+  if (PP.isIncrementalProcessingEnabled() && !PP.isBacktrackEnabled() &&
+      Tok.is(tok::identifier) &&
+      NextToken().isOneOf(tok::minus, tok::slash, tok::period) &&
+      !NextToken().hasLeadingSpace() &&
+      !GetLookAheadToken(2).hasLeadingSpace() &&
+      GetLookAheadToken(2).isOneOf(tok::identifier, tok::numeric_constant) &&
+      PP.getSourceManager()
+          .getBufferName(PP.getSourceManager().getFileLoc(Tok.getLocation()))
+          .starts_with("input_line_")) {
+    LookupResult Known(Actions, Tok.getIdentifierInfo(), Tok.getLocation(),
+                       Sema::LookupOrdinaryName);
+    Actions.LookupName(Known, getCurScope());
+    Known.suppressDiagnostics();
+    if (Known.empty()) {
+      unsigned Glued = 0;
+      for (;;) {
+        const Token &Next = GetLookAheadToken(Glued + 1);
+        if (Next.hasLeadingSpace() || Next.isAtStartOfLine() ||
+            Next.isOneOf(tok::eof, tok::semi, tok::pipe, tok::pipepipe,
+                         tok::ampamp, tok::r_paren, tok::r_brace, tok::comma,
+                         tok::l_paren, tok::l_brace, tok::equal))
+          break;
+        ++Glued;
+      }
+      SourceLocation Begin = Tok.getLocation();
+      SourceLocation Last = GetLookAheadToken(Glued).getLocation();
+      std::string Word =
+          Lexer::getSourceText(CharSourceRange::getTokenRange(Begin, Last),
+                               PP.getSourceManager(), getLangOpts())
+              .str();
+      for (unsigned I = 0; I <= Glued; ++I)
+        ConsumeAnyToken();
+      ExprResult Sym = Actions.BuildOperatorUnresolvedCall(getCurScope(), Begin, Word);
+      if (!Sym.isUsable())
+        return ExprError();
+      return Sym;
+    }
   }
 
   // This handles all of cast-expression, unary-expression, postfix-expression,
