@@ -3099,6 +3099,130 @@ void clang::cppshForgetSpecializationsSince(size_t Mark) {
     CppshSpecLog.resize(Mark);
 }
 
+namespace {
+// cppsh: a specialization on argument values being made -- a free function
+// template's (VisitFunctionDecl) or a member function template's
+// (VisitCXXMethodDecl) alike: one made before for the values it reads found
+// again (begin); the new one tagged (its mangled name its own), its
+// parameters bound as the pattern's are (copyBinding), recorded where the
+// template arguments alone do not find it (record); what its making read
+// noted as it ends.
+class CppshValueMaking {
+  const FunctionDecl *Pattern = nullptr;
+  llvm::FoldingSetNodeID Head;
+  SmallVector<std::optional<llvm::FoldingSetNodeID>, 4> Params;
+  // What is read as it is made (none of it a hit's).
+  std::optional<CppshReadWindow> Window;
+  CppshValueSpec *Made = nullptr;
+
+public:
+  CppshValueMaking() = default;
+  CppshValueMaking(const CppshValueMaking &) = delete;
+  CppshValueMaking &operator=(const CppshValueMaking &) = delete;
+  // Noted before the window closes (a member destroyed after this body).
+  ~CppshValueMaking() {
+    if (Made && Pattern) {
+      CppshReadWindow::note(*Made, Pattern->parameters());
+      CppshReadWindow::note(*Made, Made->Function->parameters());
+    }
+  }
+
+  // Whether a parameter of D is bound to a value -- or pending on one: a
+  // specialization made with it is forgotten if it reads it, none to be
+  // found by the template arguments alone either way.
+  static bool hasBoundParam(const FunctionDecl *D) {
+    return llvm::any_of(D->parameters(), [](const ParmVarDecl *P) {
+      return P && (P->hasConstantInitialization() || CppshParamRebuild.count(P) ||
+                   CppshParamValue.count(P) || CppshParamPending.count(P));
+    });
+  }
+
+  // The one made before for the values the parameters have now -- of those
+  // it read -- if any; otherwise the making begun.
+  FunctionDecl *begin(Sema &S, FunctionTemplateDecl *Template,
+                      ArrayRef<TemplateArgument> Innermost, const FunctionDecl *D) {
+    Pattern = D;
+    Head.AddPointer(Template->getCanonicalDecl());
+    for (const TemplateArgument &A : Innermost)
+      A.Profile(Head, S.Context);
+    for (const ParmVarDecl *P : D->parameters()) {
+      std::optional<llvm::FoldingSetNodeID> &K = Params.emplace_back();
+      if (auto Known = CppshParamValue.find(P); Known != CppshParamValue.end()) {
+        K.emplace().AddInteger(1u);
+        Known->second.Profile(*K);
+      } else if (const Expr *Rebuild = CppshParamRebuild.lookup(P)) {
+        K.emplace().AddInteger(2u);
+        Rebuild->Profile(*K, S.Context, /*Canonical=*/true);
+      } else if (const APValue *V = P && P->hasConstantInitialization()
+                                        ? P->getEvaluatedValue()
+                                        : nullptr) {
+        K.emplace().AddInteger(3u);
+        V->Profile(*K);
+      }
+    }
+    for (auto [It, End] = CppshSpecializations.equal_range(Head.computeHash());
+         It != End; ++It)
+      if (It->second->matches(Head, Params))
+        return It->second->Function;
+    Window.emplace();
+    return nullptr;
+  }
+
+  // Its own name: the function's, told apart from the other specializations
+  // of the same template arguments by an ABI tag -- the mangling's own way of
+  // naming variants of one declaration.
+  void tag(Sema &S, FunctionDecl *F) {
+    static unsigned Counter = 0;
+    std::string Tag = "cppsh_v" + std::to_string(++Counter);
+    StringRef Tags[] = {Tag};
+    F->addAttr(AbiTagAttr::CreateImplicit(S.Context, Tags, 1,
+                                          Pattern ? Pattern->getLocation()
+                                                  : F->getLocation()));
+  }
+
+  // A parameter of the new function bound as the pattern's is.
+  static void copyBinding(const ParmVarDecl *OrigP, ParmVarDecl *NewP) {
+    if (!OrigP || !NewP)
+      return;
+    if (const Expr *Rebuild = CppshParamRebuild.lookup(OrigP))
+      CppshParamRebuild[NewP] = Rebuild;
+    if (auto Known = CppshParamValue.find(OrigP); Known != CppshParamValue.end()) {
+      APValue Value = Known->second;
+      CppshParamValue[NewP] = std::move(Value);
+    }
+    if (auto Pending = CppshParamPending.find(OrigP);
+        Pending != CppshParamPending.end()) {
+      const VarDecl *Source = Pending->second;
+      CppshParamPending[NewP] = Source;
+    }
+    if (OrigP->hasConstantInitialization())
+      if (const APValue *Val = OrigP->getEvaluatedValue()) {
+        EvaluatedStmt *ES = NewP->ensureEvaluatedStmt();
+        ES->WasEvaluated = true;
+        ES->HasConstantInitialization = true;
+        ES->Evaluated = *Val;
+      }
+  }
+
+  // A specialization of Template on these arguments -- not the one they
+  // alone find -- found again by its values (CppshSpecializations).
+  void record(Sema &S, FunctionDecl *F, FunctionTemplateDecl *Template,
+              ArrayRef<TemplateArgument> Innermost) {
+    F->setUnlistedFunctionTemplateSpecialization(
+        Template, TemplateArgumentList::CreateCopy(S.Context, Innermost));
+    auto Spec = std::make_unique<CppshValueSpec>();
+    Spec->Head = Head;
+    Spec->Function = F;
+    Spec->Params.assign(Params.begin(), Params.end());
+    Spec->Read.resize(Params.size());
+    Made = Spec.get();
+    CppshSpecOf[F] = Spec.get();
+    CppshSpecLog.push_back(Spec.get());
+    CppshSpecializations.emplace(Head.computeHash(), std::move(Spec));
+  }
+};
+} // namespace
+
 Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     FunctionDecl *D, TemplateParameterList *TemplateParams,
     RewriteKind FunctionRewriteKind) {
@@ -3124,60 +3248,19 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     }
   }
 
-  bool HasCppshConstParam = false;
-  for (const ParmVarDecl *P : D->parameters()) {
-    // (A pending one too: made with it, a specialization forgotten if it
-    // reads it -- none to be found by the template arguments alone.)
-    if (P && (P->hasConstantInitialization() || CppshParamRebuild.count(P) ||
-              CppshParamValue.count(P) || CppshParamPending.count(P))) {
-      HasCppshConstParam = true;
-      break;
-    }
-  }
-
   // cppsh: a specialization on argument values made once for each set of
   // the values it reads -- its template, its template arguments, the values
   // of the parameters it read -- and found again: a repeated `ls` with the
   // same options, f(1) twice, the one made before (each call instantiated a
   // new one, ~80 ms).
-  llvm::FoldingSetNodeID CppshHead;
-  SmallVector<std::optional<llvm::FoldingSetNodeID>, 4> CppshParams;
-  // What is read as it is made (none of it a hit's).
-  std::optional<CppshReadWindow> CppshWindow;
-  CppshValueSpec *CppshMade = nullptr;
-  if (FunctionTemplate && !TemplateParams && HasCppshConstParam) {
-    CppshHead.AddPointer(FunctionTemplate->getCanonicalDecl());
-    for (const TemplateArgument &A : TemplateArgs.getInnermost())
-      A.Profile(CppshHead, SemaRef.Context);
-    for (const ParmVarDecl *P : D->parameters()) {
-      std::optional<llvm::FoldingSetNodeID> &K = CppshParams.emplace_back();
-      if (auto Known = CppshParamValue.find(P); Known != CppshParamValue.end()) {
-        K.emplace().AddInteger(1u);
-        Known->second.Profile(*K);
-      } else if (const Expr *Rebuild = CppshParamRebuild.lookup(P)) {
-        K.emplace().AddInteger(2u);
-        Rebuild->Profile(*K, SemaRef.Context, /*Canonical=*/true);
-      } else if (const APValue *V = P && P->hasConstantInitialization()
-                                        ? P->getEvaluatedValue()
-                                        : nullptr) {
-        K.emplace().AddInteger(3u);
-        V->Profile(*K);
-      }
-    }
-    for (auto [It, End] = CppshSpecializations.equal_range(CppshHead.computeHash());
-         It != End; ++It)
-      if (It->second->matches(CppshHead, CppshParams))
-        return It->second->Function;
-    CppshWindow.emplace();
-  }
-  // What this making read, noted before the window closes (declared after
-  // it: run first).
-  auto CppshNoteReads = llvm::scope_exit([&] {
-    if (CppshMade) {
-      CppshReadWindow::note(*CppshMade, D->parameters());
-      CppshReadWindow::note(*CppshMade, CppshMade->Function->parameters());
-    }
-  });
+  CppshValueMaking CppshMaking;
+  const bool HasCppshConstParam = FunctionTemplate && !TemplateParams &&
+                                  CppshValueMaking::hasBoundParam(D);
+  if (HasCppshConstParam)
+    if (FunctionDecl *Made =
+            CppshMaking.begin(SemaRef, FunctionTemplate,
+                              TemplateArgs.getInnermost(), D))
+      return Made;
 
   if (FunctionTemplate && !TemplateParams && !HasCppshConstParam) {
     ArrayRef<TemplateArgument> Innermost = TemplateArgs.getInnermost();
@@ -3292,16 +3375,9 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     Function->setImplicitlyInline();
 
   // cppsh: a specialization on argument values keeps the function's own name
-  // (diagnostics, printing, lookup see `f`) and is told apart from the other
-  // specializations with the same template arguments by an ABI tag -- the
-  // mangling's own way of naming variants of one declaration.
-  if (HasCppshConstParam) {
-    static unsigned CppshSpecCounter = 0;
-    std::string Tag = "cppsh_v" + std::to_string(++CppshSpecCounter);
-    StringRef Tags[] = {Tag};
-    Function->addAttr(AbiTagAttr::CreateImplicit(SemaRef.Context, Tags, 1,
-                                                 D->getLocation()));
-  }
+  // (diagnostics, printing, lookup see `f`), its mangled one its own.
+  if (HasCppshConstParam)
+    CppshMaking.tag(SemaRef, Function);
 
   if (QualifierLoc)
     Function->setQualifierInfo(QualifierLoc);
@@ -3327,28 +3403,8 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
   for (unsigned P = 0; P < Params.size(); ++P) {
     if (Params[P]) {
       Params[P]->setOwningFunction(Function);
-      if (P < D->getNumParams()) {
-        const ParmVarDecl *OrigP = D->getParamDecl(P);
-        if (const Expr *Rebuild = CppshParamRebuild.lookup(OrigP))
-          CppshParamRebuild[Params[P]] = Rebuild;
-        if (auto Known = CppshParamValue.find(OrigP); Known != CppshParamValue.end()) {
-          APValue Value = Known->second;
-          CppshParamValue[Params[P]] = std::move(Value);
-        }
-        if (auto Pending = CppshParamPending.find(OrigP);
-            Pending != CppshParamPending.end()) {
-          const VarDecl *Source = Pending->second;
-          CppshParamPending[Params[P]] = Source;
-        }
-        if (OrigP && OrigP->hasConstantInitialization()) {
-          if (const APValue *Val = OrigP->getEvaluatedValue()) {
-            EvaluatedStmt *ES = Params[P]->ensureEvaluatedStmt();
-            ES->WasEvaluated = true;
-            ES->HasConstantInitialization = true;
-            ES->Evaluated = *Val;
-          }
-        }
-      }
+      if (P < D->getNumParams())
+        CppshValueMaking::copyBinding(D->getParamDecl(P), Params[P]);
     }
   }
   Function->setParams(Params);
@@ -3391,25 +3447,12 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     // cppsh: one on argument values is not the one found by the template
     // arguments alone (CppshSpecializations finds it).
     if (HasCppshConstParam)
-      Function->setUnlistedFunctionTemplateSpecialization(
-          FunctionTemplate,
-          TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost));
+      CppshMaking.record(SemaRef, Function, FunctionTemplate, Innermost);
     else
       Function->setFunctionTemplateSpecialization(
           FunctionTemplate,
           TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost),
           /*InsertToken=*/{});
-    if (HasCppshConstParam) {
-      auto Spec = std::make_unique<CppshValueSpec>();
-      Spec->Head = CppshHead;
-      Spec->Function = Function;
-      Spec->Params.assign(CppshParams.begin(), CppshParams.end());
-      Spec->Read.resize(CppshParams.size());
-      CppshMade = Spec.get();
-      CppshSpecOf[Function] = Spec.get();
-      CppshSpecLog.push_back(Spec.get());
-      CppshSpecializations.emplace(CppshHead.computeHash(), std::move(Spec));
-    }
   } else if (isFriend && D->isThisDeclarationADefinition()) {
     // Do not connect the friend to the template unless it's actually a
     // definition. We don't want non-template functions to be marked as being
@@ -3602,7 +3645,17 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
     CXXMethodDecl *D, TemplateParameterList *TemplateParams,
     RewriteKind FunctionRewriteKind) {
   FunctionTemplateDecl *FunctionTemplate = D->getDescribedFunctionTemplate();
-  if (FunctionTemplate && !TemplateParams) {
+  // cppsh: a member function template specialized on argument values
+  // (`obj.pick(o)`), as a free one is (CppshValueMaking).
+  CppshValueMaking CppshMaking;
+  const bool HasCppshConstParam = FunctionTemplate && !TemplateParams &&
+                                  CppshValueMaking::hasBoundParam(D);
+  if (HasCppshConstParam)
+    if (FunctionDecl *Made =
+            CppshMaking.begin(SemaRef, FunctionTemplate,
+                              TemplateArgs.getInnermost(), D))
+      return Made;
+  if (FunctionTemplate && !TemplateParams && !HasCppshConstParam) {
     // We are creating a function template specialization from a function
     // template. Check whether there is already a function template
     // specialization for this particular set of template arguments.
@@ -3783,6 +3836,8 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
 
   if (D->isInlined())
     Method->setImplicitlyInline();
+  if (HasCppshConstParam)
+    CppshMaking.tag(SemaRef, Method);
 
   if (QualifierLoc)
     Method->setQualifierInfo(QualifierLoc);
@@ -3814,10 +3869,13 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
   } else if (FunctionTemplate) {
     // Record this function template specialization.
     ArrayRef<TemplateArgument> Innermost = TemplateArgs.getInnermost();
-    Method->setFunctionTemplateSpecialization(
-        FunctionTemplate,
-        TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost),
-        /*InsertToken=*/{});
+    if (HasCppshConstParam)
+      CppshMaking.record(SemaRef, Method, FunctionTemplate, Innermost);
+    else
+      Method->setFunctionTemplateSpecialization(
+          FunctionTemplate,
+          TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost),
+          /*InsertToken=*/{});
   } else if (!isFriend) {
     // Record that this is an instantiation of a member function.
     Method->setInstantiationOfMemberFunction(D, TSK_ImplicitInstantiation);
@@ -3836,8 +3894,11 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
     Method->setLexicalDeclContext(D->getLexicalDeclContext());
 
   // Attach the parameters
-  for (unsigned P = 0; P < Params.size(); ++P)
+  for (unsigned P = 0; P < Params.size(); ++P) {
     Params[P]->setOwningFunction(Method);
+    if (P < D->getNumParams())
+      CppshValueMaking::copyBinding(D->getParamDecl(P), Params[P]);
+  }
   Method->setParams(Params);
   if (InitMethodInstantiation(Method, D))
     Method->setInvalidDecl();

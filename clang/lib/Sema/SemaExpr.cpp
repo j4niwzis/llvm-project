@@ -8217,7 +8217,11 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         return CallExpr::Create(Context, Fn, ArgExprs, Context.DependentTy,
                                 VK_PRValue, RParenLoc, CurFPFeatureOverrides());
       OverloadExpr *ovl = find.Expression;
-      if (UnresolvedLookupExpr *ULE = dyn_cast<UnresolvedLookupExpr>(ovl)) {
+      // cppsh: a call of an overload set, a free function's or a member
+      // function's (`obj.pick(o)`) alike: its candidates may be specialized
+      // on the arguments' values.
+      if (isa<UnresolvedLookupExpr, UnresolvedMemberExpr>(ovl)) {
+        auto *ULE = dyn_cast<UnresolvedLookupExpr>(ovl);
         // A designated list (`ls {.dir = "/tmp", .files_only = true}`,
         // `f {.x = 1, .y = 2}`), where the name finds one function or
         // template: each designator sent where it names -- a parameter by
@@ -8226,7 +8230,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         // that get nothing taking their default arguments. Arguments before
         // the list stay where they are.
         SmallVector<Expr *, 8> Rearranged;
-        if (ULE->getNumDecls() == 1) {
+        if (ULE && ULE->getNumDecls() == 1) {
           NamedDecl *OnlyD = (*ULE->decls_begin())->getUnderlyingDecl();
           FunctionDecl *OnlyFD = dyn_cast<FunctionDecl>(OnlyD);
           if (auto *FTD = dyn_cast<FunctionTemplateDecl>(OnlyD))
@@ -8318,7 +8322,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
           return PatFD && PatFD->getBody() &&
                  PatFD->getReturnType()->getContainedAutoType();
         };
-        const bool AnyValueCandidate = llvm::any_of(ULE->decls(), ValueCandidate);
+        const bool AnyValueCandidate = llvm::any_of(ovl->decls(), ValueCandidate);
         // What each parameter had before this call set its value: put back
         // once the call is built.
         SmallVector<std::pair<ParmVarDecl *, std::optional<APValue>>, 4> SavedValues;
@@ -8361,7 +8365,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         // it waits for its value -- the call is dependent, resolved as the
         // code is instantiated (the default supplied again then).
         if (CurContext->isDependentContext() && !CppshSuppliedExprs.empty())
-          for (NamedDecl *ND : ULE->decls())
+          for (NamedDecl *ND : ovl->decls())
             if (auto *FTD =
                     dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl()))
               for (NamedDecl *P : *FTD->getTemplateParameters())
@@ -8385,7 +8389,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         // making reads (TemplateDeclInstantiator::VisitFunctionDecl) -- the
         // others it takes at run time, one specialization for every value of
         // them.
-        for (NamedDecl *ND : ULE->decls()) {
+        for (NamedDecl *ND : ovl->decls()) {
           auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
           if (!FTD)
             continue;
@@ -8609,9 +8613,14 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         auto SavedReads = std::exchange(CppshPendingReads, {});
         Sema *const SavedPendingSema = std::exchange(CppshPendingSema, this);
         CppshOnNeedRead = &cppshPendingNeedRead;
-        ExprResult OvRes = BuildOverloadedCallExpr(
-            Scope, Fn, ULE, LParenLoc, ArgExprs, RParenLoc, ExecConfig,
-            /*AllowTypoCorrection=*/true, find.IsAddressOfOperand);
+        ExprResult OvRes =
+            ULE ? BuildOverloadedCallExpr(Scope, Fn, ULE, LParenLoc, ArgExprs,
+                                          RParenLoc, ExecConfig,
+                                          /*AllowTypoCorrection=*/true,
+                                          find.IsAddressOfOperand)
+                : BuildCallToMemberFunction(Scope, Fn, LParenLoc, ArgExprs,
+                                            RParenLoc, ExecConfig, IsExecConfig,
+                                            AllowRecovery);
         CppshPendingSema = SavedPendingSema;
         const VarDecl *NeedRead = nullptr;
         const FunctionDecl *NeedReadFn = nullptr;
