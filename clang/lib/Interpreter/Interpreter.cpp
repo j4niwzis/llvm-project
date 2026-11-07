@@ -2538,8 +2538,19 @@ llvm::Error Interpreter::cppshStageDecl(unsigned Begin, unsigned End, bool Hoist
     // Run in builds of their own: the declaration's need not theirs (their
     // FinishPTU would take them back for it), nor what they meet added to
     // the list walked.
-    const std::vector<SourceRange> Needs = std::exchange(CppshTopNeedExprs, {});
+    std::vector<SourceRange> Needs = std::exchange(CppshTopNeedExprs, {});
     CppshTopNeed = false;
+    // One run for each argument, however many candidates of the call met
+    // it (std::get's overloads each checked it).
+    {
+      llvm::SmallDenseSet<std::pair<SourceLocation::UIntTy, SourceLocation::UIntTy>, 8>
+          Seen;
+      llvm::erase_if(Needs, [&](SourceRange R) {
+        return !Seen.insert({R.getBegin().getRawEncoding(),
+                             R.getEnd().getRawEncoding()})
+                    .second;
+      });
+    }
     for (SourceRange Need : Needs) {
       std::optional<unsigned> B = cppshTokenIndex(Need.getBegin());
       std::optional<unsigned> E = cppshTokenIndex(Need.getEnd());
@@ -2716,6 +2727,11 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
       break;
     }
     const bool Hoist = CppshHoistBegin.isValid() && CppshHoistEnd.isValid();
+    if (cppshTraceStaging())
+      llvm::errs() << "cppsh-trace: top-level declaration parsed: "
+                   << (TU ? "ok" : "taken back") << ", needs "
+                   << (CppshTopNeed ? "run-time template arguments" : "none")
+                   << (Hoist ? ", a staged call" : "") << "\n";
     // Parsed again as long as each time takes a step: a staged call not
     // hoisted yet (one per redo, however many the declaration makes), or
     // its run-time template arguments (all at once, a few times at most).
@@ -2751,6 +2767,8 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
     if (PTU.TheModule) {
       llvm::Error Err = Execute(PTU);
       CppshExecuteNs += Since();
+      if (Err && cppshTraceStaging())
+        llvm::errs() << "cppsh-trace: top-level declaration's code failed to run\n";
       if (Err)
         return Failed(std::move(Err));
     }

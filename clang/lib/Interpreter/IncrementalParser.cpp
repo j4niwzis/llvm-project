@@ -268,6 +268,10 @@ IncrementalParser::ParseNextTopLevel(bool First, bool &Done) {
   const bool Staging =
       CppshTopNeed ||
       (CppshHoistBegin.isValid() && CppshHoistEnd.isValid() && !CppshInHoist);
+  if (cppshTraceStaging())
+    llvm::errs() << "cppsh-trace: top-level declaration "
+                 << (!ADecl ? "none" : Staging ? "held back" : "handed to code generation")
+                 << "\n";
   if (ADecl && !Staging && !Consumer->HandleTopLevelDecl(ADecl.get()))
     return TakeBackPTU("Parsing failed. The consumer rejected a decl");
   return FinishPTU(LocalInstantiations, GlobalInstantiations);
