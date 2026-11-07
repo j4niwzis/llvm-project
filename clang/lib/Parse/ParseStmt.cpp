@@ -1235,11 +1235,11 @@ SmallVector<VarDecl *, 8> Parser::CppshLiveLocals(SourceLocation Loc) {
         Live.push_back(VD);
     // A lambda's body: the enclosing function's locals too -- what the
     // lambda captures of them, which the frame names as the lambda does.
-    if (Sc->getFlags() & Scope::FnScope) {
-      auto *DC = Sc->getEntity();
-      if (!DC || !isLambdaCallOperator(DC))
-        break;
-    }
+    // (A lambda's body scope -- a block scope, no entity of its own -- is
+    // crossed: the function around it goes on.)
+    if ((Sc->getFlags() & Scope::FnScope) &&
+        !(Sc->getFlags() & Scope::BlockScope))
+      break;
   }
   for (size_t R = CppshRangeBase; R < CppshRangeFors.size(); ++R)
     for (Stmt *DSt : {CppshRangeFors[R]->getBeginStmt(), CppshRangeFors[R]->getEndStmt()})
@@ -1745,10 +1745,11 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
   // is around the lambda (a top-level declaration's initializer has no body
   // to cut, and the need would be left unmet: the placeholder compiled).
   bool CppshBody = std::exchange(CppshNextCompoundIsBody, false);
-  if (!CppshBody && !isStmtExpr && getCurScope()->isFunctionScope())
-    if (DeclContext *DC = getCurScope()->getEntity();
-        DC && isLambdaCallOperator(DC))
-      CppshBody = true;
+  // (The lambda's body scope has no entity: its call operator is the
+  // context Sema is in as the body is parsed.)
+  if (!CppshBody && !isStmtExpr && getCurScope()->isFunctionScope() &&
+      isLambdaCallOperator(Actions.CurContext))
+    CppshBody = true;
   const SourceLocation CppshSavedBodyOpen = CppshBodyOpen;
   const size_t CppshSavedRangeBase = CppshRangeBase;
   if (CppshBody) {
