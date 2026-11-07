@@ -50,7 +50,13 @@ bool Parser::isImplicitAutoDeclaration() {
 // cppsh: the template parameters a concise function names after its name
 // (`input<T> text: std::string_view = {} = { ... }`), read by the rewrite of
 // the declaration they begin (below).
-static SmallVector<IdentifierInfo *, 4> CppshExplicitTemplateParams;
+struct CppshTemplateParam {
+  bool IsType = true;          // `T`, `class T`; else non-type
+  SmallVector<Token, 4> Type;  // non-type: its type (none: auto)
+  Token Name;
+  SmallVector<Token, 8> Default; // `= expr`, maybe none
+};
+static SmallVector<CppshTemplateParam, 4> CppshExplicitTemplateParams;
 
 void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
   if (!getLangOpts().CPlusPlus || !Tok.is(tok::identifier) ||
@@ -179,28 +185,73 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
   // put back, and the rest rewritten with those parameters.
   if (NextToken().is(tok::less) &&
       !isKnownCallableOrType(Tok.getIdentifierInfo(), Tok.getLocation())) {
-    SmallVector<IdentifierInfo *, 4> Names;
+    // Each parameter: `T` or `class T` / `typename T` (a type); `n`, `n:
+    // Type` (a value, auto where no type is said); then maybe `= expr`.
+    SmallVector<CppshTemplateParam, 4> Params;
     unsigned K = 2;
     bool Ok = false;
     while (true) {
+      CppshTemplateParam P;
       Token LT = GetLookAheadToken(K);
-      if (LT.isOneOf(tok::kw_class, tok::kw_typename)) {
+      bool Keyword = LT.isOneOf(tok::kw_class, tok::kw_typename);
+      if (Keyword)
+        LT = GetLookAheadToken(++K);
+      if (!LT.is(tok::identifier))
+        break;
+      P.Name = LT;
+      ++K;
+      if (!Keyword && GetLookAheadToken(K).is(tok::colon)) {
+        P.IsType = false;
+        ++K;
+        int Angle = 0;
+        while (true) {
+          Token TT = GetLookAheadToken(K);
+          if (TT.is(tok::eof))
+            break;
+          if (Angle == 0 && TT.isOneOf(tok::equal, tok::comma, tok::greater))
+            break;
+          if (TT.is(tok::less))
+            ++Angle;
+          else if (TT.is(tok::greater))
+            --Angle;
+          P.Type.push_back(TT);
+          ++K;
+        }
+      }
+      if (GetLookAheadToken(K).is(tok::equal)) {
+        if (!Keyword && P.Type.empty())
+          P.IsType = false; // `n = 3`: a value
+        ++K;
+        int Angle = 0, Depth = 0;
+        while (true) {
+          Token DT = GetLookAheadToken(K);
+          if (DT.is(tok::eof))
+            break;
+          if (Angle == 0 && Depth == 0 && DT.isOneOf(tok::comma, tok::greater))
+            break;
+          if (DT.isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
+            ++Depth;
+          else if (DT.isOneOf(tok::r_paren, tok::r_brace, tok::r_square))
+            --Depth;
+          else if (DT.is(tok::less))
+            ++Angle;
+          else if (DT.is(tok::greater))
+            --Angle;
+          P.Default.push_back(DT);
+          ++K;
+        }
+      }
+      Params.push_back(std::move(P));
+      Token Next = GetLookAheadToken(K);
+      if (Next.is(tok::comma)) {
         ++K;
         continue;
       }
-      if (!LT.is(tok::identifier))
-        break;
-      Names.push_back(LT.getIdentifierInfo());
-      Token Next = GetLookAheadToken(K + 1);
-      if (Next.is(tok::comma)) {
-        K += 2;
-        continue;
-      }
       if (Next.is(tok::greater)) {
-        Token After = GetLookAheadToken(K + 2);
+        Token After = GetLookAheadToken(K + 1);
         Ok = After.isOneOf(tok::l_paren, tok::identifier, tok::equal, tok::question,
                            tok::kw_requires);
-        K += 2;
+        ++K;
       }
       break;
     }
@@ -208,7 +259,7 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
       Token Name = Tok;
       for (unsigned I = 0; I < K; ++I)
         ConsumeAnyToken();
-      CppshExplicitTemplateParams = Names;
+      CppshExplicitTemplateParams = std::move(Params);
       SmallVector<Token, 2> Back{Name, Tok};
       reinjectTokens(Back);
       MaybeRewriteConciseDeclaration(AllowFunctionDef);
@@ -259,9 +310,11 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
   if (HasParens)
     ConsumeParen(); // Eat '('
 
-  SmallVector<IdentifierInfo *, 4> TemplateParams(CppshExplicitTemplateParams.begin(),
-                                                   CppshExplicitTemplateParams.end());
+  SmallVector<CppshTemplateParam, 4> Explicit = std::move(CppshExplicitTemplateParams);
   CppshExplicitTemplateParams.clear();
+  SmallVector<IdentifierInfo *, 4> TemplateParams;
+  for (const CppshTemplateParam &P : Explicit)
+    TemplateParams.push_back(P.Name.getIdentifierInfo());
   auto normalizePrimeIdent = [&](Token &T) {
     if (T.is(tok::identifier) && T.getIdentifierInfo()) {
       StringRef Name = T.getIdentifierInfo()->getName();
@@ -456,6 +509,15 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
     }
   }
 
+  // Every explicit parameter with a default, and no parameter to call it
+  // with: a forwarding function of no template arguments beside the
+  // template (below), the defaults its locals -- read at run time, if so,
+  // a need it is cut at, each call its own specialization. The template
+  // itself has no defaults then.
+  const bool Forward = !Explicit.empty() && ConvertedParams.empty() &&
+                       llvm::all_of(Explicit, [](const CppshTemplateParam &P) {
+                         return !P.Default.empty();
+                       });
   SmallVector<Token, 64> Out;
   if (!TemplateParams.empty()) {
     Out.push_back(makeKwTok(tok::kw_template, "template", Loc));
@@ -463,8 +525,19 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
     for (size_t I = 0; I < TemplateParams.size(); ++I) {
       if (I > 0)
         Out.push_back(makeTok(tok::comma, Loc));
-      Out.push_back(makeKwTok(tok::kw_typename, "typename", Loc));
+      if (I < Explicit.size() && !Explicit[I].IsType) {
+        if (Explicit[I].Type.empty())
+          Out.push_back(makeKwTok(tok::kw_auto, "auto", Loc));
+        else
+          Out.append(Explicit[I].Type.begin(), Explicit[I].Type.end());
+      } else {
+        Out.push_back(makeKwTok(tok::kw_typename, "typename", Loc));
+      }
       Out.push_back(makeTok(tok::identifier, Loc, TemplateParams[I]));
+      if (I < Explicit.size() && !Forward && !Explicit[I].Default.empty()) {
+        Out.push_back(makeTok(tok::equal, Loc));
+        Out.append(Explicit[I].Default.begin(), Explicit[I].Default.end());
+      }
     }
     Out.push_back(makeTok(tok::greater, Loc));
   }
@@ -524,6 +597,45 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
       Out.push_back(makeTok(tok::semi, EqLoc));
       Out.push_back(makeTok(tok::r_brace, EqLoc));
     }
+  }
+
+  if (Forward) {
+    // auto name() { Type p = default; ...; return name<p, ...>(); }
+    Out.push_back(makeKwTok(tok::kw_auto, "auto", Loc));
+    Out.push_back(FuncName);
+    Out.push_back(makeTok(tok::l_paren, Loc));
+    Out.push_back(makeTok(tok::r_paren, Loc));
+    Out.push_back(makeTok(tok::l_brace, Loc));
+    for (const CppshTemplateParam &P : Explicit) {
+      if (P.IsType) {
+        // using T = default;
+        Out.push_back(makeKwTok(tok::kw_using, "using", Loc));
+        Out.push_back(P.Name);
+        Out.push_back(makeTok(tok::equal, Loc));
+      } else {
+        if (P.Type.empty())
+          Out.push_back(makeKwTok(tok::kw_auto, "auto", Loc));
+        else
+          Out.append(P.Type.begin(), P.Type.end());
+        Out.push_back(P.Name);
+        Out.push_back(makeTok(tok::equal, Loc));
+      }
+      Out.append(P.Default.begin(), P.Default.end());
+      Out.push_back(makeTok(tok::semi, Loc));
+    }
+    Out.push_back(makeKwTok(tok::kw_return, "return", Loc));
+    Out.push_back(FuncName);
+    Out.push_back(makeTok(tok::less, Loc));
+    for (size_t I = 0; I < Explicit.size(); ++I) {
+      if (I > 0)
+        Out.push_back(makeTok(tok::comma, Loc));
+      Out.push_back(Explicit[I].Name);
+    }
+    Out.push_back(makeTok(tok::greater, Loc));
+    Out.push_back(makeTok(tok::l_paren, Loc));
+    Out.push_back(makeTok(tok::r_paren, Loc));
+    Out.push_back(makeTok(tok::semi, Loc));
+    Out.push_back(makeTok(tok::r_brace, Loc));
   }
 
   Out.push_back(Tok);

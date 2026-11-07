@@ -1,4 +1,4 @@
-// RUN: printf '41\n3\n7\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '41\n3\n7\n5\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
 
 // A concise function of explicit template parameters, a parameter with a
 // default without parentheses, ^ for return.
@@ -16,3 +16,9 @@ std::println("size {}", f3().size());
 g<T> = { T response; std::cin >> response; ^ response; }
 std::println("got {}", g<int>());
 // CHECK: got 7
+
+// A value template parameter whose default is read at run time: foo() reads
+// it and calls foo<it>; foo<9>() the template itself.
+foo<obj: int = input<int>()> = obj;
+std::println("foo {} {}", foo(), foo<9>());
+// CHECK: foo 5 9
