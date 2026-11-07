@@ -27,8 +27,13 @@
 #include "clang/Sema/Sema.h"
 #include "clang/Sema/Template.h"
 #include "llvm/ADT/ScopeExit.h"
+#include <set>
 
 using namespace clang;
+
+namespace clang {
+extern std::set<const FunctionDecl *> CppshCutFunctions;
+} // namespace clang
 
 namespace {
 // Whether code uses `this` (written, or implied by a member's name).
@@ -294,6 +299,12 @@ StmtResult Sema::ActOnCppshStagedReturn(CppshStagedScope &Info,
     if (FunctionDecl *FD = getCurFunctionDecl(/*AllowLambda=*/true);
         FD && FD->getReturnType()->isUndeducedType())
       Info.KeepsResult = true;
+  // The function a staged one -- found so as it is parsed, or as a template
+  // is instantiated (a value its returns depend on known only then): its
+  // calls wait for the result it keeps.
+  if (Info.KeepsResult)
+    if (FunctionDecl *FD = getCurFunctionDecl(/*AllowLambda=*/true))
+      CppshCutFunctions.insert(FD->getCanonicalDecl());
   // The rest of a staged function's body: what it returns is kept for the
   // function's caller, of its own type -- not the function's.
   if (Info.KeepsResult) {
