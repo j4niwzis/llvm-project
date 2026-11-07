@@ -113,6 +113,7 @@ tools = [
     "clang-diff",
     "clang-format",
     "clang-repl",
+    "cppsh",
     "llvm-objdump",
     "llvm-offload-binary",
     "clang-tblgen",

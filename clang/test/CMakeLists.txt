@@ -226,6 +226,11 @@ if (HAVE_CLANG_REPL_SUPPORT)
     clang-repl
     )
 endif()
+if (TARGET cppsh)
+  list(APPEND CLANG_TEST_DEPS
+    cppsh
+    )
+endif()
 
 # Copy gen_ast_dump_json_test.py to the clang build dir. This allows invoking
 # it without having to pass the --clang= argument
