@@ -7638,6 +7638,16 @@ static bool MayBeFunctionType(const ASTContext &Context, const Expr *E) {
              OverloadExpr, UnresolvedMemberExpr, UnaryOperator>(E);
 }
 
+// cppsh: whether a parameter can be specialized on its argument's value: one
+// taken by value, or by a reference to const (the body, which changes it
+// nowhere -- cppshMutates -- reads the value it refers to). A reference to
+// non-const may be written through: never.
+static bool cppshBindable(const ParmVarDecl *P) {
+  const QualType T = P->getType();
+  return !T->isReferenceType() ||
+         (T->isLValueReferenceType() && T.getNonReferenceType().isConstQualified());
+}
+
 ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                                MultiExprArg ArgExprs, SourceLocation RParenLoc,
                                Expr *ExecConfig, bool IsExecConfig,
@@ -8403,7 +8413,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
               if (auto *PV = dyn_cast<VarDecl>(DRE->getDecl());
                   PV && CppshParamPending.count(PV)) {
                 const VarDecl *Source = CppshParamPending.lookup(PV);
-                if (!PatFD->getParamDecl(I)->getType()->isReferenceType())
+                if (cppshBindable(PatFD->getParamDecl(I)))
                   setPending(PatFD->getParamDecl(I), Source);
                 continue;
               }
@@ -8444,7 +8454,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                   // known, bound in another attempt): pending -- wanted if
                   // read. (A reference parameter is specialized on no value.)
                   if (CppshStagedLive && CppshStagedTracked.count(VD)) {
-                    if (!PatFD->getParamDecl(I)->getType()->isReferenceType()) {
+                    if (cppshBindable(PatFD->getParamDecl(I))) {
                       setPending(PatFD->getParamDecl(I), VD);
                       PendingStaged.push_back(VD);
                     }
@@ -8465,7 +8475,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                       VD->getParentFunctionOrMethod() == NeedFD &&
                       !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)) &&
                       cppshInUserInput(*this, NeedFD->getLocation())) {
-                    if (!PatFD->getParamDecl(I)->getType()->isReferenceType()) {
+                    if (cppshBindable(PatFD->getParamDecl(I))) {
                       setPending(PatFD->getParamDecl(I), VD);
                       PendingNeeds.push_back({VD, NeedFD});
                     }
@@ -8480,7 +8490,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                       !VD->isConstexpr() &&
                       VD->getParentFunctionOrMethod() == TplFD &&
                       cppshInUserInput(*this, TplFD->getLocation())) {
-                    if (!PatFD->getParamDecl(I)->getType()->isReferenceType()) {
+                    if (cppshBindable(PatFD->getParamDecl(I))) {
                       setPending(PatFD->getParamDecl(I), VD);
                       PendingNeeds.push_back({VD, TplFD});
                     }
@@ -8493,7 +8503,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                   // Pending on it: staged there only if the callee reads it.
                   if (VD->hasGlobalStorage() &&
                       VD->getTranslationUnitDecl() == Context.getTranslationUnitDecl()) {
-                    if (!PatFD->getParamDecl(I)->getType()->isReferenceType()) {
+                    if (cppshBindable(PatFD->getParamDecl(I))) {
                       setPending(PatFD->getParamDecl(I), VD);
                       PendingStage.push_back({VD, ArgE->getBeginLoc()});
                     }
@@ -8529,8 +8539,18 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
             if (Ok && EV.Val.hasValue()) {
               ParmVarDecl *P = PatFD->getParamDecl(I);
               QualType PT = P->getType();
-              if (PT->isReferenceType())
+              // A reference to const: bound to the argument's value -- the
+              // object it refers to, of the argument's type (one converted on
+              // the way, a temporary, is not specialized on).
+              if (PT->isReferenceType()) {
+                QualType AT = ArgE->getType();
+                if (cppshBindable(P) && !AT.isNull() && !AT->isArrayType() &&
+                    !AT->isFunctionType() &&
+                    (PT->isDependentType() ||
+                     Context.hasSameUnqualifiedType(AT, PT.getNonReferenceType())))
+                  setValue(P, EV.Val);
                 continue;
+              }
               if (PT->isDependentType()) {
                 QualType AT = ArgE->getType();
                 if (!AT.isNull() && !AT->isArrayType() && !AT->isFunctionType())

@@ -9887,6 +9887,13 @@ bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
   if (const VarDecl *PVD = VD;
       !Frame && (!CppshStagedLocal || CppshStagedLive)) {
     const QualType T = VD->getType().getNonReferenceType();
+    // A reference parameter pending on a value known only later.
+    if (auto Pending = CppshParamPending.find(PVD);
+        Pending != CppshParamPending.end()) {
+      if (Info.InConstantContext || CppshFoldingCondition)
+        cppshReadPending(Pending->second);
+      return Error(E);
+    }
     if (auto Known = CppshParamValue.find(PVD); Known != CppshParamValue.end()) {
       ++CppshBindingReads;
       CppshBindingsRead.insert(PVD);
