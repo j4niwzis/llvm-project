@@ -1749,9 +1749,22 @@ struct CppshQuietConsumer : DiagnosticConsumer {
 // of a staged function's body (keepsResult): what it returns constructed in
 // storage of its type made for it, named by a global, __cppsh_resK, kept for
 // the function's caller.
+// The runs prepared (__cppsh_staged_prepare) whose code the JIT's own code
+// is calling: what follows each call (__cppsh_staged_done) by them. One that
+// threw is left behind, dropped by the next done of a run around it.
+struct CppshRunInFlight {
+  const CppshStagedStmt *Staged = nullptr;
+  bool Keep = false;
+  std::string ResultName;
+  unsigned KeptBefore = 0;
+  int Entry = 0;
+};
+static std::vector<CppshRunInFlight> CppshRunsInFlight;
+
 static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
                           void *Slot, int Entry, void *OuterPromise = nullptr,
-                          void **HandleOut = nullptr) {
+                          void **HandleOut = nullptr, void **FnOut = nullptr,
+                          void **SlotOut = nullptr) {
   // Code that suspends the coroutine it is in: compiled as a coroutine, its
   // handle handed back (HandleOut), not run here.
   const bool Coro = HandleOut != nullptr;
@@ -2207,6 +2220,19 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     *HandleOut = reinterpret_cast<CoroFn>(Found->Address)(Frame, OuterPromise, Entry);
     return 0;
   }
+  // Called by the code that reached it (FnOut): the frame updated in place,
+  // the function and its slot handed back -- no frame of the interpreter's
+  // between that code and what it runs, an exception thrown there unwinding
+  // through the JIT's code alone. What follows the call: __cppsh_staged_done.
+  if (FnOut) {
+    auto *OuterFrame = const_cast<void **>(Frame);
+    for (unsigned I = 0; I < Entries.size(); ++I)
+      OuterFrame[I] = Entries[I];
+    *FnOut = Found->Address;
+    *SlotOut = Slot;
+    CppshRunsInFlight.push_back({SS, Keep, ResultName, CppshKeptResults, Entry});
+    return 0;
+  }
   using StagedFn = int (*)(void **, void *, int);
   const unsigned KeptBefore = CppshKeptResults;
   const int Left =
@@ -2238,6 +2264,52 @@ extern "C" void *__cppsh_staged_coro_start(const void *Node, void *const *Frame,
   cppshRunStaged(static_cast<const CppshStagedStmt *>(Node), Frame, nullptr,
                  Entry, OuterPromise, &Handle);
   return Handle;
+}
+
+// The code compiled for a staged statement and these values, for the code
+// that reached it to call (`fn(frame, *slot_out, entry)`); null where it
+// cannot be compiled (said so).
+extern "C" void *__cppsh_staged_prepare(const void *Node, void *const *Frame,
+                                        void *Slot, int Entry, void **SlotOut) {
+  if (!CppshActiveInterpreter) {
+    llvm::errs() << "error: cppsh: a staged statement cannot run: no interpreter\n";
+    return nullptr;
+  }
+  void *Fn = nullptr;
+  *SlotOut = nullptr;
+  cppshRunStaged(static_cast<const CppshStagedStmt *>(Node), Frame, Slot, Entry,
+                 nullptr, nullptr, &Fn, SlotOut);
+  return Fn;
+}
+
+// What follows the call of a prepared run: how it left, given back; the
+// result it kept named (a staged function's rest).
+extern "C" int __cppsh_staged_done(const void *Node, int Left) {
+  auto It = std::find_if(CppshRunsInFlight.rbegin(), CppshRunsInFlight.rend(),
+                         [&](const CppshRunInFlight &R) { return R.Staged == Node; });
+  if (It == CppshRunsInFlight.rend())
+    return Left;
+  CppshRunInFlight Run = std::move(*It);
+  // Those after it threw (they never got here): dropped with it.
+  CppshRunsInFlight.erase(std::prev(It.base()), CppshRunsInFlight.end());
+  if (cppshTraceStaging() && CppshActiveInterpreter) {
+    Sema &S = CppshActiveInterpreter->getCompilerInstance()->getSema();
+    llvm::errs() << "cppsh-trace: ran staged "
+                 << Run.Staged->getBeginLoc().printToString(S.getSourceManager())
+                 << " entry " << Run.Entry << " left " << Left
+                 << (Run.Keep ? (Run.ResultName.empty() ? " keeping nothing"
+                                                        : " keeping " + Run.ResultName)
+                              : std::string())
+                 << "\n";
+  }
+  // Its return kept the result -- unless code staged inside it did (that
+  // code's result kept already).
+  if (Run.Keep && Left == 3 && !Run.ResultName.empty() &&
+      CppshKeptResults == Run.KeptBefore) {
+    CppshLastResult = Run.ResultName;
+    ++CppshKeptResults;
+  }
+  return Left;
 }
 
 extern "C" int __cppsh_staged_run(const void *Node, void *const *Frame,

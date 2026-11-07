@@ -1602,14 +1602,44 @@ void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
   // The statement itself, which the interpreter compiles: in this process.
   llvm::Value *Node = Builder.CreateIntToPtr(
       llvm::ConstantInt::get(IntPtrTy, reinterpret_cast<uintptr_t>(&S)), PtrTy);
-  llvm::FunctionType *FnTy = llvm::FunctionType::get(
-      Int32Ty, {PtrTy, PtrTy, PtrTy, Int32Ty}, /*isVarArg=*/false);
-  llvm::FunctionCallee Run = CGM.CreateRuntimeFunction(FnTy, "__cppsh_staged_run");
-  Code = EmitRuntimeCallOrInvoke(
-      Run,
-      {Node, FrameAddr.emitRawPointer(*this), Slot,
-       Builder.CreateLoad(EntryAddr, "cppsh.entered")},
-      "cppsh.left");
+  // The code compiled for it and the values the frame has, found or made by
+  // the interpreter (__cppsh_staged_prepare), called here -- an invoke where
+  // a handler is around it: what it throws unwinds through code generated as
+  // this is, never through the interpreter's. Then what follows the call
+  // (__cppsh_staged_done). None compiled: as if it left off its end.
+  Address SlotOut = CreateTempAlloca(PtrTy, getPointerAlign(), "cppsh.slot");
+  llvm::Value *FrameP = FrameAddr.emitRawPointer(*this);
+  llvm::Value *Entered = Builder.CreateLoad(EntryAddr, "cppsh.entered");
+  llvm::FunctionCallee Prepare = CGM.CreateRuntimeFunction(
+      llvm::FunctionType::get(PtrTy, {PtrTy, PtrTy, PtrTy, Int32Ty, PtrTy},
+                              /*isVarArg=*/false),
+      "__cppsh_staged_prepare");
+  llvm::Value *Fn = EmitNounwindRuntimeCall(
+      Prepare, {Node, FrameP, Slot, Entered, SlotOut.emitRawPointer(*this)},
+      "cppsh.fn");
+  llvm::BasicBlock *CallBB = createBasicBlock("cppsh.call");
+  llvm::BasicBlock *SkipBB = createBasicBlock("cppsh.skip");
+  llvm::BasicBlock *JoinBB = createBasicBlock("cppsh.join");
+  Builder.CreateCondBr(Builder.CreateIsNull(Fn), SkipBB, CallBB);
+  EmitBlock(CallBB);
+  llvm::FunctionType *StagedTy =
+      llvm::FunctionType::get(Int32Ty, {PtrTy, PtrTy, Int32Ty}, /*isVarArg=*/false);
+  llvm::CallBase *Ran = EmitCallOrInvoke(
+      llvm::FunctionCallee(StagedTy, Fn),
+      {FrameP, Builder.CreateLoad(SlotOut, "cppsh.slot.out"), Entered}, "cppsh.ran");
+  llvm::FunctionCallee Done = CGM.CreateRuntimeFunction(
+      llvm::FunctionType::get(Int32Ty, {PtrTy, Int32Ty}, /*isVarArg=*/false),
+      "__cppsh_staged_done");
+  llvm::Value *Left = EmitNounwindRuntimeCall(Done, {Node, Ran}, "cppsh.left");
+  llvm::BasicBlock *CalledBB = Builder.GetInsertBlock();
+  Builder.CreateBr(JoinBB);
+  EmitBlock(SkipBB);
+  Builder.CreateBr(JoinBB);
+  EmitBlock(JoinBB);
+  llvm::PHINode *Phi = Builder.CreatePHI(Int32Ty, 2, "cppsh.code");
+  Phi->addIncoming(Left, CalledBB);
+  Phi->addIncoming(Builder.getInt32(0), SkipBB);
+  Code = Phi;
   }
   // In staged code compiled as it runs (a function of the interpreter's):
   // where the function around both returns its value is that function's
