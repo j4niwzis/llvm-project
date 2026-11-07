@@ -1931,7 +1931,14 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
       return *Shown;
     };
     llvm::function_ref<Expr *(Expr *)> PrintValue = PrintValueFn;
+    // What it wanted the times before, wanted from the start: the same code
+    // wants the same locals, whatever their values -- no attempt made only
+    // to learn that again.
     SmallVector<unsigned, 4> Want;
+    for (const CppshStagedCompiled &C : Instances)
+      for (unsigned I : C.Wanted)
+        if (I < N && !llvm::is_contained(Want, I))
+          Want.push_back(I);
     FunctionDecl *F = nullptr;
     QualType KeptType;
     for (bool Report = false;;) {
@@ -2183,6 +2190,15 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     C.Result = KeptType;
     Instances.push_back(std::move(C));
     Found = &Instances.back();
+    // Compiled for many values (a loop whose staged statement each
+    // iteration reaches with a new one): said, as each new value compiles
+    // again -- what makes it slow, and where.
+    if (const size_t Count = Instances.size();
+        Count == 16 || Count == 128 || Count == 1024)
+      llvm::errs() << "warning: cppsh: staged code at "
+                   << SS->getBeginLoc().printToString(S.getSourceManager())
+                   << " has been compiled for " << Count
+                   << " different values; each new value compiles it again\n";
   }
   if (!Found->Address)
     return Fail("its compiled function is not found");
