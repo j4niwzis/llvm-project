@@ -1285,6 +1285,23 @@ static bool cppshReturns(ArrayRef<Token> Toks) {
   return llvm::any_of(Toks, [](const Token &T) { return T.is(tok::kw_return); });
 }
 
+// Whether code always returns: a return statement of its own at its top
+// level (what follows it is dead), not one an if or else makes.
+static bool cppshAlwaysReturns(ArrayRef<Token> Toks) {
+  int Depth = 0;
+  for (size_t I = 0; I < Toks.size(); ++I) {
+    const Token &T = Toks[I];
+    if (T.isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
+      ++Depth;
+    else if (T.isOneOf(tok::r_paren, tok::r_brace, tok::r_square))
+      --Depth;
+    else if (Depth == 0 && T.is(tok::kw_return) &&
+             (I == 0 || Toks[I - 1].isOneOf(tok::semi, tok::l_brace, tok::r_brace)))
+      return true;
+  }
+  return false;
+}
+
 // Whether code breaks out of, or continues, a loop (or switch) around it.
 static bool cppshLeavesLoop(ArrayRef<Token> Toks) {
   return !cppshOwnTokens(Toks, tok::kw_break, true, true).empty() ||
@@ -1377,10 +1394,12 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   // returns std::sh::staged, the region its own returns -- the result kept
   // for whoever waits for it (__cppsh_region_staged), as a staged
   // function's is.
-  const bool Staged = Returns && AtBody && isa<DeclStmt>(R.get()) && Function &&
-                      !cppshIsRegion(Function) &&
+  // In a block of the body: where the region always returns; the rest of the
+  // body after the statement holding it then made one too (CppshStagedPending).
+  const bool Staged = Returns && Function && !cppshIsRegion(Function) &&
                       Function->getReturnType()->isUndeducedType() &&
-                      !cppshLeavesLoop(Toks);
+                      !cppshLeavesLoop(Toks) &&
+                      ((AtBody && isa<DeclStmt>(R.get())) || cppshAlwaysReturns(Toks));
   if (Returns && !Staged &&
       (!Function || cppshIsRegion(Function) ||
        Function->getReturnType()->isUndeducedType()))
@@ -1495,6 +1514,8 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
       return false;
     CppshCutFunctions.insert(Function->getCanonicalDecl());
     Stmts.push_back(Ret.get());
+    if (!AtBody)
+      CppshStagedPending = true;
     return true;
   }
   StmtResult Run = Call.isUsable()
@@ -1757,6 +1778,22 @@ ExprResult Parser::ParseCppshRegionLambda(ArrayRef<CppshCutLocal> Frame,
   return Actions.ActOnLambdaExpr(Loc, Body.get());
 }
 
+void Parser::CppshRegionFrame(ArrayRef<Token> Toks, SourceLocation Loc,
+                             std::vector<CppshCutLocal> &Frame,
+                             SmallVectorImpl<Expr *> &Args) {
+  llvm::SmallPtrSet<const IdentifierInfo *, 16> Named;
+  for (const Token &T : Toks)
+    if (T.is(tok::identifier))
+      Named.insert(T.getIdentifierInfo());
+  for (VarDecl *VD : CppshLiveLocals(Loc)) {
+    if (!Named.count(VD->getIdentifier()))
+      continue;
+    const QualType T = VD->getType().getNonReferenceType();
+    Frame.push_back({VD->getIdentifier(), T, false, /*ByRef=*/true});
+    Args.push_back(Actions.BuildDeclRefExpr(VD, T, VK_LValue, Loc));
+  }
+}
+
 bool Parser::CppshReturnStagedRegion(SmallVectorImpl<Stmt *> &Stmts,
                                      SourceLocation Loc, ExprResult Lambda,
                                      ArrayRef<Expr *> Args) {
@@ -1996,6 +2033,29 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
     if (R.isUsable())
       Stmts.push_back(R.get());
     LastIsError = R.isInvalid();
+
+    // cppsh: a staged region returned the function's result from a block
+    // of this statement: the rest of the body after it a staged region too.
+    if (CppshBody && std::exchange(CppshStagedPending, false) &&
+        Tok.isNot(tok::r_brace) && Tok.isNot(tok::eof)) {
+      const SourceLocation RestBegin = Tok.getLocation();
+      std::optional<unsigned> B = cppshTokenIndex(RestBegin);
+      SkipUntil(tok::r_brace, StopBeforeMatch);
+      std::optional<unsigned> E = cppshTokenIndex(Tok.getLocation());
+      bool Made = false;
+      if (B && E && *B < *E) {
+        std::vector<CppshCutLocal> Frame;
+        SmallVector<Expr *, 8> Args;
+        CppshRegionFrame(ArrayRef<Token>(CppshInputTokens).slice(*B, *E - *B),
+                         RestBegin, Frame, Args);
+        const bool SavedReturns = std::exchange(CppshRegionReturns, false);
+        ExprResult Lambda = ParseCppshRegionLambda(Frame, {}, *B, *E);
+        CppshRegionReturns = SavedReturns;
+        Made = CppshReturnStagedRegion(Stmts, RestBegin, Lambda, Args);
+      }
+      if (!Made)
+        CppshRegionError(RestBegin);
+    }
   }
   // StmtExpr needs to do copy initialization for last statement.
   // If last statement is invalid, the last statement in `Stmts` will be
@@ -3544,19 +3604,10 @@ void Parser::CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
     CppshCutNeeded = false;
     bool Made = false;
     if (Begin < End && FD->getReturnType()->isUndeducedType()) {
-      llvm::SmallPtrSet<const IdentifierInfo *, 16> Named;
-      for (const Token &T : ArrayRef<Token>(CppshInputTokens).slice(Begin, End - Begin))
-        if (T.is(tok::identifier))
-          Named.insert(T.getIdentifierInfo());
       std::vector<CppshCutLocal> Frame;
       SmallVector<Expr *, 8> Args;
-      for (VarDecl *VD : CppshLiveLocals(Loc)) {
-        if (!Named.count(VD->getIdentifier()))
-          continue;
-        const QualType T = VD->getType().getNonReferenceType();
-        Frame.push_back({VD->getIdentifier(), T, false, /*ByRef=*/true});
-        Args.push_back(Actions.BuildDeclRefExpr(VD, T, VK_LValue, Loc));
-      }
+      CppshRegionFrame(ArrayRef<Token>(CppshInputTokens).slice(Begin, End - Begin),
+                       Loc, Frame, Args);
       SmallVector<SourceLocation, 2> NeedLocs;
       for (Expr *NE : CppshCutNeedExprs) {
         NeedLocs.push_back(NE->getBeginLoc());

@@ -428,6 +428,65 @@ const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E) {
   return Find(E, Find);
 }
 
+// Whether a function template's body has a plain `if` whose condition reads
+// its parameter I -- what a call is specialized on that argument's value for
+// (BuildCallExpr's value specialization).
+static bool cppshFoldsOn(const FunctionDecl *FD, unsigned I) {
+  const Stmt *Body = FD ? FD->getBody() : nullptr;
+  if (!Body || I >= FD->getNumParams() || !FD->getReturnType()->getContainedAutoType())
+    return false;
+  const ParmVarDecl *P = FD->getParamDecl(I);
+  auto Reads = [&](const Stmt *X, auto &Self) -> bool {
+    if (!X)
+      return false;
+    if (auto *DRE = dyn_cast<DeclRefExpr>(X))
+      return DRE->getDecl() == P;
+    for (const Stmt *C : X->children())
+      if (Self(C, Self))
+        return true;
+    return false;
+  };
+  auto HasIf = [&](const Stmt *X, auto &Self) -> bool {
+    if (!X)
+      return false;
+    if (auto *If = dyn_cast<IfStmt>(X); If && !If->isConstexpr() && Reads(If->getCond(), Reads))
+      return true;
+    for (const Stmt *C : X->children())
+      if (Self(C, Self))
+        return true;
+    return false;
+  };
+  return HasIf(Body, HasIf);
+}
+
+// In a template's body the user wrote, a call one of whose candidates may be
+// specialized on the value of a local the call hands it (not a parameter,
+// not a constant): a value that exists only as the function runs, whatever
+// the template is instantiated with -- a need now, met as the body is parsed
+// (the statement made a staged region).
+void cppshNeedForTemplateCall(Sema &S, Expr *Fn, ArrayRef<Expr *> Args) {
+  auto *ULE = dyn_cast<UnresolvedLookupExpr>(Fn->IgnoreParens());
+  FunctionDecl *Cur = S.getCurFunctionDecl(/*AllowLambda=*/true);
+  if (!ULE || !Cur || !Cur->isDependentContext() ||
+      (isLambdaCallOperator(Cur) && !cppshIsRegion(Cur)) ||
+      !cppshInUserInput(S, Cur->getLocation()))
+    return;
+  for (unsigned I = 0; I < Args.size(); ++I) {
+    auto *DRE = Args[I] ? dyn_cast<DeclRefExpr>(Args[I]->IgnoreParenImpCasts()) : nullptr;
+    auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+    if (!VD || isa<ParmVarDecl>(VD) || !VD->hasLocalStorage() || VD->isConstexpr() ||
+        VD->getParentFunctionOrMethod() != Cur)
+      continue;
+    for (NamedDecl *ND : ULE->decls())
+      if (auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
+          FTD && cppshFoldsOn(FTD->getTemplatedDecl(), I)) {
+        CppshCutNeeded = true;
+        CppshCutNeedVar = VD;
+        return;
+      }
+  }
+}
+
 const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
   if (!E)
     return nullptr;
@@ -7568,6 +7627,11 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
 
   if (CheckArgsForPlaceholders(ArgExprs))
     return ExprError();
+
+  // cppsh: in a template's body, a call that may be specialized on a local's
+  // value: a need met as the body is parsed.
+  if (CurContext->isDependentContext())
+    cppshNeedForTemplateCall(*this, Fn, ArgExprs);
 
   // The result of __builtin_counted_by_ref cannot be used as a function
   // argument. It allows leaking and modification of bounds safety information.

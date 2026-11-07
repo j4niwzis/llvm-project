@@ -8729,6 +8729,15 @@ private:
                                     unsigned Begin, unsigned End,
                                     CppshRegionBody Kind = CppshRegionBody::Statements,
                                     const CppshForward *Forward = nullptr);
+  /// cppsh: a staged region returned the function's result from inside a
+  /// block of its body: the rest of the body after the statement holding
+  /// it is made one too -- every way out of a staged function staged alike.
+  bool CppshStagedPending = false;
+  /// cppsh: the locals named in Toks, live at Loc: a region's frame, and
+  /// the arguments that hand them to it.
+  void CppshRegionFrame(ArrayRef<Token> Toks, SourceLocation Loc,
+                        std::vector<CppshCutLocal> &Frame,
+                        SmallVectorImpl<Expr *> &Args);
   /// cppsh: the function returns what a staged region gives (a staged
   /// function's result), the region handed Args.
   bool CppshReturnStagedRegion(SmallVectorImpl<Stmt *> &Stmts,
