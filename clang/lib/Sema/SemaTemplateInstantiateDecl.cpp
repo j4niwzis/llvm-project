@@ -3057,7 +3057,7 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
         CppshKey.AddInteger(0u);
       }
     }
-    for (auto [It, End] = CppshSpecializations.equal_range(CppshKey.ComputeHash()); It != End;
+    for (auto [It, End] = CppshSpecializations.equal_range(CppshKey.computeHash()); It != End;
          ++It)
       if (It->second.first == CppshKey && !It->second.second->isInvalidDecl())
         return It->second.second;
@@ -3274,7 +3274,7 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
         TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost),
         /*InsertToken=*/{});
     if (HasCppshConstParam)
-      CppshSpecializations.emplace(CppshKey.ComputeHash(),
+      CppshSpecializations.emplace(CppshKey.computeHash(),
                                    std::make_pair(CppshKey, Function));
   } else if (isFriend && D->isThisDeclarationADefinition()) {
     // Do not connect the friend to the template unless it's actually a
