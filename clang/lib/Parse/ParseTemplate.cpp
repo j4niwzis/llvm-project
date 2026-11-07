@@ -1379,6 +1379,13 @@ ParsedTemplateArgument Parser::ParseTemplateArgument() {
       ExprArg.get()->containsErrors()) {
     return ParsedTemplateArgument();
   }
+  // cppsh: in a staged region, a run-time template argument of its first
+  // statement: supplied by the region's parameter for it (CppshEmitRegion).
+  if (!CppshRegionArgs.empty())
+    if (ParmVarDecl *P = CppshRegionArgs.lookup(
+            ExprArg.get()->getBeginLoc().getRawEncoding()))
+      ExprArg = Actions.BuildDeclRefExpr(P, P->getType().getNonReferenceType(),
+                                         VK_LValue, Loc);
 
   return ParsedTemplateArgument(ParsedTemplateArgument::NonType,
                                 ExprArg.get(), Loc);

@@ -135,7 +135,6 @@ std::vector<std::string> CppshCutRemainders;
 // and what follows it (__cppsh_loopK); empty otherwise.
 std::vector<std::string> CppshCutLoopRests;
 std::vector<std::vector<CppshCutLocal>> CppshCutLocals;
-std::vector<CppshStep> CppshSteps;
 
 std::vector<Token> CppshInputTokens;
 // Where each recorded token is, by its location (each token's own, macro
@@ -398,10 +397,31 @@ static std::string cppshLineMark(SourceManager &SM, SourceLocation Loc) {
 // user typed (or instantiated from one), not a parameter whose value is known
 // -- what a need is made of (a value-specialized call's argument, a template
 // argument). None where the expression reads no such local.
-const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
+bool cppshIsRegion(const FunctionDecl *FD) {
+  if (!FD)
+    return false;
+  for (const auto *A : FD->specific_attrs<AnnotateAttr>())
+    if (A->getAnnotation() == "cppsh.region")
+      return true;
+  return false;
+}
+
+// The function a need would be met in: the one being written -- or the
+// staged region (a lambda's call operator, and a template's body) it is in.
+static FunctionDecl *cppshNeedFunction(Sema &S) {
+  FunctionDecl *Inner = S.getCurFunctionDecl(/*AllowLambda=*/true);
+  if (cppshIsRegion(Inner))
+    return Inner;
   FunctionDecl *Cur = S.getCurFunctionDecl();
-  if (!E || !Cur || isLambdaCallOperator(Cur) || Cur->isDependentContext() ||
-      !cppshInUserInput(S, Cur->getLocation()))
+  if (!Cur || isLambdaCallOperator(Cur) || Cur->isDependentContext() ||
+      Inner != Cur)
+    return nullptr;
+  return Cur;
+}
+
+const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
+  FunctionDecl *Cur = cppshNeedFunction(S);
+  if (!E || !Cur || !cppshInUserInput(S, Cur->getLocation()))
     return nullptr;
   if (S.CodeSynthesisContexts.empty()
           ? Cur->isTemplateInstantiation()
@@ -428,9 +448,8 @@ const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
 // Whether a run-time template argument here is a need of the function being
 // written: a body the user typed, outside a lambda, not a template's pattern.
 bool cppshExprNeedHere(Sema &S, const Expr *E) {
-  FunctionDecl *Cur = S.getCurFunctionDecl();
-  return E && Cur && !isLambdaCallOperator(Cur) && !Cur->isDependentContext() &&
-         !E->isValueDependent() && !E->containsErrors() &&
+  FunctionDecl *Cur = cppshNeedFunction(S);
+  return E && Cur && !E->isValueDependent() && !E->containsErrors() &&
          cppshInUserInput(S, Cur->getLocation()) &&
          cppshInUserInput(S, E->getBeginLoc());
 }
@@ -8344,21 +8363,19 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                   // value only known as it runs: the body is cut here.
                   // (Not in a lambda's body: no cut is made there, and the
                   // call would be left a recovery expression, unsaid.)
-                  if (VD->hasLocalStorage() && getCurFunctionDecl() &&
-                      !isLambdaCallOperator(getCurFunctionDecl()) &&
-                      !getCurFunctionDecl()->isDependentContext() &&
+                  FunctionDecl *NeedFD = cppshNeedFunction(*this);
+                  if (VD->hasLocalStorage() && NeedFD &&
                       (CodeSynthesisContexts.empty()
-                           ? !getCurFunctionDecl()->isTemplateInstantiation()
+                           ? !NeedFD->isTemplateInstantiation()
                            : (CodeSynthesisContexts.back().Kind ==
                                   CodeSynthesisContext::TemplateInstantiation &&
-                              CodeSynthesisContexts.back().Entity ==
-                                  getCurFunctionDecl())) &&
-                      VD->getParentFunctionOrMethod() == getCurFunctionDecl() &&
+                              CodeSynthesisContexts.back().Entity == NeedFD)) &&
+                      VD->getParentFunctionOrMethod() == NeedFD &&
                       !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)) &&
-                      cppshInUserInput(*this, getCurFunctionDecl()->getLocation())) {
+                      cppshInUserInput(*this, NeedFD->getLocation())) {
                     CppshCutNeeded = true;
                     CppshCutNeedVar = VD;
-                    CppshCutNeedFunction = getCurFunctionDecl();
+                    CppshCutNeedFunction = NeedFD;
                     CppshCutHere = true;
                     continue;
                   }

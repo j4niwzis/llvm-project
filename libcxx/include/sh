@@ -1848,19 +1848,30 @@ std::array<void *, sizeof...(T)> __cppsh_frame(T &&...locals) noexcept {
 // locals at `frame` (an absolute symbol of the JIT).
 extern "C" void __cppsh_cut_run(unsigned id, void *const *frame, unsigned n);
 
-// The interpreter's: statement `id`, run on its own, compiled and run against
-// the locals at `frame`.
-extern "C" void __cppsh_step_run(unsigned id, void *const *frame, unsigned n);
+// The interpreter's: the staged region whose closure and arguments' types
+// `tag` names, instantiated with the values at `frame` and run on them.
+extern "C" void __cppsh_region_run(const void *tag, void *closure,
+                                   void *const *frame, unsigned n);
 
 namespace std {
 namespace sh {
 
-// A statement that needed a value only running its function gives: compiled
-// with the values now, run against the function's locals, and the function
-// goes on (the compiler makes the statement this).
-template <std::size_t N>
-void __cppsh_step(unsigned id, std::array<void *, N> frame) {
-  ::__cppsh_step_run(id, frame.data(), static_cast<unsigned>(N));
+// What names a region's closure type and its arguments' types to the
+// interpreter: the address of its specialization.
+template <class C, class... A>
+inline const char __cppsh_region_tag = 0;
+
+// A staged region (the code from a statement that needs a value only running
+// its function gives, made an implicit generic lambda by the compiler):
+// instantiated with the values of the locals and arguments it is handed, as
+// they are now, and run on them -- in their frame.
+template <class C, class... A>
+void __cppsh_region(C &&closure, A &&...args) {
+  void *frame[] = {const_cast<void *>(static_cast<const void *>(std::addressof(args)))...,
+                   nullptr};
+  ::__cppsh_region_run(&__cppsh_region_tag<std::remove_cvref_t<C>, A...>,
+                       const_cast<void *>(static_cast<const void *>(std::addressof(closure))),
+                       frame, static_cast<unsigned>(sizeof...(A)));
 }
 
 template <std::size_t N>

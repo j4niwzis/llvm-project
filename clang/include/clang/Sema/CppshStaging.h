@@ -21,6 +21,7 @@
 #include <vector>
 
 namespace clang {
+class FunctionDecl;
 class IdentifierInfo;
 class SourceManager;
 
@@ -33,7 +34,7 @@ struct CppshCutLocal {
   /// Handed over by moving it: a type with no copy.
   bool Move = false;
   /// Taken by reference, not as a value it is compiled with: a local the
-  /// code changes, or that has no copy (a step's: CppshStep).
+  /// code changes, or that has no copy.
   bool ByRef = false;
 };
 
@@ -49,15 +50,10 @@ void cppshRecordToken(const SourceManager &SM, const Token &T);
 /// Where the token at Loc is in CppshInputTokens; none where it is not one.
 std::optional<unsigned> cppshTokenIndex(SourceLocation Loc);
 
-/// A statement run on its own when its function runs (Parser::
-/// CppshEmitStep): its tokens [Begin, End) of CppshInputTokens, its frame,
-/// and whether the function running it is built (__cppsh_step_run).
-struct CppshStep {
-  unsigned Begin = 0, End = 0;
-  std::vector<CppshCutLocal> Frame;
-  bool Built = false;
-};
-extern std::vector<CppshStep> CppshSteps;
+/// Whether a function is a staged region's call operator (Parser::
+/// CppshEmitRegion): code whose types may depend on values that exist only as
+/// its function runs, a need met in it a region of its own.
+bool cppshIsRegion(const FunctionDecl *FD);
 } // namespace clang
 
 #endif // LLVM_CLANG_SEMA_CPPSHSTAGING_H

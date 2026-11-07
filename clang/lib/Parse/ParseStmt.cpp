@@ -1544,7 +1544,8 @@ static void cppshWrapSwitch(Sema &S, size_t OpenBefore, StmtResult &Res) {
 // (cppshWrapLoop), a switch it finishes the case of (cppshWrapSwitch).
 static bool cppshCutsIn(Sema &S, Scope *Sc) {
   FunctionDecl *FD = S.getCurFunctionDecl();
-  if (!FD || S.getCurFunctionDecl(/*AllowLambda=*/true) != FD || CppshBodyOpen.isInvalid())
+  FunctionDecl *Inner = S.getCurFunctionDecl(/*AllowLambda=*/true);
+  if (!FD || (Inner != FD && !cppshIsRegion(Inner)) || CppshBodyOpen.isInvalid())
     return false;
   while (Sc && !(Sc->getFlags() & Scope::FnScope))
     Sc = Sc->getParent();
@@ -1627,8 +1628,7 @@ static SmallVector<size_t, 4> cppshOwnTokens(ArrayRef<Token> Toks,
 
 // Whether code leaves the function it is in, or jumps where a function of its
 // own could not: a return, a goto, a co_*, a label of a switch around it.
-// Such code cannot run on its own and hand its function back. (A break or
-// continue of a loop around it can: cppshLeavesLoop.)
+// (A break or continue of a loop around it can be told back: cppshLeavesLoop.)
 static bool cppshLeavesFunction(ArrayRef<Token> Toks) {
   for (const Token &T : Toks)
     if (T.isOneOf(tok::kw_return, tok::kw_goto, tok::kw_co_return,
@@ -1676,30 +1676,37 @@ SmallVector<VarDecl *, 8> Parser::CppshLiveLocals(SourceLocation Loc) {
   return Live;
 }
 
-// cppsh: a statement that needs a value only running the function gives:
-// compiled when it runs, with the values known, against the function's own
-// locals -- then the function goes on, in its frame. What is compiled so: the
-// statement alone; or, where it declares what follows may use (`std::array<
-// int, n> a;`), the rest of its block -- nothing after the block sees what it
-// declares, so all after it is the function's own code. It becomes
-//   std::sh::__cppsh_step(id, __cppsh_frame(the locals it names...));
-// every local by reference (its frame's own; one it does not change is still
-// a value it is compiled with: Sema's value specialization) -- and, where it
-// breaks out of or continues a loop around it, a slot saying so:
-//   { int __cppsh_code = 0; __cppsh_step(...);
+// cppsh: a staged region. A statement needs a value that exists only as its
+// function runs (a local's, as a template argument; a run-time template
+// argument's). The code from it on whose types may depend on that value --
+// the statement alone, or, where it declares what follows may use (`std::
+// array<int, n> a;`), the rest of its block (nothing after the block sees
+// what it declares) -- is parsed, once, as the body of an implicit generic
+// lambda: a dependent context, as a template's body is, sharing the frame.
+//   [&]<auto __cppsh_key>(auto &n, auto &a, ..., auto &&__cppsh_need0, ...)
+//       { <the code> }
+// Each local it names is a parameter of it, by reference (the frame's own
+// object), so that whatever reads one is dependent; a run-time template
+// argument written in the statement is supplied by a parameter of its own.
+// The function hands it to std::sh::__cppsh_region with those locals and
+// arguments; as it runs, the interpreter instantiates the call operator with
+// the values known (__cppsh_region_run) and calls it. Where it breaks out of
+// or continues a loop around it, a slot of the frame says so, and the
+// function breaks or continues itself:
+//   { int __cppsh_code = 0; __cppsh_region(...);
 //     if (__cppsh_code == 1) break; if (__cppsh_code == 2) continue; }
-// False where it cannot be: it returns, jumps, or is no value's need (a
-// staged function's result): a cut is made instead.
-bool Parser::CppshEmitStep(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
-                           SourceLocation Begin) {
+// False where it cannot be (it returns or jumps out; a staged function's
+// result, not a value's need): the caller cuts instead, or says so.
+bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
+                             SourceLocation Begin) {
   if (!R.isUsable() || (!CppshCutNeedVar && CppshCutNeedExprs.empty()))
     return false;
   std::optional<unsigned> B = cppshTokenIndex(Begin);
-  if (!B)
+  // A region's first statement needing a value again: what it needs is no
+  // local nor argument of it -- another region of it would be the same.
+  if (!B || (CppshRegionBegin && *CppshRegionBegin == *B))
     return false;
-  // Where it ends: past the statement, or the rest of its block.
-  const bool WholeRest = isa<DeclStmt>(R.get());
-  if (WholeRest)
+  if (isa<DeclStmt>(R.get()))
     SkipUntil(tok::r_brace, StopBeforeMatch);
   std::optional<unsigned> E = Tok.is(tok::eof) && CppshReplayEnd
                                   ? CppshReplayEnd
@@ -1716,14 +1723,13 @@ bool Parser::CppshEmitStep(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
       Named.insert(T.getIdentifierInfo());
   ASTContext &Ctx = Actions.getASTContext();
   std::vector<CppshCutLocal> Frame;
-  SmallVector<Expr *, 8> Refs;
+  SmallVector<Expr *, 8> Args;
   for (VarDecl *VD : CppshLiveLocals(Begin)) {
     if (!Named.count(VD->getIdentifier()))
       continue;
     const QualType T = VD->getType().getNonReferenceType();
-    Frame.push_back({VD->getIdentifier(), T.getUnqualifiedType(), false,
-                     /*ByRef=*/true});
-    Refs.push_back(Actions.BuildDeclRefExpr(VD, T, VK_LValue, Begin));
+    Frame.push_back({VD->getIdentifier(), T, false, /*ByRef=*/true});
+    Args.push_back(Actions.BuildDeclRefExpr(VD, T, VK_LValue, Begin));
   }
   // The slot saying how it left: a local of a block of its own.
   ParseScope CodeScope(this, Scope::DeclScope);
@@ -1746,176 +1752,235 @@ bool Parser::CppshEmitStep(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     if (!CodeDecl.isUsable())
       return false;
     Frame.push_back({CodeName, Ctx.IntTy, false, /*ByRef=*/true});
-    Refs.push_back(Actions.BuildDeclRefExpr(CodeVar, Ctx.IntTy, VK_LValue, Begin));
+    Args.push_back(Actions.BuildDeclRefExpr(CodeVar, Ctx.IntTy, VK_LValue, Begin));
   }
-  // The run-time template arguments it met, their values as long long.
+  // The run-time template arguments the statement met: evaluated here, each
+  // handed over as a parameter of its own.
+  SmallVector<SourceLocation, 2> NeedLocs;
   for (Expr *NE : CppshCutNeedExprs) {
-    ExprResult AsLL = Actions.BuildCStyleCastExpr(
-        Begin, Ctx.getTrivialTypeSourceInfo(Ctx.LongLongTy, Begin), Begin, NE);
-    if (!AsLL.isUsable())
-      return false;
-    Frame.push_back({nullptr, Ctx.LongLongTy, false, false});
-    Refs.push_back(AsLL.get());
-  }
-  ExprResult FrameFn = cppshShFunction(Actions, PP, "__cppsh_frame", Begin);
-  ExprResult StepFn = cppshShFunction(Actions, PP, "__cppsh_step", Begin);
-  if (!FrameFn.isUsable() || !StepFn.isUsable())
-    return false;
-  ExprResult FrameCall =
-      Actions.ActOnCallExpr(getCurScope(), FrameFn.get(), Begin, Refs, Begin);
-  if (!FrameCall.isUsable())
-    return false;
-  const unsigned Id = CppshSteps.size();
-  Expr *Args[2] = {IntegerLiteral::Create(Ctx, llvm::APInt(32, Id),
-                                          Ctx.UnsignedIntTy, Begin),
-                   FrameCall.get()};
-  ExprResult StepCall =
-      Actions.ActOnCallExpr(getCurScope(), StepFn.get(), Begin, Args, Begin);
-  StmtResult Step = StepCall.isUsable()
-                        ? Actions.ActOnExprStmt(StepCall, /*DiscardedValue=*/true)
-                        : StmtError();
-  if (!Step.isUsable())
-    return false;
-  if (!Code) {
-    Stmts.push_back(Step.get());
-  } else {
-    // if (__cppsh_code == K) break/continue;
-    SmallVector<Stmt *, 4> Block{CodeDecl.get(), Step.get()};
-    for (unsigned K : {1u, 2u}) {
-      Expr *Ref = Actions.BuildDeclRefExpr(CodeVar, Ctx.IntTy, VK_LValue, Begin);
-      Expr *Lit = IntegerLiteral::Create(
-          Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), K), Ctx.IntTy, Begin);
-      ExprResult Cond = Actions.BuildBinOp(getCurScope(), Begin, BO_EQ, Ref, Lit);
-      Sema::ConditionResult C = Cond.isUsable()
-                                    ? Actions.ActOnCondition(getCurScope(), Begin,
-                                                             Cond.get(),
-                                                             Sema::ConditionKind::Boolean)
-                                    : Sema::ConditionError();
-      StmtResult Jump = K == 1 ? Actions.ActOnBreakStmt(Begin, getCurScope(), nullptr, SourceLocation())
-                               : Actions.ActOnContinueStmt(Begin, getCurScope(), nullptr, SourceLocation());
-      if (C.isInvalid() || !Jump.isUsable())
-        return false;
-      StmtResult If = Actions.ActOnIfStmt(Begin, IfStatementKind::Ordinary, Begin,
-                                          nullptr, C, Begin, Jump.get(),
-                                          SourceLocation(), nullptr);
-      if (!If.isUsable())
-        return false;
-      Block.push_back(If.get());
-    }
-    StmtResult Compound =
-        Actions.ActOnCompoundStmt(Begin, Begin, Block, /*isStmtExpr=*/false);
-    if (!Compound.isUsable())
-      return false;
-    Stmts.push_back(Compound.get());
+    NeedLocs.push_back(NE->getBeginLoc());
+    Args.push_back(NE);
   }
   CppshCutNeedExprs.clear();
-  CppshSteps.push_back({*B, *E, std::move(Frame), false});
+  ExprResult Lambda = ParseCppshRegionLambda(Frame, NeedLocs, *B, *E);
+  ExprResult RegionFn = cppshShFunction(Actions, PP, "__cppsh_region", Begin);
+  if (!Lambda.isUsable() || !RegionFn.isUsable())
+    return false;
+  Args.insert(Args.begin(), Lambda.get());
+  ExprResult Call =
+      Actions.ActOnCallExpr(getCurScope(), RegionFn.get(), Begin, Args, Begin);
+  StmtResult Run = Call.isUsable()
+                       ? Actions.ActOnExprStmt(Call, /*DiscardedValue=*/true)
+                       : StmtError();
+  if (!Run.isUsable())
+    return false;
+  if (!Code) {
+    Stmts.push_back(Run.get());
+    return true;
+  }
+  // if (__cppsh_code == K) break/continue;
+  SmallVector<Stmt *, 4> Block{CodeDecl.get(), Run.get()};
+  for (unsigned K : {1u, 2u}) {
+    Expr *Ref = Actions.BuildDeclRefExpr(CodeVar, Ctx.IntTy, VK_LValue, Begin);
+    Expr *Lit = IntegerLiteral::Create(
+        Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), K), Ctx.IntTy, Begin);
+    ExprResult Cond = Actions.BuildBinOp(getCurScope(), Begin, BO_EQ, Ref, Lit);
+    Sema::ConditionResult C =
+        Cond.isUsable() ? Actions.ActOnCondition(getCurScope(), Begin, Cond.get(),
+                                                 Sema::ConditionKind::Boolean)
+                        : Sema::ConditionError();
+    StmtResult Jump =
+        K == 1 ? Actions.ActOnBreakStmt(Begin, getCurScope(), nullptr, SourceLocation())
+               : Actions.ActOnContinueStmt(Begin, getCurScope(), nullptr,
+                                           SourceLocation());
+    if (C.isInvalid() || !Jump.isUsable())
+      return false;
+    StmtResult If =
+        Actions.ActOnIfStmt(Begin, IfStatementKind::Ordinary, Begin, nullptr, C,
+                            Begin, Jump.get(), SourceLocation(), nullptr);
+    if (!If.isUsable())
+      return false;
+    Block.push_back(If.get());
+  }
+  StmtResult Compound =
+      Actions.ActOnCompoundStmt(Begin, Begin, Block, /*isStmtExpr=*/false);
+  if (!Compound.isUsable())
+    return false;
+  Stmts.push_back(Compound.get());
   return true;
 }
 
-// The function a step runs: `auto Name(auto x, auto &y, ...) { <its
-// statement> }` -- the statement's own tokens, parsed now, in the unit being
-// built (__cppsh_step_run).
-Decl *Parser::ParseCppshStepFunction(IdentifierInfo *Name,
-                                     ArrayRef<CppshCutLocal> Frame,
-                                     unsigned Begin, unsigned End) {
-  if (Begin >= End || End > CppshInputTokens.size())
-    return nullptr;
+// The region's lambda, built with Sema's lambda actions as the parser builds
+// any: an explicit template head (`<auto __cppsh_key>`: the interpreter's,
+// one for each set of values it is instantiated with), a parameter for each
+// local (`auto &`) and run-time argument (`auto &&`), and the code, parsed
+// from its recorded tokens [Begin, End).
+ExprResult Parser::ParseCppshRegionLambda(ArrayRef<CppshCutLocal> Frame,
+                                          ArrayRef<SourceLocation> NeedLocs,
+                                          unsigned Begin, unsigned End) {
+  ASTContext &Ctx = Actions.getASTContext();
+  const PrintingPolicy &Policy = Ctx.getPrintingPolicy();
+  IdentifierTable &Idents = PP.getIdentifierTable();
   const SourceLocation Loc = CppshInputTokens[Begin].getLocation();
-  const PrintingPolicy &Policy = Actions.getASTContext().getPrintingPolicy();
-  ParsingDeclSpec DS(*this);
-  SetConciseAuto(DS, Loc);
-  DS.Finish(Actions, Policy);
-  ParsedAttributes DAttrs(AttrFactory);
-  ParsingDeclarator D(*this, DS, DAttrs, DeclaratorContext::File);
-  D.SetIdentifier(Name, Loc);
-  {
-    ParseScope PrototypeScope(this, Scope::FunctionPrototypeScope |
-                                        Scope::DeclScope |
-                                        Scope::FunctionDeclarationScope);
-    Actions.ActOnStartFunctionDeclarationDeclarator(D, TemplateParameterDepth);
-    SmallVector<DeclaratorChunk::ParamInfo, 8> ParamInfo;
-    for (const CppshCutLocal &L : Frame) {
-      if (!L.Name)
-        continue;
-      DeclSpec PDS(AttrFactory);
-      SetConciseAuto(PDS, Loc);
-      PDS.Finish(Actions, Policy);
-      Declarator PD(PDS, ParsedAttributesView::none(),
-                    DeclaratorContext::Prototype);
-      PD.SetIdentifier(L.Name, Loc);
-      if (L.ByRef)
-        PD.AddTypeInfo(DeclaratorChunk::getReference(0, Loc, /*lvalue=*/true),
-                       Loc);
-      Decl *Param = Actions.ActOnParamDeclarator(getCurScope(), PD);
-      ParamInfo.push_back(DeclaratorChunk::ParamInfo(L.Name, Loc, Param));
-    }
-    D.AddTypeInfo(DeclaratorChunk::getFunction(
-                      /*HasProto=*/true, /*IsAmbiguous=*/false, Loc,
-                      ParamInfo.data(), ParamInfo.size(), SourceLocation(), Loc,
-                      /*RefQualifierIsLvalueRef=*/true, SourceLocation(),
-                      SourceLocation(), EST_None, SourceRange(), nullptr,
-                      nullptr, 0, nullptr, nullptr, {}, Loc, Loc, D),
-                  ParsedAttributes(AttrFactory), Loc);
-    Actions.ActOnFinishFunctionDeclarationDeclarator(D);
-  }
-  TemplateParameterDepthRAII CurTemplateDepthTracker(TemplateParameterDepth);
-  ParseScope BodyScope(this, Scope::FnScope | Scope::DeclScope |
-                                 Scope::CompoundStmtScope);
-  Sema::FPFeaturesStateRAII SaveFPFeatures(Actions);
-  Decl *Fn = Actions.ActOnStartOfFunctionDef(getCurScope(), D,
-                                             MultiTemplateParamsArg());
-  D.complete(Fn);
-  D.getMutableDeclSpec().abort();
-  if (const auto *Template = dyn_cast_if_present<FunctionTemplateDecl>(Fn);
-      Template && Template->isAbbreviated() &&
-      Template->getTemplateParameters()->getParam(0)->isImplicit())
-    CurTemplateDepthTracker.addDepth(1);
 
-  // No cut in it: what it needs is known as it is compiled -- a need still
-  // left is one of a local it declares itself, not staged.
-  const SourceLocation SavedOpen = std::exchange(CppshBodyOpen, SourceLocation());
-  const bool SavedNeeded = std::exchange(CppshCutNeeded, false);
-  // A break or continue of a loop around it: the slot set, the step left.
+  LambdaIntroducer Intro;
+  Intro.Range = SourceRange(Loc, Loc);
+  Intro.Default = LCD_ByRef;
+  Intro.DefaultLoc = Loc;
+  DeclSpec DS(AttrFactory);
+  Declarator D(DS, ParsedAttributesView::none(), DeclaratorContext::LambdaExpr);
+  TemplateParameterDepthRAII CurTemplateDepthTracker(TemplateParameterDepth);
+  ParseScope LambdaScope(this, Scope::LambdaScope | Scope::DeclScope |
+                                   Scope::FunctionDeclarationScope |
+                                   Scope::FunctionPrototypeScope);
+  Actions.PushLambdaScope();
+  Actions.ActOnLambdaExpressionAfterIntroducer(Intro, getCurScope());
+
+  MultiParseScope TemplateParamScope(*this);
+  TemplateParamScope.Enter(Scope::TemplateParamScope);
+  DeclSpec KeyDS(AttrFactory);
+  SetConciseAuto(KeyDS, Loc);
+  KeyDS.Finish(Actions, Policy);
+  Declarator KeyD(KeyDS, ParsedAttributesView::none(),
+                  DeclaratorContext::TemplateParam);
+  KeyD.SetIdentifier(&Idents.get("__cppsh_key"), Loc);
+  NamedDecl *Key = Actions.ActOnNonTypeTemplateParameter(
+      getCurScope(), KeyD, CurTemplateDepthTracker.getDepth(), 0,
+      SourceLocation(), nullptr);
+  if (!Key) {
+    Actions.ActOnLambdaError(Loc, getCurScope());
+    return ExprError();
+  }
+  ++CurTemplateDepthTracker;
+  NamedDecl *TemplateParams[1] = {Key};
+  Actions.ActOnLambdaExplicitTemplateParameterList(Intro, Loc, TemplateParams,
+                                                   Loc, ExprResult());
+
+  ParseScope Prototype(this, Scope::FunctionPrototypeScope |
+                                 Scope::FunctionDeclarationScope |
+                                 Scope::DeclScope);
+  Actions.RecordParsingTemplateParameterDepth(
+      CurTemplateDepthTracker.getOriginalDepth());
+  SmallVector<DeclaratorChunk::ParamInfo, 8> ParamInfo;
+  auto addParam = [&](const IdentifierInfo *Name, bool LValue) {
+    DeclSpec PDS(AttrFactory);
+    SetConciseAuto(PDS, Loc);
+    PDS.Finish(Actions, Policy);
+    Declarator PD(PDS, ParsedAttributesView::none(),
+                  DeclaratorContext::LambdaExprParameter);
+    PD.SetIdentifier(Name, Loc);
+    PD.AddTypeInfo(DeclaratorChunk::getReference(0, Loc, LValue), Loc);
+    Decl *P = Actions.ActOnParamDeclarator(getCurScope(), PD);
+    ParamInfo.push_back(DeclaratorChunk::ParamInfo(Name, Loc, P));
+    return dyn_cast_or_null<ParmVarDecl>(P);
+  };
+  for (const CppshCutLocal &L : Frame)
+    addParam(L.Name, /*LValue=*/true);
+  SmallVector<ParmVarDecl *, 2> NeedParams;
+  for (size_t I = 0; I < NeedLocs.size(); ++I)
+    NeedParams.push_back(
+        addParam(&Idents.get("__cppsh_need" + std::to_string(I)), /*LValue=*/false));
+  if (Actions.getCurGenericLambda())
+    CurTemplateDepthTracker.setAddedDepth(1);
+  Actions.ActOnLambdaClosureParameters(getCurScope(), ParamInfo);
+  Actions.ActOnLambdaClosureQualifiers(Intro, SourceLocation());
+  D.AddTypeInfo(DeclaratorChunk::getFunction(
+                    /*HasProto=*/true, /*IsAmbiguous=*/false, Loc,
+                    ParamInfo.data(), ParamInfo.size(), SourceLocation(), Loc,
+                    /*RefQualifierIsLvalueRef=*/true, SourceLocation(),
+                    SourceLocation(), EST_None, SourceRange(), nullptr, nullptr,
+                    0, nullptr, nullptr, {}, Loc, Loc, D, TypeResult(),
+                    SourceLocation(), &DS),
+                ParsedAttributes(AttrFactory), Loc);
+  Prototype.Exit();
+
+  ParseScope BodyScope(this, Scope::BlockScope | Scope::FnScope |
+                                 Scope::DeclScope | Scope::CompoundStmtScope);
+  Actions.ActOnStartOfLambdaDefinition(Intro, D, DS);
+  // Known for one: Sema lets a need be met in it (cppshIsRegion).
+  if (auto *Call = dyn_cast_or_null<CXXMethodDecl>(
+          Actions.getCurFunctionDecl(/*AllowLambda=*/true)))
+    Call->addAttr(AnnotateAttr::CreateImplicit(Ctx, "cppsh.region", nullptr, 0,
+                                               SourceRange(Loc)));
+
+  // Its code: the arguments of the statement's run-time template arguments
+  // its parameters; a need met in it a region of its own.
+  auto SavedArgs = std::exchange(CppshRegionArgs, {});
+  for (size_t I = 0; I < NeedLocs.size(); ++I)
+    if (NeedParams[I])
+      CppshRegionArgs[NeedLocs[I].getRawEncoding()] = NeedParams[I];
+  const std::optional<unsigned> SavedRegionBegin =
+      std::exchange(CppshRegionBegin, Begin);
+  const SourceLocation SavedOpen = std::exchange(CppshBodyOpen, Loc);
+  const size_t SavedRangeBase = std::exchange(CppshRangeBase, CppshRangeFors.size());
   IdentifierInfo *const SavedCode = std::exchange(
-      CppshStepCode,
+      CppshRegionCode,
       llvm::any_of(Frame, [](const CppshCutLocal &L) {
         return L.Name && L.Name->isStr("__cppsh_code");
       })
-          ? &PP.getIdentifierTable().get("__cppsh_code")
+          ? &Idents.get("__cppsh_code")
           : nullptr);
-  const std::optional<unsigned> SavedReplayEnd = std::exchange(CppshReplayEnd, End);
   StmtResult Body;
   {
     Sema::CompoundScopeRAII CompoundScope(Actions);
     StmtVector Stmts;
-    const void *Mark = &Stmts;
-    ConciseReplay(ArrayRef<Token>(CppshInputTokens).slice(Begin, End - Begin), Mark);
-    while (Tok.isNot(tok::eof)) {
-      if (ConsumeNullStmt(Stmts))
-        continue;
-      StmtResult R = ParseStatementOrDeclaration(Stmts, ParsedStmtContext::Compound);
-      if (R.isUsable())
-        Stmts.push_back(R.get());
-    }
-    ConciseEndReplay(Mark);
-    if (CppshCutNeeded)
-      Diag(Loc, Actions.getDiagnostics().getCustomDiagID(
-                    DiagnosticsEngine::Error,
-                    "this needs a value only running it gives, of a variable "
-                    "it declares itself: not staged yet"));
-    // Its end: past its last token (where an instantiation of it is cut, the
-    // rest up to there).
+    ParseCppshRegionStatements(Stmts, Begin, End);
     Body = Actions.ActOnCompoundStmt(Loc, CppshInputTokens[End - 1].getEndLoc(),
                                      Stmts, /*isStmtExpr=*/false);
   }
+  CppshRegionArgs = std::move(SavedArgs);
+  CppshRegionBegin = SavedRegionBegin;
   CppshBodyOpen = SavedOpen;
-  CppshCutNeeded = SavedNeeded;
-  CppshStepCode = SavedCode;
-  CppshReplayEnd = SavedReplayEnd;
-  CppshCutNeedExprs.clear();
+  CppshRangeBase = SavedRangeBase;
+  CppshRegionCode = SavedCode;
   BodyScope.Exit();
-  return Actions.ActOnFinishFunctionBody(Fn, Body.get());
+  TemplateParamScope.Exit();
+  LambdaScope.Exit();
+  if (Body.isInvalid() || D.isInvalidType()) {
+    Actions.ActOnLambdaError(Loc, getCurScope());
+    return ExprError();
+  }
+  return Actions.ActOnLambdaExpr(Loc, Body.get());
+}
+
+// The statements of a region, from their recorded tokens [Begin, End): a need
+// met at one of them, a region of its own -- or, where it cannot be, an
+// error (no cut is made in a region).
+void Parser::ParseCppshRegionStatements(StmtVector &Stmts, unsigned Begin,
+                                        unsigned End) {
+  const void *Mark = &Stmts;
+  const std::optional<unsigned> SavedEnd = std::exchange(CppshReplayEnd, End);
+  ConciseReplay(ArrayRef<Token>(CppshInputTokens).slice(Begin, End - Begin), Mark);
+  while (Tok.isNot(tok::eof)) {
+    if (ConsumeNullStmt(Stmts))
+      continue;
+    const SourceLocation StmtBegin = Tok.getLocation();
+    CppshCutNeeded = false;
+    CppshCutNeedExprs.clear();
+    StmtResult R = ParseStatementOrDeclaration(Stmts, ParsedStmtContext::Compound);
+    if (CppshCutNeeded) {
+      CppshCutNeeded = false;
+      if (CppshEmitRegion(Stmts, R, StmtBegin))
+        continue;
+      CppshRegionError(StmtBegin);
+      while (Tok.isNot(tok::eof))
+        ConsumeAnyToken();
+      break;
+    }
+    if (R.isUsable())
+      Stmts.push_back(R.get());
+  }
+  ConciseEndReplay(Mark);
+  CppshReplayEnd = SavedEnd;
+}
+
+void Parser::CppshRegionError(SourceLocation Loc) {
+  CppshCutNeedExprs.clear();
+  Diag(Loc, Actions.getDiagnostics().getCustomDiagID(
+                DiagnosticsEngine::Error,
+                "this needs a value only known as the function runs, and the "
+                "code from here cannot be compiled once it is: it returns or "
+                "jumps out of its block, or the value is changed in it"));
 }
 
 // The cut: the function returns through std::sh::__cppsh_cut, its rest
@@ -2121,9 +2186,16 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
     if (CppshCuts && CppshCutNeeded) {
       CppshCutNeeded = false;
       FunctionDecl *FD = Actions.getCurFunctionDecl();
-      // Run on its own, the function going on in its frame: no cut.
-      if (CppshEmitStep(Stmts, R, CppshStmtBegin)) {
+      // A staged region, the function going on in its frame: no cut.
+      if (CppshEmitRegion(Stmts, R, CppshStmtBegin)) {
         LastIsError = false;
+        continue;
+      }
+      // In a region itself: no cut is made there.
+      if (cppshIsRegion(Actions.getCurFunctionDecl(/*AllowLambda=*/true))) {
+        CppshRegionError(CppshStmtBegin);
+        SkipUntil(tok::r_brace, StopBeforeMatch);
+        LastIsError = true;
         continue;
       }
       SourceManager &SM = PP.getSourceManager();
@@ -3475,20 +3547,20 @@ StmtResult Parser::ParseBreakOrContinueStatement(bool IsContinue) {
     }
   }
 
-  // cppsh: in a step's function, a break or continue of a loop of the
-  // function it was taken out of: the step left, saying which.
-  if (CppshStepCode && !Target &&
+  // cppsh: in a staged region, a break or continue of a loop around it: the
+  // region left, saying which.
+  if (CppshRegionCode && !Target &&
       !(IsContinue ? getCurScope()->getContinueParent()
                    : getCurScope()->getBreakParent()))
-    return CppshLeaveStep(KwLoc, IsContinue ? 2 : 1);
+    return CppshLeaveRegion(KwLoc, IsContinue ? 2 : 1);
 
   if (IsContinue)
     return Actions.ActOnContinueStmt(KwLoc, getCurScope(), Target, LabelLoc);
   return Actions.ActOnBreakStmt(KwLoc, getCurScope(), Target, LabelLoc);
 }
 
-StmtResult Parser::CppshLeaveStep(SourceLocation Loc, unsigned Code) {
-  LookupResult R(Actions, CppshStepCode, Loc, Sema::LookupOrdinaryName);
+StmtResult Parser::CppshLeaveRegion(SourceLocation Loc, unsigned Code) {
+  LookupResult R(Actions, CppshRegionCode, Loc, Sema::LookupOrdinaryName);
   Actions.LookupName(R, getCurScope());
   auto *Slot = R.getAsSingle<VarDecl>();
   if (!Slot)

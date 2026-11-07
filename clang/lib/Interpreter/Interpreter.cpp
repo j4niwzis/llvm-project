@@ -1426,6 +1426,9 @@ unsigned long long CppshParseNs = 0, CppshExecuteNs = 0;
 
 extern std::vector<std::string> CppshCutRemainders;
 extern std::set<const FunctionDecl *> CppshCutFunctions;
+extern llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
+extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
+bool cppshMutates(const Stmt *S, const VarDecl *VD);
 extern std::vector<std::string> CppshCutLoopRests;
 extern bool CppshTopNeed;
 extern std::vector<APValue> CppshActiveNeeds;
@@ -1652,50 +1655,178 @@ struct CppshFrameState {
 };
 } // namespace
 
-// A statement run on its own (Parser::CppshEmitStep), as its function runs:
-// compiled with the values its frame holds now -- its function, `auto
-// __cppsh_contstepN(auto x, auto &y, ...) { <the statement> }`, built once,
-// from the statement's tokens; specialized on those values at each call
-// (once for each set of them) -- and run against the frame's locals. The
-// function it was cut out of goes on, in its own frame.
-extern "C" void __cppsh_step_run(unsigned Id, void *const *Frame, unsigned N) {
-  if (!CppshActiveInterpreter || Id >= CppshSteps.size())
+// std::sh::__cppsh_region_tag, the variable template whose specializations
+// name a region's closure type and its arguments' types (each one's address
+// what __cppsh_region hands over).
+static VarTemplateDecl *cppshRegionTagTemplate(Sema &S) {
+  NamespaceDecl *Std = S.getStdNamespace();
+  if (!Std)
+    return nullptr;
+  IdentifierTable &Idents = S.getPreprocessor().getIdentifierTable();
+  LookupResult ShR(S, &Idents.get("sh"), SourceLocation(),
+                   Sema::LookupNamespaceName);
+  S.LookupQualifiedName(ShR, Std);
+  auto *Sh = ShR.getAsSingle<NamespaceDecl>();
+  if (!Sh)
+    return nullptr;
+  LookupResult R(S, &Idents.get("__cppsh_region_tag"), SourceLocation(),
+                 Sema::LookupOrdinaryName);
+  S.LookupQualifiedName(R, Sh);
+  return R.getAsSingle<VarTemplateDecl>();
+}
+
+// A staged region run (Parser::CppshEmitRegion), as the function it is in
+// runs: its call operator instantiated with the values of the locals and
+// arguments it is handed -- read from the frame (or rebuilt from their
+// snapshots), each a value it is compiled with unless it changes it -- and
+// called with them, in their frame. One instantiation for each set of values
+// (its __cppsh_key), found again for the same values.
+extern "C" void __cppsh_region_run(const void *Tag, void *Closure,
+                                   void *const *Frame, unsigned N) {
+  if (!CppshActiveInterpreter)
     return;
   Interpreter &Interp = *CppshActiveInterpreter;
   Sema &S = Interp.getCompilerInstance()->getSema();
-  IdentifierTable &Idents = S.getPreprocessor().getIdentifierTable();
-  CppshStep &Step = CppshSteps[Id];
-  const std::string Tag = std::to_string(CppshContinuations++);
-  CppshFrameState State;
-  std::vector<APValue> Needs;
-  CppshGlobals Globals;
-  ArrayRef<CppshCutLocal> Locals = ArrayRef<CppshCutLocal>(Step.Frame).take_front(N);
-  if (!cppshFrameGlobals(Interp, S, Tag, Locals, Frame, Needs, Globals))
-    return;
-  CppshActiveNeeds = std::move(Needs);
-  CppshActiveNeedsTaken = 0;
-  if (!cppshReport(Interp.cppshBeginBuild()))
-    return;
-  IdentifierInfo *Name = &Idents.get("__cppsh_contstep" + std::to_string(Id));
-  const bool Built = Step.Built;
-  if (!Built)
-    if (Decl *Fn = Interp.cppshParser().ParseCppshStepFunction(Name, Step.Frame,
-                                                               Step.Begin, Step.End))
-      Interp.cppshAddBuilt(Fn);
   ASTContext &Ctx = S.Context;
   const SourceLocation Loc;
-  TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(S.TUScope);
-  ExprResult Call = cppshCallWithFrame(S, Name, Globals);
-  ExprResult Full = Call.isUsable()
-                        ? S.ActOnFinishFullExpr(Call.get(), /*DiscardedValue=*/true)
-                        : ExprError();
-  S.ActOnFinishTopLevelStmtDecl(
-      Stmt, Full.isUsable() ? static_cast<clang::Stmt *>(Full.get())
-                            : new (Ctx) NullStmt(Loc));
-  Interp.cppshAddBuilt(Stmt);
-  // Built once it is in a unit that went through: one taken back takes the
-  // function back with it.
-  Step.Built = cppshReport(Interp.cppshEndBuildAndExecute()) || Built;
+
+  // Which region: the specialization of __cppsh_region_tag at Tag.
+  static llvm::DenseMap<const void *, VarTemplateSpecializationDecl *> Tags;
+  VarTemplateSpecializationDecl *Spec = Tags.lookup(Tag);
+  if (!Spec)
+    if (VarTemplateDecl *VTD = cppshRegionTagTemplate(S))
+      for (VarTemplateSpecializationDecl *Candidate : VTD->specializations()) {
+        llvm::Expected<llvm::orc::ExecutorAddr> Addr =
+            Interp.getSymbolAddress(GlobalDecl(Candidate));
+        if (!Addr) {
+          llvm::consumeError(Addr.takeError());
+          continue;
+        }
+        if (Addr->toPtr<const void *>() == Tag) {
+          Tags[Tag] = Spec = Candidate;
+          break;
+        }
+      }
+  if (!Spec || Spec->getTemplateArgs().size() != 2)
+    return;
+  const QualType ClosureType = Spec->getTemplateArgs()[0].getAsType();
+  ArrayRef<TemplateArgument> ArgTypes =
+      Spec->getTemplateArgs()[1].getPackAsArray();
+  auto *RD = ClosureType->getAsCXXRecordDecl();
+  FunctionTemplateDecl *CallTemplate =
+      RD ? RD->getDependentLambdaCallOperator() : nullptr;
+  FunctionDecl *Pattern = CallTemplate ? CallTemplate->getTemplatedDecl() : nullptr;
+  if (!Pattern || Pattern->getNumParams() != N || ArgTypes.size() != N)
+    return;
+
+  const std::string Unit = std::to_string(CppshContinuations++);
+  CppshFrameState State;
+  // Its frame: the arguments, then the closure itself.
+  std::vector<CppshCutLocal> Locals;
+  SmallVector<void *, 8> Addresses(Frame, Frame + N);
+  IdentifierTable &Idents = S.getPreprocessor().getIdentifierTable();
+  for (unsigned I = 0; I < N; ++I)
+    Locals.push_back({&Idents.get("a" + std::to_string(I)),
+                      ArgTypes[I].getAsType().getNonReferenceType(), false,
+                      /*ByRef=*/true});
+  Locals.push_back({&Idents.get("closure"), ClosureType, false, /*ByRef=*/true});
+  Addresses.push_back(Closure);
+  std::vector<APValue> Needs;
+  CppshGlobals Globals;
+  if (!cppshFrameGlobals(Interp, S, Unit, Locals, Addresses.data(), Needs, Globals) ||
+      Globals.size() != N + 1)
+    return;
+
+  // The values it is compiled with: each parameter it does not change.
+  Stmt *Body = Pattern->getBody();
+  llvm::FoldingSetNodeID Values;
+  SmallVector<std::pair<ParmVarDecl *, std::optional<APValue>>, 8> SavedValues;
+  SmallVector<std::pair<ParmVarDecl *, const Expr *>, 8> SavedRebuilds;
+  for (unsigned I = 0; I < N; ++I) {
+    ParmVarDecl *P = Pattern->getParamDecl(I);
+    VarDecl *G = Globals[I].second;
+    if (!Body || cppshMutates(Body, P)) {
+      Values.AddInteger(0u);
+      continue;
+    }
+    if (std::optional<APValue> V = cppshRuntimeValueOf(G)) {
+      Values.AddInteger(1u);
+      V->Profile(Values);
+      auto Known = CppshParamValue.find(P);
+      SavedValues.push_back({P, Known == CppshParamValue.end()
+                                    ? std::nullopt
+                                    : std::optional<APValue>(Known->second)});
+      CppshParamValue[P] = std::move(*V);
+    } else if (Expr *Rebuild = cppshRuntimeRebuildOf(S, G)) {
+      Values.AddInteger(2u);
+      Rebuild->Profile(Values, Ctx, /*Canonical=*/true);
+      SavedRebuilds.push_back({P, CppshParamRebuild.lookup(P)});
+      CppshParamRebuild[P] = Rebuild;
+    } else {
+      Values.AddInteger(0u);
+    }
+  }
+  // Its key: one for each set of values, in the order first met.
+  static std::map<const FunctionTemplateDecl *, std::vector<llvm::FoldingSetNodeID>>
+      Keys;
+  std::vector<llvm::FoldingSetNodeID> &Known = Keys[CallTemplate];
+  unsigned Key = llvm::find(Known, Values) - Known.begin();
+  if (Key == Known.size())
+    Known.push_back(Values);
+
+  // closure.operator()<Key>(a0, a1, ...), a top-level statement.
+  const bool WasNeeded = std::exchange(CppshCutNeeded, false);
+  if (cppshReport(Interp.cppshBeginBuild())) {
+    TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(S.TUScope);
+    Expr *Base = S.BuildDeclRefExpr(Globals[N].second, ClosureType, VK_LValue, Loc);
+    Expr *KeyLit = IntegerLiteral::Create(
+        Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.UnsignedIntTy), Key),
+        Ctx.UnsignedIntTy, Loc);
+    TemplateArgumentListInfo TemplateArgs(Loc, Loc);
+    TemplateArgs.addArgument(
+        TemplateArgumentLoc(TemplateArgument(KeyLit, /*IsCanonical=*/false), KeyLit));
+    CXXScopeSpec SS;
+    DeclarationNameInfo Name(Ctx.DeclarationNames.getCXXOperatorName(OO_Call), Loc);
+    ExprResult Member = S.BuildMemberReferenceExpr(
+        Base, ClosureType, Loc, /*IsArrow=*/false, SS, SourceLocation(), nullptr,
+        Name, &TemplateArgs, S.TUScope);
+    SmallVector<Expr *, 8> Args;
+    for (unsigned I = 0; I < N; ++I)
+      Args.push_back(S.BuildDeclRefExpr(Globals[I].second,
+                                        Globals[I].first->Type, VK_LValue, Loc));
+    ExprResult Call = Member.isUsable()
+                          ? S.BuildCallExpr(S.TUScope, Member.get(), Loc, Args, Loc)
+                          : ExprError();
+    ExprResult Full = Call.isUsable()
+                          ? S.ActOnFinishFullExpr(Call.get(), /*DiscardedValue=*/true)
+                          : ExprError();
+    // A need met as it was instantiated: a value it changes (no constant).
+    if (CppshCutNeeded) {
+      S.Diag(Pattern->getLocation(),
+             S.getDiagnostics().getCustomDiagID(
+                 DiagnosticsEngine::Error,
+                 "this needs the value of a variable it changes itself: not staged"));
+      Full = ExprError();
+    }
+    S.ActOnFinishTopLevelStmtDecl(
+        Stmt, Full.isUsable() ? static_cast<clang::Stmt *>(Full.get())
+                              : new (Ctx) NullStmt(Loc));
+    Interp.cppshAddBuilt(Stmt);
+    cppshReport(Interp.cppshEndBuildAndExecute());
+  }
+  CppshCutNeeded = WasNeeded;
+  for (auto &[P, Was] : llvm::reverse(SavedRebuilds)) {
+    if (Was)
+      CppshParamRebuild[P] = Was;
+    else
+      CppshParamRebuild.erase(P);
+  }
+  for (auto &[P, Was] : llvm::reverse(SavedValues)) {
+    if (Was)
+      CppshParamValue[P] = std::move(*Was);
+    else
+      CppshParamValue.erase(P);
+  }
 }
 
 // A staged function's rest, as its cut left it, run --

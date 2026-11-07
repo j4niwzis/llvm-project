@@ -8706,24 +8706,30 @@ private:
   };
   /// cppsh: the locals live at Loc in the function being parsed.
   SmallVector<VarDecl *, 8> CppshLiveLocals(SourceLocation Loc);
-  /// cppsh: a statement that needs a value only running its function gives
-  /// made one run on its own, the function going on in its frame
-  /// (std::sh::__cppsh_step); false where it cannot be.
-  bool CppshEmitStep(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
-                     SourceLocation Begin);
-  /// cppsh: the function a step runs, from the statement's recorded tokens
-  /// [Begin, End), in the unit being built (__cppsh_step_run).
-  Decl *ParseCppshStepFunction(IdentifierInfo *Name,
-                               ArrayRef<CppshCutLocal> Frame, unsigned Begin,
-                               unsigned End);
-  /// cppsh: in the function of a step being parsed, the frame's slot a break
-  /// or continue of a loop around the step sets (1, 2) before returning;
-  /// none outside one, or where it has none.
-  IdentifierInfo *CppshStepCode = nullptr;
+  /// cppsh: the code from a statement that needs a value only running its
+  /// function gives made a staged region -- an implicit generic lambda,
+  /// instantiated with the values as the function runs, in its frame
+  /// (std::sh::__cppsh_region); false where it cannot be.
+  bool CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
+                       SourceLocation Begin);
+  ExprResult ParseCppshRegionLambda(ArrayRef<CppshCutLocal> Frame,
+                                    ArrayRef<SourceLocation> NeedLocs,
+                                    unsigned Begin, unsigned End);
+  void ParseCppshRegionStatements(StmtVector &Stmts, unsigned Begin,
+                                  unsigned End);
+  void CppshRegionError(SourceLocation Loc);
+  /// cppsh: in a region being parsed, the parameter each run-time template
+  /// argument of its first statement is supplied by, by its location.
+  llvm::DenseMap<SourceLocation::UIntTy, ParmVarDecl *> CppshRegionArgs;
+  /// cppsh: where the region being parsed begins in the recorded tokens.
+  std::optional<unsigned> CppshRegionBegin;
+  /// cppsh: in a region being parsed, the slot a break or continue of a loop
+  /// around it sets (1, 2) before it returns; none where it has none.
+  IdentifierInfo *CppshRegionCode = nullptr;
   /// cppsh: where the recorded tokens being parsed again end (a step's).
   std::optional<unsigned> CppshReplayEnd;
-  /// cppsh: the step being left with Code, its function returning.
-  StmtResult CppshLeaveStep(SourceLocation Loc, unsigned Code);
+  /// cppsh: the region being left with Code, its call operator returning.
+  StmtResult CppshLeaveRegion(SourceLocation Loc, unsigned Code);
   CppshBuiltBody CppshBeginBuiltReturn(SourceLocation Open);
   void CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
                               SmallVectorImpl<Stmt *> &Stmts, ExprResult E,

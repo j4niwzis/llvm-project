@@ -3705,6 +3705,17 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
   for (unsigned P = 0; P < Params.size(); ++P)
     Params[P]->setOwningFunction(Method);
   Method->setParams(Params);
+  // cppsh: the values a call specialized the parameters on (a staged
+  // region's call operator: __cppsh_region_run), its instantiation's too.
+  for (unsigned P = 0; P < Params.size() && P < D->getNumParams(); ++P) {
+    const ParmVarDecl *OrigP = D->getParamDecl(P);
+    if (const Expr *Rebuild = CppshParamRebuild.lookup(OrigP))
+      CppshParamRebuild[Params[P]] = Rebuild;
+    if (auto Known = CppshParamValue.find(OrigP); Known != CppshParamValue.end()) {
+      APValue Value = Known->second;
+      CppshParamValue[Params[P]] = std::move(Value);
+    }
+  }
 
   if (InitMethodInstantiation(Method, D))
     Method->setInvalidDecl();
