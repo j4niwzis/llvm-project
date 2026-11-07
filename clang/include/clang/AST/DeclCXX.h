@@ -2144,6 +2144,7 @@ public:
 };
 
 class CppshStagedStmt;
+class TemplateTypeParmDecl;
 
 /// cppsh: the context of a staged statement (CppshStagedStmt): code of a
 /// function that needs a value only running the function gives -- a local's,
