@@ -1,4 +1,4 @@
-// RUN: printf '3\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '3\n5\n4\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
 
 // Staged code that yields from the coroutine it is in: compiled as a
 // coroutine of its own, its co_yield the outer generator's.
@@ -21,3 +21,18 @@ gen sizes() { int n = 0; std::cin >> n; std::array<int, n> a{}; for (std::size_t
 // CHECK: y 0
 // CHECK: y 10
 // CHECK: y 20
+
+// A co_return of staged code: the coroutine it is in ends there (its
+// promise's return_void).
+gen early() { int n = 0; std::cin >> n; std::array<int, n> a{}; for (std::size_t i = 0; i < a.size(); ++i) { if (i == 2) co_return; co_yield static_cast<int>(i); } }
+{ auto g = early(); while (g.next()) std::println("e {}", g.value()); std::println("early done"); }
+// CHECK: e 0
+// CHECK-NEXT: e 1
+// CHECK-NEXT: early done
+
+// A co_await of staged code: the coroutine it is in suspended with the
+// awaiter, resumed through the staged code.
+gen waits() { int n = 0; std::cin >> n; std::array<int, n> a{}; co_await std::suspend_always{}; co_yield static_cast<int>(a.size()); }
+{ auto g = waits(); int k = 0; while (g.next()) { ++k; std::println("w {} {}", k, g.value()); } }
+// CHECK: w 1 0
+// CHECK-NEXT: w 2 4
