@@ -1413,11 +1413,15 @@ VarDecl *Parser::CppshNeedVar(Expr *NE, unsigned I,
                               SmallVectorImpl<Stmt *> &Stmts) {
   ASTContext &Ctx = Actions.getASTContext();
   const SourceLocation Loc = NE->getBeginLoc();
-  const QualType Auto = Ctx.getAutoDeductType();
+  // Of the argument's own type, as the template parameter takes it -- not
+  // `auto`, which an instantiation of the code around it (its initializer
+  // transformed, the conversion of the first parse left out) would deduce
+  // otherwise: the staged parameter standing for it of the same type.
+  const QualType T = NE->getType().getNonReferenceType().getUnqualifiedType();
   auto *VD = VarDecl::Create(
       Ctx, Actions.CurContext, Loc, Loc,
-      &PP.getIdentifierTable().get("__cppsh_need" + std::to_string(I)), Auto,
-      Ctx.getTrivialTypeSourceInfo(Auto, Loc), SC_None);
+      &PP.getIdentifierTable().get("__cppsh_need" + std::to_string(I)), T,
+      Ctx.getTrivialTypeSourceInfo(T, Loc), SC_None);
   VD->setImplicit();
   Actions.AddInitializerToDecl(VD, NE, /*DirectInit=*/false);
   if (VD->isInvalidDecl())

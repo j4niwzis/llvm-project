@@ -513,6 +513,9 @@ Sema::ActOnStartCppshStagedInstantiation(CppshStagedDecl *Old,
     Params.push_back(P);
   }
   SD->setParameters(Context, Params);
+  // Its run-time default template arguments, supplied by the same staged
+  // parameters (the same places, the parameters in the same order).
+  SD->setSupplies(Context, Old->supplies());
   SD->setSuspends(Old->suspends());
   CppshStagedScope Info;
   Info.Decl = SD;
