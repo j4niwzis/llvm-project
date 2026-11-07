@@ -8857,6 +8857,20 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                     }
                     continue;
                   }
+                  // A local of the top-level statement being written (`for
+                  // (...) { bool b; std::cin >> b; f(b); }`), its value only
+                  // known as it runs: pending the same way -- if read, the
+                  // statement is cut here, as a function's body is.
+                  if (const TopLevelStmtDecl *Top = cppshTopStatement(*this);
+                      Top && VD->hasLocalStorage() && !VD->isConstexpr() &&
+                      !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)) &&
+                      cppshInUserInput(*this, VD->getLocation())) {
+                    if (cppshBindable(PatFD->getParamDecl(I))) {
+                      setPending(PatFD->getParamDecl(I), VD);
+                      PendingNeeds.push_back({VD, nullptr});
+                    }
+                    continue;
+                  }
                   // Defined by this same input, not run yet: its value is not
                   // known now, nor its initializer's to be trusted (a read
                   // from std::cin may come between) -- the input is staged
@@ -8889,7 +8903,10 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                       CppshParamRebuild[P] = Rebuild;
                       continue;
                     }
-                  if (!Ok)
+                  // Its initializer -- never a local's that may have changed
+                  // since (only a const one's).
+                  if (!Ok && (!VD->hasLocalStorage() ||
+                              VD->getType().isConstQualified()))
                     if (const Expr *InitE = VD->getAnyInitializer()) {
                       if (!InitE->isValueDependent())
                         Ok = InitE->EvaluateAsRValue(EV, Context);
