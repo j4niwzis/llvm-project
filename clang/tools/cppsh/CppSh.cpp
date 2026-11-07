@@ -196,11 +196,40 @@ extern void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef);
 // Code run as the interpreter stages it (Interpreter::ParseAndExecute): whole,
 // cut only where a value it defines is needed by what follows -- before each
 // piece, the snapshots of the variables it names.
+// `$llvm-lit -v clang/test/x`, `$ ls *.cpp | wc -l`: a line beginning with
+// `$` is a command line -- the rest of it run as it is written by the system
+// shell (/bin/sh -c: its pipes, globs, variables and quoting), as cppsh's
+// foreground job (a std::sh::command), its status last_status. Nothing of it
+// is read as C++.
+static std::string cppshCommandLines(llvm::StringRef Code) {
+  llvm::SmallVector<llvm::StringRef, 8> Lines;
+  Code.split(Lines, '\n');
+  std::string Out;
+  for (size_t I = 0; I < Lines.size(); ++I) {
+    llvm::StringRef Body = Lines[I].ltrim();
+    if (Body.size() > 1 && Body.front() == '$') {
+      std::string Rest = Body.drop_front().trim().str();
+      // A raw string's delimiter its text does not hold.
+      std::string Delim = "cppsh";
+      while (llvm::StringRef(Rest).contains(")" + Delim + "\""))
+        Delim += "_";
+      Out += "std::sh::command(std::vector<std::string>{\"/bin/sh\", \"-c\", R\"" + Delim +
+             "(" + Rest + ")" + Delim + "\"});";
+    } else {
+      Out += Lines[I].str();
+    }
+    if (I + 1 < Lines.size())
+      Out += '\n';
+  }
+  return Out;
+}
+
 static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Code) {
   clang::CppshBeforeChunk = [](clang::Interpreter &I, llvm::StringRef Piece) {
     snapshotNamed(I, Piece);
   };
-  llvm::Error Err = Interp.ParseAndExecute(Code);
+  const std::string Expanded = cppshCommandLines(Code);
+  llvm::Error Err = Interp.ParseAndExecute(Expanded);
   // An input's output out before the next input runs, stdio's and LLVM's
   // streams alike, in the order it was written.
   std::fflush(nullptr);
