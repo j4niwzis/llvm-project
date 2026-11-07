@@ -9633,11 +9633,24 @@ StmtResult TreeTransform<Derived>::TransformCppshStagedStmt(CppshStagedStmt *S) 
       return StmtError();
     Frame.push_back(R.get());
   }
+  // Each staged parameter's type: the local's it stands for, as the frame
+  // now names it -- a local declared `auto` in a template is of the type its
+  // initializer gave it, which the parameter's own type does not say.
   SmallVector<QualType, 8> Types;
-  for (ImplicitParamDecl *P : Old->parameters()) {
+  ArrayRef<ImplicitParamDecl *> OldParams = Old->parameters();
+  for (unsigned I = 0; I < OldParams.size(); ++I) {
+    ImplicitParamDecl *P = OldParams[I];
     QualType T = getDerived().TransformType(P->getType());
     if (T.isNull())
       return StmtError();
+    if (T->isUndeducedType() && I < Frame.size() && Frame[I]) {
+      QualType Local = Frame[I]->getType();
+      if (const auto *Ref = T->getAs<ReferenceType>())
+        Local = Ref->isSpelledAsLValue()
+                    ? SemaRef.Context.getLValueReferenceType(Local)
+                    : SemaRef.Context.getRValueReferenceType(Local);
+      T = Local;
+    }
     Types.push_back(T);
   }
   CppshStagedDecl *New = getSema().ActOnStartCppshStagedInstantiation(
