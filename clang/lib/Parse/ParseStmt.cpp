@@ -1144,6 +1144,7 @@ extern std::vector<std::string> CppshCutRemainders;
 extern std::vector<std::string> CppshCutLoopRests;
 bool cppshMoveOnly(Sema &S, QualType T);
 extern const VarDecl *CppshCutNeedVar;
+extern std::vector<Expr *> CppshCutNeedExprs;
 bool cppshMutates(const Stmt *S, const VarDecl *VD);
 extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
 } // namespace clang
@@ -1631,6 +1632,17 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
             Live.push_back(VD);
     std::vector<std::string> Names, Types;
     PrintingPolicy Policy(Actions.Context.getLangOpts());
+    // The run-time template arguments of the statement cut at, their values
+    // as long long: evaluated here, once, handed over (__cppsh_need<i>).
+    SmallVector<Expr *, 4> NeedArgs;
+    for (Expr *E : CppshCutNeedExprs) {
+      ExprResult AsLL = Actions.BuildCStyleCastExpr(
+          Loc, Actions.Context.getTrivialTypeSourceInfo(Actions.Context.LongLongTy, Loc),
+          Loc, E);
+      if (AsLL.isUsable())
+        NeedArgs.push_back(AsLL.get());
+    }
+    CppshCutNeedExprs.clear();
     for (VarDecl *VD : Live) {
       Names.push_back(VD->getName().str());
       // `&&` first: handed over by moving it (a type with no copy).
@@ -1638,6 +1650,10 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
                       TypeName::getFullyQualifiedName(
                           VD->getType().getNonReferenceType().getUnqualifiedType(),
                           Actions.Context, Policy, /*WithGlobalNsPrefix=*/true));
+    }
+    for (size_t I = 0; I < NeedArgs.size(); ++I) {
+      Names.push_back("__cppsh_need" + std::to_string(I));
+      Types.push_back("long long");
     }
     unsigned Id = CppshCutRemainders.size();
     CppshCutRemainders.push_back(cppshLineMark(SM, Loc) + Rest.str());
@@ -1652,6 +1668,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
       for (VarDecl *VD : Live)
         Refs.push_back(Actions.BuildDeclRefExpr(
             VD, VD->getType().getNonReferenceType(), VK_LValue, Loc));
+      Refs.append(NeedArgs.begin(), NeedArgs.end());
       ExprResult FrameCall =
           Actions.ActOnCallExpr(getCurScope(), Frame.get(), Loc, Refs, Loc);
       Expr *IdLit = IntegerLiteral::Create(Actions.Context, llvm::APInt(32, Id),
@@ -1718,8 +1735,10 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
     StmtResult R;
     SourceLocation CppshStmtBegin = Tok.getLocation();
     const size_t CppshOpenBefore = CppshOpenCuts.size();
-    if (CppshCuts)
+    if (CppshCuts) {
       CppshCutNeeded = false;
+      CppshCutNeedExprs.clear();
+    }
     if (Tok.isNot(tok::kw___extension__)) {
       R = ParseStatementOrDeclaration(Stmts, SubStmtCtx);
     } else {

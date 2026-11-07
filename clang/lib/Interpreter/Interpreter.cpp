@@ -1422,6 +1422,9 @@ unsigned long long CppshParseNs = 0, CppshExecuteNs = 0;
 extern std::vector<std::string> CppshCutRemainders;
 extern std::set<const FunctionDecl *> CppshCutFunctions;
 extern std::vector<std::string> CppshCutLoopRests;
+extern bool CppshTopNeed;
+extern std::vector<APValue> CppshActiveNeeds;
+extern size_t CppshActiveNeedsTaken;
 extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
 extern SourceLocation CppshHoistBegin, CppshHoistEnd;
 extern bool CppshInHoist;
@@ -1451,7 +1454,17 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   // A type marked `&&` (no copy): moved -- the frame it is in is left as
   // soon as the continuation has run.
   std::vector<std::string> Tys;
+  // The run-time template arguments' values (__cppsh_need<i>, long long):
+  // read here, for the continuation's compile to take in order -- not its
+  // parameters.
+  std::vector<APValue> Needs;
   for (unsigned I = 0; I < N && I < Names.size(); ++I) {
+    if (llvm::StringRef(Names[I]).starts_with("__cppsh_need")) {
+      long long V = *static_cast<const long long *>(Frame[I]);
+      Needs.push_back(APValue(llvm::APSInt(llvm::APInt(64, static_cast<uint64_t>(V), true),
+                                           /*isUnsigned=*/false)));
+      continue;
+    }
     std::string Ty = Types[I];
     bool Move = llvm::StringRef(Ty).starts_with("&&");
     if (Move)
@@ -1478,14 +1491,18 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
     // -- never constants there, as the next iteration changes them; its need
     // cut again.
     std::string RefParams, RefArgs;
-    for (unsigned I = 0; I < N && I < Names.size(); ++I) {
+    for (unsigned I = 0, T = 0; I < N && I < Names.size(); ++I) {
+      if (llvm::StringRef(Names[I]).starts_with("__cppsh_need"))
+        continue;
+      (void)T;
       // By value: a function, not a template -- no value specialization of
       // its parameters (the next iteration changes them); the continuation
       // locals, values it was specialized on, are copied (moved, with no copy).
       bool Move = llvm::StringRef(Types[I]).starts_with("&&");
-      RefParams += std::string(RefParams.empty() ? "" : ", ") + Tys[I] + " " + Names[I];
+      std::string Ty = Move ? Types[I].substr(2) : Types[I];
+      RefParams += std::string(RefParams.empty() ? "" : ", ") + Ty + " " + Names[I];
       RefArgs += std::string(RefArgs.empty() ? "" : ", ") +
-                 (Move ? "static_cast<" + Tys[I] + " &&>(" + Names[I] + ")" : Names[I]);
+                 (Move ? "static_cast<" + Ty + " &&>(" + Names[I] + ")" : Names[I]);
     }
     // The flag a `break` of the iteration sets: the loop not run on.
     std::string Flag = "__cppsh_brk" + std::to_string(Id);
@@ -1507,11 +1524,19 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   // staging probe for either.
   bool WasNoProbe = CppshNoProbe;
   CppshNoProbe = true;
+  std::vector<APValue> OuterNeeds = std::exchange(CppshActiveNeeds, {});
+  size_t OuterTaken = std::exchange(CppshActiveNeedsTaken, 0);
   if (llvm::Error Err = Globals.empty() ? llvm::Error::success()
                                         : CppshActiveInterpreter->ParseAndExecute(Globals))
     llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
-  else if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Code))
-    llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
+  else {
+    CppshActiveNeeds = std::move(Needs);
+    CppshActiveNeedsTaken = 0;
+    if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Code))
+      llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
+  }
+  CppshActiveNeeds = std::move(OuterNeeds);
+  CppshActiveNeedsTaken = OuterTaken;
   CppshNoProbe = WasNoProbe;
   CppshInHoist = WasHoist;
   // The result: that of this continuation -- unless it was staged on in turn
@@ -1773,7 +1798,7 @@ static bool cppshMentionsStaged(Sema &S, llvm::StringRef Code) {
     size_t J = I;
     while (J < Code.size() && Ident(Code[J]))
       ++J;
-    if (Code.slice(I, J).starts_with("__cppsh_")) {
+    if (Code.slice(I, J).starts_with("__cppsh_top")) {
       I = J;
       continue;
     }
@@ -1824,6 +1849,45 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
         return Err;
     return llvm::Error::success();
   }
+  // A top-level statement that met a run-time template argument: compiled
+  // again inside a function -- a need there, staged as in any. A plain
+  // statement its body; an expression shown its return; `x = init` its
+  // initializer a function's result, the call hoisted as any staged one.
+  if (!CppshNoProbe) {
+    CppshTopNeed = false;
+    llvm::Error Err = cppshParseAndExecuteOnce(Code, V);
+    if (!CppshTopNeed)
+      return Err;
+    llvm::consumeError(std::move(Err));
+    CppshTopNeed = false;
+    static unsigned Inits = 0;
+    llvm::StringRef S = Code.trim();
+    std::string Wrapped;
+    size_t Eq = S.find('=');
+    bool IsInit = S.ends_with(";") && Eq != llvm::StringRef::npos && Eq > 0 &&
+                  !S.substr(Eq).starts_with("==") &&
+                  llvm::all_of(S.take_front(Eq).trim(), [](char C) {
+                    return std::isalnum(static_cast<unsigned char>(C)) || C == '_';
+                  });
+    if (IsInit) {
+      std::string Name = "__cppsh_init" + std::to_string(Inits++);
+      Wrapped = "auto " + Name + "() { return (" +
+                S.substr(Eq + 1).drop_back().trim().str() + "); }\n" +
+                S.take_front(Eq).trim().str() + " = " + Name + "();";
+    } else if (S.ends_with(";")) {
+      std::string Name = "__cppsh_topstmt" + std::to_string(Inits++);
+      Wrapped = "auto " + Name + "() {\n" + S.str() + "\n}\n" + Name + "();";
+    } else {
+      std::string Name = "__cppsh_init" + std::to_string(Inits++);
+      Wrapped = "auto " + Name + "() { return (" + S.str() + "); }\n" + Name + "()";
+    }
+    return ParseAndExecute(Wrapped, V);
+  }
+  return cppshParseAndExecuteOnce(Code, V);
+}
+
+// One statement as it is (ParseAndExecute: the rest of it).
+llvm::Error Interpreter::cppshParseAndExecuteOnce(llvm::StringRef Code, Value *V) {
   // A top-level loop, if, switch or block: the body of a function of its
   // own, called at once -- where a need in it (a value read at run time, a
   // template argument of it) cuts as in any function: each iteration of a

@@ -112,6 +112,19 @@ SourceLocation CppshStageAt;
 bool CppshCutNeeded = false;
 // The local whose value the need is for; none for a staged call.
 const VarDecl *CppshCutNeedVar = nullptr;
+// The expressions of run-time template arguments met in the statement being
+// parsed (a call's value as a default, input<int>()): evaluated where the body
+// is cut, once, and handed over in the frame (__cppsh_need<i>, as long long).
+std::vector<Expr *> CppshCutNeedExprs;
+// A top-level statement met a run-time template argument: it is compiled
+// again inside a function (Interpreter::ParseAndExecute).
+bool CppshTopNeed = false;
+// The values of those arguments, for the continuation being compiled -- each
+// taken by the next run-time template argument met in it, in order
+// (__cppsh_cut_run sets them).
+std::vector<APValue> CppshActiveNeeds;
+size_t CppshActiveNeedsTaken = 0;
+
 // The function the need arose in: the one whose type is not deduced from
 // the return the cut replaces (SemaStmt).
 const FunctionDecl *CppshCutNeedFunction = nullptr;
@@ -377,6 +390,30 @@ const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
   return Find(E, Find);
 }
 
+// Whether a run-time template argument here is a need of the function being
+// written: a body the user typed, outside a lambda, not a template's pattern.
+bool cppshExprNeedHere(Sema &S, const Expr *E) {
+  FunctionDecl *Cur = S.getCurFunctionDecl();
+  return E && Cur && !isLambdaCallOperator(Cur) && !Cur->isDependentContext() &&
+         !E->isValueDependent() && !E->containsErrors() &&
+         cppshInUserInput(S, Cur->getLocation()) &&
+         cppshInUserInput(S, E->getBeginLoc());
+}
+// Whether it is one of a top-level statement the user typed.
+bool cppshTopNeedHere(Sema &S, const Expr *E) {
+  return E && !S.getCurFunctionDecl() && !E->isValueDependent() &&
+         !E->containsErrors() && cppshInUserInput(S, E->getBeginLoc());
+}
+// In a continuation, the value of the next run-time template argument met
+// in it, as the cut handed it over; none where they are all taken.
+std::optional<APValue> cppshKnownNeed(Sema &S) {
+  FunctionDecl *Cur = S.getCurFunctionDecl();
+  if (!Cur || !Cur->getIdentifier() || !Cur->getName().starts_with("__cppsh_cont") ||
+      CppshActiveNeedsTaken >= CppshActiveNeeds.size())
+    return std::nullopt;
+  return CppshActiveNeeds[CppshActiveNeedsTaken++];
+}
+
 // std::sh::<Name>, as an expression to call.
 static ExprResult cppshShCallee(Sema &S, StringRef Name, SourceLocation Loc) {
   NamespaceDecl *Std = S.getStdNamespace();
@@ -450,6 +487,19 @@ void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
                         VD->getType().getNonReferenceType().getUnqualifiedType(),
                         S.Context, Policy, /*WithGlobalNsPrefix=*/true));
   }
+  // The run-time template arguments, their values as long long.
+  SmallVector<Expr *, 4> NeedArgs;
+  for (size_t I = 0; I < CppshCutNeedExprs.size(); ++I) {
+    ExprResult AsLL = S.BuildCStyleCastExpr(
+        Loc, S.Context.getTrivialTypeSourceInfo(S.Context.LongLongTy, Loc), Loc,
+        CppshCutNeedExprs[I]);
+    if (!AsLL.isUsable())
+      continue;
+    Names.push_back("__cppsh_need" + std::to_string(NeedArgs.size()));
+    Types.push_back("long long");
+    NeedArgs.push_back(AsLL.get());
+  }
+  CppshCutNeedExprs.clear();
   unsigned Id = CppshCutRemainders.size();
   CppshCutRemainders.push_back(cppshLineMark(SM, Loc) + Rest.str());
   CppshCutLoopRests.emplace_back();
@@ -464,6 +514,7 @@ void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
   for (VarDecl *VD : Live)
     Refs.push_back(S.BuildDeclRefExpr(VD, VD->getType().getNonReferenceType(),
                                       VK_LValue, Loc));
+  Refs.append(NeedArgs.begin(), NeedArgs.end());
   ExprResult FrameCall = S.BuildCallExpr(nullptr, Frame.get(), Loc, Refs, Loc);
   if (!FrameCall.isUsable())
     return;

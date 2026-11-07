@@ -58,6 +58,11 @@ extern bool CppshCutNeeded;
 extern const VarDecl *CppshCutNeedVar;
 extern const FunctionDecl *CppshCutNeedFunction;
 const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E);
+extern std::vector<Expr *> CppshCutNeedExprs;
+extern bool CppshTopNeed;
+bool cppshExprNeedHere(Sema &S, const Expr *E);
+bool cppshTopNeedHere(Sema &S, const Expr *E);
+std::optional<APValue> cppshKnownNeed(Sema &S);
 } // namespace clang
 using namespace sema;
 
@@ -6855,6 +6860,37 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
                                    T->isUnsignedIntegerOrEnumerationType()));
       return ConstantExpr::Create(Context, E, Value);
     }
+
+  // cppsh: any other run-time template argument the user wrote -- a call's
+  // value (input<int>()), written or a default substituted, for a function,
+  // class, variable or alias template alike.
+  if (CCE == CCEKind::TemplateArg && T->isIntegralOrEnumerationType()) {
+    llvm::APSInt Zero(Context.getIntWidth(T), T->isUnsignedIntegerOrEnumerationType());
+    // In a continuation: the value the cut handed over, in order.
+    if (std::optional<APValue> Known = cppshKnownNeed(*this); Known && Known->isInt()) {
+      llvm::APSInt V = Known->getInt();
+      V = V.extOrTrunc(Context.getIntWidth(T));
+      V.setIsUnsigned(T->isUnsignedIntegerOrEnumerationType());
+      Value = APValue(V);
+      return ConstantExpr::Create(Context, E, Value);
+    }
+    // In a function body: a need -- evaluated where the body is cut, handed
+    // over in the frame; meanwhile a zero, the statement being dropped.
+    if (cppshExprNeedHere(*this, E)) {
+      CppshCutNeeded = true;
+      CppshCutNeedVar = nullptr;
+      CppshCutNeedFunction = getCurFunctionDecl();
+      CppshCutNeedExprs.push_back(E);
+      Value = APValue(Zero);
+      return ConstantExpr::Create(Context, E, Value);
+    }
+    // At the top level: the statement compiled again inside a function.
+    if (cppshTopNeedHere(*this, E)) {
+      CppshTopNeed = true;
+      Value = APValue(Zero);
+      return ConstantExpr::Create(Context, E, Value);
+    }
+  }
 
   // It's not a constant expression. Produce an appropriate diagnostic.
   if (Notes.size() == 1 &&

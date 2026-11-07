@@ -1825,8 +1825,10 @@ struct staged {
   friend constexpr bool operator==(staged, staged) noexcept { return true; }
 };
 
+// Each a local, or a temporary (a run-time template argument's value, alive
+// to the end of the cut's return): its address.
 template <typename... T>
-std::array<void *, sizeof...(T)> __cppsh_frame(T &...locals) noexcept {
+std::array<void *, sizeof...(T)> __cppsh_frame(T &&...locals) noexcept {
   return {const_cast<void *>(static_cast<const void *>(std::addressof(locals)))...};
 }
 

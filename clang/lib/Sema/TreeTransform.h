@@ -57,6 +57,7 @@ using namespace llvm::omp;
 namespace clang {
 // cppsh: cuts in instantiated bodies (SemaExpr.cpp).
 extern bool CppshCutNeeded;
+extern std::vector<Expr *> CppshCutNeedExprs;
 bool cppshCutsInstantiatedBody(Sema &S, const CompoundStmt *Body);
 void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
                            SmallVectorImpl<Stmt *> &Statements);
@@ -8383,8 +8384,10 @@ TreeTransform<Derived>::TransformCompoundStmt(CompoundStmt *S,
   // the function in a body the parser may cut), kept across it.
   const bool CppshOuterNeed = CppshBody && CppshCutNeeded;
   for (auto *B : S->body()) {
-    if (CppshBody)
+    if (CppshBody) {
       CppshCutNeeded = false;
+      CppshCutNeedExprs.clear();
+    }
     StmtResult Result = getDerived().TransformStmt(
         B, IsStmtExpr && B == S->body_back() ? StmtDiscardKind::StmtExprResult
                                              : StmtDiscardKind::Discarded);
