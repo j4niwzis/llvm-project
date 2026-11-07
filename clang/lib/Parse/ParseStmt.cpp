@@ -1304,19 +1304,24 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   // the staged statement references queued again, once it is made.
   auto Dropped = std::move(CppshDropped);
   CppshDropped.clear();
-  // What the first parse declared (`a` of `a = std::array<int, n>{}`):
-  // out of scope -- the staged statement declares its own.
+  // What the first parse declared (`a` of `a = std::array<int, n>{}`; a
+  // label, in the function's scope): out of scope -- the staged statement
+  // declares its own.
   {
     SourceManager &SM = PP.getSourceManager();
-    SmallVector<NamedDecl *, 4> FirstParse;
-    for (Decl *D : getCurScope()->decls())
-      if (auto *ND = dyn_cast<NamedDecl>(D);
-          ND && ND->getIdentifier() &&
-          !SM.isBeforeInTranslationUnit(ND->getLocation(), Begin))
-        FirstParse.push_back(ND);
-    for (NamedDecl *ND : FirstParse) {
-      getCurScope()->RemoveDecl(ND);
-      Actions.IdResolver.RemoveDecl(ND);
+    for (Scope *Sc = getCurScope(); Sc; Sc = Sc->getParent()) {
+      SmallVector<NamedDecl *, 4> FirstParse;
+      for (Decl *D : Sc->decls())
+        if (auto *ND = dyn_cast<NamedDecl>(D);
+            ND && ND->getIdentifier() &&
+            !SM.isBeforeInTranslationUnit(ND->getLocation(), Begin))
+          FirstParse.push_back(ND);
+      for (NamedDecl *ND : FirstParse) {
+        Sc->RemoveDecl(ND);
+        Actions.IdResolver.RemoveDecl(ND);
+      }
+      if (Sc->getFlags() & Scope::FnScope)
+        break;
     }
   }
   // Its frame: the live locals (those its body does not name dropped by
@@ -1441,6 +1446,9 @@ StmtResult Parser::CppshParseStaged(
   }
   const std::optional<unsigned> SavedRegionBegin =
       std::exchange(CppshRegionBegin, RegionBegin);
+  // The rest of a function's body made staged after a block that kept a
+  // staged function's result: the function's own concern, not this body's.
+  const bool SavedPending = std::exchange(CppshStagedPending, false);
   const SourceLocation SavedOpen = std::exchange(CppshBodyOpen, Begin);
   const size_t SavedRangeBase = std::exchange(CppshRangeBase, CppshRangeFors.size());
   StmtResult Body;
@@ -1452,6 +1460,7 @@ StmtResult Parser::CppshParseStaged(
   }
   CppshSuppliedExprs = std::move(SavedArgs);
   CppshRegionBegin = SavedRegionBegin;
+  CppshStagedPending = SavedPending;
   CppshBodyOpen = SavedOpen;
   CppshRangeBase = SavedRangeBase;
   if (!Body.isUsable()) {
