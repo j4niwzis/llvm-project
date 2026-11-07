@@ -2065,6 +2065,18 @@ bool Lexer::LexIdentifierContinue(Token &Result, const char *CurPtr) {
     }
     if (C == '\\' && tryConsumeIdentifierUCN(CurPtr, Size, Result))
       continue;
+    // cppsh: kebab-case -- a '-' between two parts of a name, glued to both
+    // (`llvm-lit`, `clang-format`, `some-thing`): one identifier, in what the
+    // user typed (the REPL's input buffers). Not before a digit or anything
+    // else: `n-1`, `a - b`, `p->m`, `i--`, `x-=1` are what they are in C++.
+    if (C == '-' && LangOpts.IncrementalExtensions && PP &&
+        CurPtr + Size < BufferEnd && isAsciiIdentifierStart(CurPtr[Size]) &&
+        PP->getSourceManager()
+            .getBufferName(PP->getSourceManager().getFileLoc(FileLoc))
+            .starts_with("input_line_")) {
+      CurPtr = ConsumeChar(CurPtr, Size, Result);
+      continue;
+    }
     if (!isASCII(C) && tryConsumeIdentifierUTF8Char(CurPtr, Result))
       continue;
     if (C == '\'' && LangOpts.CPlusPlus &&

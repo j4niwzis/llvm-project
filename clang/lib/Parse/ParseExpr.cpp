@@ -174,15 +174,16 @@ ExprResult Parser::MaybeParseUnparenthesizedCallArgs(ExprResult LHS) {
                        tok::unknown);
     };
     bool Shell = shellOnly(Tok) || isPathStart();
-    // A name glued to a '-', '/' or '.' -- `clang-format`, `test/a.cpp`,
-    // `notes.txt` -- a word too, where the name is none C++ knows (below):
-    // `n-1`, `a/b`, `e.name` with n, a, e declared stay C++.
+    // A name glued to a '/' or '.' -- `test/a.cpp`, `notes.txt` -- a word
+    // too, where the name is none C++ knows (below): `a/b`, `e.name` with a,
+    // e declared stay C++. (A '-' between parts of a name is one name, lexed
+    // so: kebab-case.)
     const bool Named = Tok.is(tok::identifier);
     unsigned Glued = 0;
     while (!endsWord(GetLookAheadToken(Glued + 1))) {
       const Token &Next = GetLookAheadToken(Glued + 1);
       Shell = Shell || shellOnly(Next) ||
-              (Named && Next.isOneOf(tok::minus, tok::slash, tok::period));
+              (Named && Next.isOneOf(tok::slash, tok::period));
       ++Glued;
     }
     // A word of one token is one only where it is a path's mark alone
@@ -1006,14 +1007,13 @@ Parser::ParseCastExpression(CastParseKind ParseKind, bool isAddressOfOperand,
     return Sym;
   }
 
-  // cppsh: a command named with a '-', '/' or '.' in it -- `llvm-lit`,
-  // `clang-format`, `tools/run`, `run.sh` -- as an expression's first word,
-  // in what the user typed, where its first part is a name C++ does not know:
-  // the symbol of the word as written, as a path is above. `n-1` with n
-  // declared stays a subtraction.
+  // cppsh: a command named with a '/' or '.' in it -- `tools/run`, `run.sh`
+  // -- as an expression's first word, in what the user typed, where its
+  // first part is a name C++ does not know: the symbol of the word as
+  // written, as a path is above. (`llvm-lit` is one name already: the
+  // lexer reads kebab-case.)
   if (PP.isIncrementalProcessingEnabled() && !PP.isBacktrackEnabled() &&
-      Tok.is(tok::identifier) &&
-      NextToken().isOneOf(tok::minus, tok::slash, tok::period) &&
+      Tok.is(tok::identifier) && NextToken().isOneOf(tok::slash, tok::period) &&
       !NextToken().hasLeadingSpace() &&
       !GetLookAheadToken(2).hasLeadingSpace() &&
       GetLookAheadToken(2).isOneOf(tok::identifier, tok::numeric_constant) &&
