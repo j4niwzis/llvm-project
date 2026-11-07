@@ -189,6 +189,18 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
     if (!S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl()))
       continue;
     auto *VD = R.getAsSingle<clang::VarDecl>();
+    // One of a unit no longer there (taken back): nothing to snapshot.
+    if (VD) {
+      bool Live = false;
+      for (const clang::Decl *TU : Ctx.getTranslationUnitDecl()->redecls())
+        Live |= TU == VD->getTranslationUnitDecl();
+      if (!Live) {
+        if (::getenv("CPPSH_TRACE_STAGING"))
+          llvm::errs() << "cppsh-trace: snapshot: " << Name
+                       << " found, of a unit taken back: skipped\n";
+        continue;
+      }
+    }
     if (!VD || !VD->hasGlobalStorage() || VD->isInvalidDecl() ||
         VD->getType()->isDependentType() ||
         VD->getType().getNonReferenceType().isTriviallyCopyableType(Ctx))

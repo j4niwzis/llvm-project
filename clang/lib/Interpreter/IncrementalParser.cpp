@@ -107,6 +107,12 @@ llvm::Error IncrementalParser::TakeBackPTU(llvm::StringRef Why) {
   for (Decl *D : TU->noload_decls())
     if (auto *ND = dyn_cast<NamedDecl>(D); ND && ND->getDeclName())
       Withdrawn.push_back(ND);
+  if (cppshTraceStaging()) {
+    llvm::errs() << "cppsh-trace: unit taken back (" << Why << "), its names:";
+    for (NamedDecl *D : Withdrawn)
+      llvm::errs() << " " << D->getDeclName().getAsString();
+    llvm::errs() << "\n";
+  }
   CleanUpPTU(TU);
   // cppsh: none of them found by name any more -- the unit now current's
   // lookup, which a top-level declaration taken back for its staging was
