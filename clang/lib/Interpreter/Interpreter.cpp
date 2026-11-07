@@ -1699,6 +1699,10 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     return 0;
   };
   auto *SS = const_cast<CppshStagedStmt *>(Staged);
+  if (cppshTraceStaging())
+    llvm::errs() << "cppsh-trace: running staged "
+                 << SS->getBeginLoc().printToString(S.getSourceManager())
+                 << " entry " << Entry << "\n";
   CppshStagedDecl *SD = SS->getStagedDecl();
   ArrayRef<ImplicitParamDecl *> Params = SD->parameters();
   const unsigned N = Params.size();
@@ -1927,6 +1931,14 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
   const unsigned KeptBefore = CppshKeptResults;
   const int Left =
       reinterpret_cast<StagedFn>(Found->Address)(Entries.data(), Slot, Entry);
+  if (cppshTraceStaging())
+    llvm::errs() << "cppsh-trace: ran staged "
+                 << SS->getBeginLoc().printToString(S.getSourceManager())
+                 << " entry " << Entry << " left " << Left
+                 << (Keep ? (ResultName.empty() ? " keeping nothing"
+                                                : " keeping " + ResultName)
+                          : std::string())
+                 << "\n";
   // Its return kept the result -- unless code staged inside it did (that
   // code's result kept already).
   if (Keep && Left == 3 && !ResultName.empty() && CppshKeptResults == KeptBefore) {

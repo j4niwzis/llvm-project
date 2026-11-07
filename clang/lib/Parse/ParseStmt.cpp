@@ -1266,19 +1266,29 @@ SmallVector<VarDecl *, 8> Parser::CppshLiveLocals(SourceLocation Loc) {
 // from a staged statement already): the caller says so.
 bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
                              SourceLocation Begin, bool AtBody) {
+  auto Refuse = [&](const char *Why) {
+    if (cppshTraceStaging())
+      llvm::errs() << "cppsh-trace: not staged at "
+                   << Begin.printToString(PP.getSourceManager()) << ": " << Why
+                   << "\n";
+    return false;
+  };
   // What it needs: a local's value, a run-time template argument's, or a
   // staged function's result -- one, the last a staged call leaves.
-  if (CppshCutStagedCalls.size() > 1 ||
-      (!CppshCutNeedVar && CppshCutNeedExprs.empty() && CppshCutStagedCalls.empty()))
-    return false;
+  if (CppshCutStagedCalls.size() > 1)
+    return Refuse("more than one staged call");
+  if (!CppshCutNeedVar && CppshCutNeedExprs.empty() && CppshCutStagedCalls.empty())
+    return Refuse("nothing it needs is known");
   // Its first parse may be invalid (what the need left unresolved): a
   // statement, not a declaration, then.
   const bool Declares = R.isUsable() && isa<DeclStmt>(R.get());
   std::optional<unsigned> B = cppshTokenIndex(Begin);
   // A staged statement's first statement needing a value again: what it
   // needs is no local of it -- another staged statement would be the same.
-  if (!B || (CppshRegionBegin && *CppshRegionBegin == *B))
-    return false;
+  if (!B)
+    return Refuse("its tokens are not recorded");
+  if (CppshRegionBegin && *CppshRegionBegin == *B)
+    return Refuse("the staged statement's own first statement needs it again");
   if (Declares)
     SkipUntil(tok::r_brace, StopBeforeMatch);
   std::optional<unsigned> E =
@@ -1286,7 +1296,7 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
       : CppshReplayEnd  ? CppshReplayEnd
                         : std::optional<unsigned>(CppshInputTokens.size());
   if (!E || *E <= *B)
-    return false;
+    return Refuse("where it ends is not known");
   // The instantiations the first parse queued, dropped by the caller: those
   // the staged statement references queued again, once it is made.
   auto Dropped = std::move(CppshDropped);
@@ -1314,7 +1324,7 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   for (Expr *NE : CppshCutNeedExprs) {
     VarDecl *V = CppshNeedVar(NE, Needs.size(), Before);
     if (!V)
-      return false;
+      return Refuse("a run-time template argument's value has no local");
     Locals.push_back(V);
     Needs.push_back({NE->getBeginLoc(), V});
   }
@@ -1328,7 +1338,7 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
       /*Keeps=*/false, From,
       [&](StmtVector &Body) { ParseCppshRegionStatements(Body, From, To); });
   if (!S.isUsable())
-    return false;
+    return Refuse("its body did not parse");
   // A return from it of a value whose type it gives made it the rest of a
   // staged function (Sema): the result kept for the function's caller, the
   // function returning nothing of its own after it -- so every path through
@@ -1343,6 +1353,11 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     Diag(Begin, diag::err_cppsh_staged_result_falls_through);
     return true;
   }
+  if (cppshTraceStaging())
+    llvm::errs() << "cppsh-trace: staged at "
+                 << Begin.printToString(PP.getSourceManager())
+                 << (Staged ? " (a staged function's rest)" : "")
+                 << (StagedCall ? " (with a staged call)" : "") << "\n";
   Stmts.append(Before.begin(), Before.end());
   Stmts.push_back(S.get());
   SmallVector<Stmt *, 4> Made(Before.begin(), Before.end());

@@ -71,6 +71,10 @@ const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E);
 /// template argument's value (Interpreter::cppshStageDecl).
 extern llvm::DenseMap<SourceLocation::UIntTy, Expr *> CppshSuppliedExprs;
 
+/// Whether staging is traced (CPPSH_TRACE_STAGING set): what is staged, why
+/// not, and how each staged statement ran -- on stderr, "cppsh-trace: ".
+bool cppshTraceStaging();
+
 /// A need met in the statement being parsed (CppshCutNeeded): what the rest
 /// of that statement's analysis says is held back -- it is parsed again,
 /// as a staged region's -- until cppshEndNeedDiagnostics, where the

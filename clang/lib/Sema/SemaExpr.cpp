@@ -111,6 +111,11 @@ SourceLocation CppshStageAt;
 bool CppshCutNeeded = false;
 llvm::DenseMap<SourceLocation::UIntTy, Expr *> CppshSuppliedExprs;
 
+bool cppshTraceStaging() {
+  static const bool On = ::getenv("CPPSH_TRACE_STAGING") != nullptr;
+  return On;
+}
+
 // Whether the diagnostics of the statement a need was met in are being held
 // back, and whether they were before.
 static bool CppshNeedHolding = false;
@@ -7573,6 +7578,26 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
     Call = OpenMP().ActOnOpenMPCall(Call, Scope, LParenLoc, ArgExprs, RParenLoc,
                                     ExecConfig);
   // A call of a staged function (cppsh): its result only known as it runs.
+  if (cppshTraceStaging())
+    if (const auto *CE = dyn_cast_or_null<CallExpr>(Call.get()))
+      if (const FunctionDecl *Callee = CE->getDirectCallee();
+          Callee && cppshInUserInput(*this, CE->getBeginLoc())) {
+        const FunctionDecl *Pattern = Callee->getTemplateInstantiationPattern();
+        llvm::errs() << "cppsh-trace: call of " << Callee->getNameAsString()
+                     << (CppshCutFunctions.count(Callee->getCanonicalDecl())
+                             ? " (staged)"
+                             : "")
+                     << (Pattern ? " pattern " + Pattern->getNameAsString() +
+                                       (CppshCutFunctions.count(
+                                            Pattern->getCanonicalDecl())
+                                            ? " (staged)"
+                                            : "")
+                                 : std::string())
+                     << " need-function "
+                     << (cppshNeedFunction(*this) ? "yes" : "no")
+                     << " top-statement "
+                     << (cppshTopStatement(*this) ? "yes" : "no") << "\n";
+      }
   if (const auto *CE = dyn_cast<CallExpr>(Call.get()))
     if (const FunctionDecl *Callee = CE->getDirectCallee();
         Callee &&
