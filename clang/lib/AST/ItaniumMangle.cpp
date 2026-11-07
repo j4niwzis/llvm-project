@@ -536,7 +536,8 @@ private:
   void manglePrefix(NestedNameSpecifier Qualifier);
   void manglePrefix(const DeclContext *DC, bool NoFunction=false);
   void manglePrefix(QualType type);
-  void mangleTemplatePrefix(GlobalDecl GD, bool NoFunction=false);
+  void mangleTemplatePrefix(GlobalDecl GD, bool NoFunction = false,
+                            ArrayRef<StringRef> OwnAbiTags = {});
   void mangleTemplatePrefix(TemplateName Template);
   void DiagnoseUnsupportedPackIndexTemplateName();
   const NamedDecl *getClosurePrefix(const Decl *ND);
@@ -1906,7 +1907,17 @@ void CXXNameMangler::mangleNestedName(GlobalDecl GD, const DeclContext *DC,
   // Check if we have a template.
   const TemplateArgumentList *TemplateArgs = nullptr;
   if (GlobalDecl TD = isTemplate(GD, TemplateArgs)) {
-    mangleTemplatePrefix(TD, NoFunction);
+    // cppsh: a specialization's own ABI tags (one specialized on its
+    // arguments' values) written with the template's name.
+    SmallVector<StringRef, 2> Own;
+    if (const auto *FD = dyn_cast<FunctionDecl>(ND))
+      if (const FunctionTemplateDecl *Primary = FD->getPrimaryTemplate())
+        if (const auto *Tags = FD->getAttr<AbiTagAttr>();
+            Tags && Tags->isImplicit() &&
+            !Primary->getTemplatedDecl()->hasAttr<AbiTagAttr>())
+          Own.append(Tags->tags_begin(), Tags->tags_end());
+    llvm::sort(Own);
+    mangleTemplatePrefix(TD, NoFunction, Own);
     mangleTemplateArgs(asTemplateName(TD), *TemplateArgs);
   } else {
     manglePrefix(DC, NoFunction);
@@ -2398,9 +2409,19 @@ void CXXNameMangler::mangleTemplatePrefix(TemplateName Template) {
   addSubstitution(Template);
 }
 
-void CXXNameMangler::mangleTemplatePrefix(GlobalDecl GD,
-                                          bool NoFunction) {
+void CXXNameMangler::mangleTemplatePrefix(GlobalDecl GD, bool NoFunction,
+                                          ArrayRef<StringRef> OwnAbiTags) {
   const TemplateDecl *ND = cast<TemplateDecl>(GD.getDecl());
+  // cppsh: a member function template's specialization of its own ABI tags
+  // (cppsh_vN): the template's name written with them, no substitution of
+  // (or for) the untagged name.
+  if (!OwnAbiTags.empty()) {
+    const DeclContext *DC = Context.getEffectiveDeclContext(ND);
+    manglePrefix(DC, NoFunction);
+    mangleUnqualifiedName(GD.getWithDecl(ND->getTemplatedDecl()), DC,
+                          OwnAbiTags);
+    return;
+  }
   // <template-prefix> ::= <prefix> <template unqualified-name>
   //                   ::= <template-param>
   //                   ::= <substitution>
