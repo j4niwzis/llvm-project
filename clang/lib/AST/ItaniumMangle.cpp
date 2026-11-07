@@ -1066,6 +1066,23 @@ const RecordDecl *CXXNameMangler::GetLocalClassDecl(const Decl *D) {
 void CXXNameMangler::mangleNameWithAbiTags(
     GlobalDecl GD, ArrayRef<StringRef> AdditionalAbiTags) {
   const NamedDecl *ND = cast<NamedDecl>(GD.getDecl());
+  // cppsh: a function template specialization's own ABI tags -- one
+  // specialized on its arguments' values (cppsh_vN) is told by them from the
+  // others of the same template arguments -- written with the template's
+  // name, which is all of the name a specialization mangles.
+  SmallVector<StringRef, 4> WithOwnTags;
+  if (const auto *FD = dyn_cast<FunctionDecl>(ND))
+    if (const FunctionTemplateDecl *Primary = FD->getPrimaryTemplate())
+      if (const auto *Own = FD->getAttr<AbiTagAttr>();
+          Own && Own->isImplicit() &&
+          !Primary->getTemplatedDecl()->hasAttr<AbiTagAttr>()) {
+        WithOwnTags.assign(AdditionalAbiTags.begin(), AdditionalAbiTags.end());
+        for (StringRef Tag : Own->tags())
+          WithOwnTags.push_back(Tag);
+        llvm::sort(WithOwnTags);
+        WithOwnTags.erase(llvm::unique(WithOwnTags), WithOwnTags.end());
+        AdditionalAbiTags = WithOwnTags;
+      }
   //  <name> ::= [<module-name>] <nested-name>
   //         ::= [<module-name>] <unscoped-name>
   //         ::= [<module-name>] <unscoped-template-name> <template-args>
