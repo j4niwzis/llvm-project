@@ -1535,8 +1535,18 @@ void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
   Builder.CreateStore(llvm::ConstantPointerNull::get(PtrTy),
                       Builder.CreateConstArrayGEP(FrameAddr, Frame.size()));
   llvm::Value *Slot = llvm::ConstantPointerNull::get(PtrTy);
-  if (S.leaves(CppshStagedStmt::LeavesByReturn) && ReturnValue.isValid())
-    Slot = ReturnValue.emitRawPointer(*this);
+  if (S.leaves(CppshStagedStmt::LeavesByReturn)) {
+    bool InRunFn = false;
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(CurCodeDecl);
+    if (FD)
+      for (const auto *A : FD->specific_attrs<AnnotateAttr>())
+        if (A->getAnnotation() == "cppsh.staged.run")
+          InRunFn = FD->getNumParams() == 2;
+    if (InRunFn)
+      Slot = Builder.CreateLoad(GetAddrOfLocalVar(FD->getParamDecl(1)));
+    else if (ReturnValue.isValid())
+      Slot = ReturnValue.emitRawPointer(*this);
+  }
   // The statement itself, which the interpreter compiles: in this process.
   llvm::Value *Node = Builder.CreateIntToPtr(
       llvm::ConstantInt::get(IntPtrTy, reinterpret_cast<uintptr_t>(&S)), PtrTy);
@@ -1545,21 +1555,56 @@ void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
   llvm::FunctionCallee Run = CGM.CreateRuntimeFunction(FnTy, "__cppsh_staged_run");
   llvm::Value *Code = EmitRuntimeCallOrInvoke(
       Run, {Node, FrameAddr.emitRawPointer(*this), Slot}, "cppsh.left");
-  auto Leave = [&](unsigned K, JumpDest Dest) {
-    llvm::BasicBlock *Taken = createBasicBlock("cppsh.leave");
+  // In staged code compiled as it runs (a function of the interpreter's):
+  // where the function around both returns its value is that function's
+  // slot, and a way out of that code too is that function's leaving.
+  const auto *RunFD = dyn_cast_or_null<FunctionDecl>(CurCodeDecl);
+  bool InRun = false;
+  if (RunFD)
+    for (const auto *A : RunFD->specific_attrs<AnnotateAttr>())
+      if (A->getAnnotation() == "cppsh.staged.run")
+        InRun = RunFD->getNumParams() == 2;
+  auto LeaveRun = [&](unsigned K) {
+    Builder.CreateStore(Builder.getInt32(K), ReturnValue);
+    EmitBranchThroughCleanup(ReturnBlock);
+  };
+  auto Leave = [&](unsigned K, llvm::function_ref<void()> Taken) {
+    llvm::BasicBlock *TakenBB = createBasicBlock("cppsh.leave");
     llvm::BasicBlock *Next = createBasicBlock("cppsh.next");
     Builder.CreateCondBr(Builder.CreateICmpEQ(Code, Builder.getInt32(K)),
-                         Taken, Next);
-    EmitBlock(Taken);
-    EmitBranchThroughCleanup(Dest);
+                         TakenBB, Next);
+    EmitBlock(TakenBB);
+    Taken();
     EmitBlock(Next);
   };
-  if (S.leaves(CppshStagedStmt::LeavesByBreak) && !BreakContinueStack.empty())
-    Leave(1, BreakContinueStack.back().BreakBlock);
-  if (S.leaves(CppshStagedStmt::LeavesByContinue) && !BreakContinueStack.empty())
-    Leave(2, BreakContinueStack.back().ContinueBlock);
+  if (S.leaves(CppshStagedStmt::LeavesByBreak)) {
+    if (!BreakContinueStack.empty())
+      Leave(1, [&] { EmitBranchThroughCleanup(BreakContinueStack.back().BreakBlock); });
+    else if (InRun)
+      Leave(1, [&] { LeaveRun(1); });
+  }
+  if (S.leaves(CppshStagedStmt::LeavesByContinue)) {
+    if (!BreakContinueStack.empty())
+      Leave(2, [&] { EmitBranchThroughCleanup(BreakContinueStack.back().ContinueBlock); });
+    else if (InRun)
+      Leave(2, [&] { LeaveRun(2); });
+  }
   if (S.leaves(CppshStagedStmt::LeavesByReturn))
-    Leave(3, ReturnBlock);
+    Leave(3, [&] {
+      if (InRun)
+        LeaveRun(3);
+      else
+        EmitBranchThroughCleanup(ReturnBlock);
+    });
+  ArrayRef<LabelDecl *> Targets = S.gotoTargets();
+  ArrayRef<int> Propagate = S.gotoPropagation();
+  for (unsigned I = 0; I < Targets.size(); ++I)
+    Leave(4 + I, [&] {
+      if (InRun && Propagate[I] >= 0)
+        LeaveRun(Propagate[I]);
+      else
+        EmitBranchThroughCleanup(getJumpDestForLabel(Targets[I]));
+    });
 }
 
 // cppsh: an exit from a staged statement's body, compiled as it runs: the

@@ -325,6 +325,18 @@ CppshStagedStmt *CppshStagedStmt::CreateEmpty(const ASTContext &C,
   return S;
 }
 
+void CppshStagedStmt::setGotoTargets(const ASTContext &C,
+                                     ArrayRef<LabelDecl *> L,
+                                     ArrayRef<int> P) {
+  NumTargets = L.size();
+  Targets = NumTargets ? new (C) LabelDecl *[NumTargets] : nullptr;
+  Propagate = NumTargets ? new (C) int[NumTargets] : nullptr;
+  for (unsigned I = 0; I < NumTargets; ++I) {
+    Targets[I] = L[I];
+    Propagate[I] = I < P.size() ? P[I] : -1;
+  }
+}
+
 SourceLocation CppshStagedExitStmt::getEndLoc() const {
   if (const Expr *V = getValue())
     return V->getEndLoc();

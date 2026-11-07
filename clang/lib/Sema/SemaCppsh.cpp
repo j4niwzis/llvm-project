@@ -40,6 +40,20 @@ struct CppshFindThis : RecursiveASTVisitor<CppshFindThis> {
   }
 };
 
+// The labels code defines, and those its gotos jump to.
+struct CppshJumps : RecursiveASTVisitor<CppshJumps> {
+  llvm::SmallPtrSet<const LabelDecl *, 4> Defined;
+  SmallVector<LabelDecl *, 4> Gone;
+  bool VisitLabelStmt(LabelStmt *S) {
+    Defined.insert(S->getDecl());
+    return true;
+  }
+  bool VisitGotoStmt(GotoStmt *S) {
+    Gone.push_back(S->getLabel());
+    return true;
+  }
+};
+
 // The declarations code names.
 struct CppshUses : RecursiveASTVisitor<CppshUses> {
   llvm::SmallPtrSet<const Decl *, 16> Used;
@@ -169,8 +183,18 @@ StmtResult Sema::ActOnFinishCppshStaged(CppshStagedDecl *SD, Stmt *Body,
     Frame.push_back(BuildCXXThisExpr(Loc, ThisTy, /*IsImplicit=*/true));
     SD->setUsesThis(true);
   }
+  // The labels outside it its gotos jump to.
+  CppshJumps Jumps;
+  Jumps.TraverseStmt(Body);
+  SmallVector<LabelDecl *, 4> Targets;
+  for (LabelDecl *L : Jumps.Gone)
+    if (L && !Jumps.Defined.count(L) && !llvm::is_contained(Targets, L))
+      Targets.push_back(L);
+  if (!Targets.empty())
+    Info.Leaves |= CppshStagedStmt::LeavesByGoto;
   auto *S = CppshStagedStmt::Create(Context, SD, Body, Frame, Info.Leaves,
                                     Info.KeepsResult, Loc, EndLoc);
+  S->setGotoTargets(Context, Targets, SmallVector<int, 4>(Targets.size(), -1));
   SD->setStagedStmt(S);
   return S;
 }
@@ -205,10 +229,6 @@ StmtResult Sema::ActOnCppshStagedLeave(SourceLocation Loc, Scope *Target,
   for (Scope *S = Info->BodyScope; S; S = S->getParent()) {
     if (S != Target)
       continue;
-    if (Info->KeepsResult) {
-      Diag(Loc, diag::err_cppsh_staged_result_jump);
-      return StmtError();
-    }
     Info->Leaves |= IsContinue ? CppshStagedStmt::LeavesByContinue
                                : CppshStagedStmt::LeavesByBreak;
     return new (Context) CppshStagedExitStmt(
@@ -222,12 +242,6 @@ StmtResult Sema::ActOnCppshStagedReturn(CppshStagedScope &Info,
                                         SourceLocation Loc, Expr *Value,
                                         Scope *CurScope) {
   Info.Leaves |= CppshStagedStmt::LeavesByReturn;
-  // From staged code inside other staged code: the inner one is compiled
-  // into a function of the outer one's -- no way to the function both are in.
-  if (CppshStagedScopes.size() > 1) {
-    Diag(Loc, diag::err_cppsh_staged_nested_return);
-    return StmtError();
-  }
   // A value whose type is known only as the function runs, returned from a
   // function whose type is deduced from it: the function is a staged one --
   // this code its rest, its result kept for its caller.
@@ -235,12 +249,6 @@ StmtResult Sema::ActOnCppshStagedReturn(CppshStagedScope &Info,
     if (FunctionDecl *FD = getCurFunctionDecl(/*AllowLambda=*/true);
         FD && FD->getReturnType()->isUndeducedType())
       Info.KeepsResult = true;
-  if (Info.KeepsResult &&
-      (Info.Leaves & (CppshStagedStmt::LeavesByBreak |
-                      CppshStagedStmt::LeavesByContinue))) {
-    Diag(Loc, diag::err_cppsh_staged_result_jump);
-    return StmtError();
-  }
   // The rest of a staged function's body: what it returns is kept for the
   // function's caller, of its own type -- not the function's.
   if (Info.KeepsResult) {
@@ -271,7 +279,7 @@ StmtResult Sema::ActOnCppshStagedReturn(CppshStagedScope &Info,
 }
 
 StmtResult Sema::BuildCppshStagedExit(unsigned K, SourceLocation Loc,
-                                      Expr *Value) {
+                                      Expr *Value, unsigned Target) {
   auto Kind = static_cast<CppshStagedExitStmt::ExitKind>(K);
   // Still in a staged statement's body (an enclosing template's
   // instantiation; a nested statement's, as the one around it is
@@ -295,11 +303,33 @@ StmtResult Sema::BuildCppshStagedExit(unsigned K, SourceLocation Loc,
     return ReturnStmt::Create(C, Loc, Lit, /*NRVOCandidate=*/nullptr);
   };
   if (Kind != CppshStagedExitStmt::Return)
-    return new (C) CppshStagedExitStmt(Kind, Loc, nullptr, nullptr, Leave(Kind));
-  // A staged function's result: what its own function returns.
-  if (Run->KeepsResult)
-    return BuildReturnStmt(Loc, Value, /*AllowRecovery=*/false);
+    return new (C) CppshStagedExitStmt(
+        Kind, Loc, nullptr, nullptr,
+        Leave(Kind == CppshStagedExitStmt::Goto ? 4 + Target : unsigned(Kind)),
+        Target);
+  // A staged function's result: of the type its returns give it (as an
+  // `auto` function's would be), constructed where the interpreter keeps it.
   QualType R = Run->ReturnType;
+  if (Run->KeepsResult) {
+    QualType T;
+    if (Value && !Value->getType()->isVoidType()) {
+      T = Value->getType().getNonReferenceType().getUnqualifiedType();
+      if (T->isArrayType())
+        T = C.getArrayDecayedType(T);
+      else if (T->isFunctionType())
+        T = C.getPointerType(T);
+    }
+    if (!T.isNull()) {
+      if (Run->ReturnType.isNull()) {
+        Run->ReturnType = T;
+      } else if (!C.hasSameType(Run->ReturnType, T)) {
+        Diag(Loc, diag::err_auto_fn_different_deductions)
+            << 0 << T << Run->ReturnType;
+        return StmtError();
+      }
+    }
+    R = T;
+  }
   if (R.isNull() || R->isVoidType()) {
     if (Value) {
       ExprResult V = ActOnFinishFullExpr(Value, Loc, /*DiscardedValue=*/true);
@@ -361,10 +391,9 @@ Sema::ActOnStartCppshStagedInstantiation(CppshStagedDecl *Old,
   return SD;
 }
 
-StmtResult Sema::ActOnFinishCppshStagedInstantiation(CppshStagedDecl *SD,
-                                                     StmtResult Body,
-                                                     ArrayRef<Expr *> Frame,
-                                                     CppshStagedStmt *Old) {
+StmtResult Sema::ActOnFinishCppshStagedInstantiation(
+    CppshStagedDecl *SD, StmtResult Body, ArrayRef<Expr *> Frame,
+    CppshStagedStmt *Old, ArrayRef<LabelDecl *> Targets) {
   if (CppshStagedScopes.empty() || CppshStagedScopes.back().Decl != SD)
     return StmtError();
   CppshStagedScope Info = CppshStagedScopes.pop_back_val();
@@ -373,7 +402,19 @@ StmtResult Sema::ActOnFinishCppshStagedInstantiation(CppshStagedDecl *SD,
     return StmtError();
   auto *S = CppshStagedStmt::Create(
       Context, SD, Body.get(), Frame, Old->getLeaves() | Info.Leaves,
-      Old->keepsResult(), Old->getBeginLoc(), Old->getEndLoc());
+      Old->keepsResult() || Info.KeepsResult, Old->getBeginLoc(),
+      Old->getEndLoc());
+  // In staged code compiled as it runs, directly in its function: a label
+  // outside that code too is reached by that function's leaving for it.
+  SmallVector<int, 4> Propagate(Targets.size(), -1);
+  if (CurrentCppshStagedRun && CurrentCppshStagedRun->Staged &&
+      CppshStagedScopes.empty()) {
+    ArrayRef<LabelDecl *> Outer = CurrentCppshStagedRun->Staged->gotoTargets();
+    for (unsigned I = 0; I < Targets.size(); ++I)
+      if (const auto *It = llvm::find(Outer, Targets[I]); It != Outer.end())
+        Propagate[I] = 4 + (It - Outer.begin());
+  }
+  S->setGotoTargets(Context, Targets, Propagate);
   SD->setStagedStmt(S);
   return S;
 }

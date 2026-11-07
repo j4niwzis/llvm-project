@@ -16106,6 +16106,8 @@ public:
     FunctionDecl *Function = nullptr;
     DeclContext *AccessContext = nullptr;
     VarDecl *This = nullptr;
+    /// The statement instantiated (its goto targets the body's exits).
+    CppshStagedStmt *Staged = nullptr;
   };
   CppshStagedRun *CurrentCppshStagedRun = nullptr;
 
@@ -16136,7 +16138,8 @@ public:
                                     Expr *Value, Scope *CurScope);
   /// An exit from a staged statement's body (CppshStagedExitStmt::ExitKind
   /// K), as its body is instantiated.
-  StmtResult BuildCppshStagedExit(unsigned K, SourceLocation Loc, Expr *Value);
+  StmtResult BuildCppshStagedExit(unsigned K, SourceLocation Loc, Expr *Value,
+                                  unsigned Target = 0);
 
   CppshStagedDecl *ActOnStartCppshStagedInstantiation(CppshStagedDecl *Old,
                                                       ArrayRef<QualType> Types,
@@ -16144,7 +16147,8 @@ public:
   StmtResult ActOnFinishCppshStagedInstantiation(CppshStagedDecl *D,
                                                  StmtResult Body,
                                                  ArrayRef<Expr *> Frame,
-                                                 CppshStagedStmt *Old);
+                                                 CppshStagedStmt *Old,
+                                                 ArrayRef<LabelDecl *> Targets);
 
   /// A staged statement's body instantiated, as it runs, into the function
   /// being defined (CurContext): each staged parameter the corresponding one

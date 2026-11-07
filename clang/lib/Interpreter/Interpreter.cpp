@@ -1665,7 +1665,12 @@ struct CppshStagedCompiled {
   llvm::FoldingSetNodeID Values;
   FunctionDecl *Function = nullptr;
   void *Address = nullptr;
+  // A staged function's rest: the type of the result its returns give.
+  QualType Result;
 };
+// Each time a staged function's result is kept: so that a staged statement
+// whose body left by a return knows whether code staged inside it kept one.
+unsigned CppshKeptResults = 0;
 } // namespace
 
 // A staged statement, reached as its function runs (CodeGen's
@@ -1676,8 +1681,10 @@ struct CppshStagedCompiled {
 // statement returns its value, and run. One instantiation for each set of
 // values, found again for the same values. What it returns: how the body
 // left (0: off its end; 1, 2: by a break, a continue; 3: by a return, its
-// value constructed). The rest of a staged function's body (keepsResult):
-// its function's result kept in a global, __cppsh_resK, for the caller.
+// value constructed; 4 + I: by a goto to its I-th label outside it). The rest
+// of a staged function's body (keepsResult): what it returns constructed in
+// storage of its type made for it, named by a global, __cppsh_resK, kept for
+// the function's caller.
 static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
                           void *Slot) {
   if (!CppshActiveInterpreter || !Staged || !Staged->getStagedDecl())
@@ -1763,9 +1770,9 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
 
   static std::map<const CppshStagedStmt *, std::vector<CppshStagedCompiled>> Compiled;
   static unsigned Count = 0;
-  std::vector<CppshStagedCompiled> &Known2 = Compiled[Staged];
+  std::vector<CppshStagedCompiled> &Instances = Compiled[Staged];
   CppshStagedCompiled *Found = nullptr;
-  for (CppshStagedCompiled &C : Known2)
+  for (CppshStagedCompiled &C : Instances)
     if (C.Values == Values)
       Found = &C;
 
@@ -1777,148 +1784,150 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
 
   const bool WasNeeded = std::exchange(CppshCutNeeded, false);
   auto RestoreNeeded = llvm::scope_exit([&] { CppshCutNeeded = WasNeeded; });
-  if (!Found || Keep) {
+  // Compiled for these values: `int __cppsh_stagedK(void **frame, void
+  // *slot)`, its body the statement's instantiated.
+  if (!Found) {
     if (!cppshReport(Interp.cppshBeginBuild()))
       return Fail("no unit to compile it in");
-    FunctionDecl *F = Found ? Found->Function : nullptr;
-    if (!F) {
-      const QualType VoidPtrPtr = Ctx.getPointerType(Ctx.VoidPtrTy);
-      SmallVector<QualType, 2> FnParams{VoidPtrPtr};
-      if (!Keep)
-        FnParams.push_back(Ctx.VoidPtrTy);
-      Sema::CppshStagedRun Run;
-      Run.KeepsResult = Keep;
-      Run.ReturnType = Outer ? Outer->getReturnType() : Ctx.VoidTy;
-      Run.AccessContext = Around;
-      F = cppshDefineFunction(
-          S, "__cppsh_staged" + std::to_string(Count++),
-          Keep ? Ctx.getAutoDeductType() : Ctx.IntTy, FnParams,
-          [&](FunctionDecl *Fn, ArrayRef<ParmVarDecl *> Ps) -> Stmt * {
-            Run.Function = Fn;
-            Run.Slot = Keep ? nullptr : Ps[1];
-            SmallVector<Stmt *, 16> Stmts;
-            SmallVector<VarDecl *, 8> Locals;
-            // Each local: `T &name = *(T *)frame[I];`, its value bound.
-            for (unsigned I = 0; I < N; ++I) {
-              const QualType RefT = Ctx.getLValueReferenceType(Types[I]);
-              auto *L = VarDecl::Create(Ctx, Fn, Loc, Params[I]->getLocation(),
-                                        Params[I]->getIdentifier(), RefT,
-                                        Ctx.getTrivialTypeSourceInfo(RefT, Loc),
-                                        SC_None);
-              Expr *Ptr = cppshFrameEntry(S, Ps[0], I, Ctx.getPointerType(Types[I]));
-              ExprResult Obj =
-                  Ptr ? S.CreateBuiltinUnaryOp(Loc, UO_Deref, Ptr) : ExprError();
-              if (!Obj.isUsable())
-                return nullptr;
-              S.AddInitializerToDecl(L, Obj.get(), /*DirectInit=*/false);
-              if (L->isInvalidDecl())
-                return nullptr;
-              if (Known[I])
-                CppshParamValue[L] = *Known[I];
-              else if (Rebuilt[I])
-                CppshParamRebuild[L] = Rebuilt[I];
-              StmtResult DS =
-                  S.ActOnDeclStmt(S.ConvertDeclToDeclGroup(L), Loc, Loc);
-              if (!DS.isUsable())
-                return nullptr;
-              Stmts.push_back(DS.get());
-              Locals.push_back(L);
-            }
-            // `this`: `C *__cppsh_this = (C *)frame[N];`.
-            if (SD->usesThis()) {
-              const QualType ThisTy = SS->frame().back()->getType();
-              auto *This = VarDecl::Create(
-                  Ctx, Fn, Loc, Loc, &Idents.get("__cppsh_this"), ThisTy,
-                  Ctx.getTrivialTypeSourceInfo(ThisTy, Loc), SC_None);
-              Expr *Ptr = cppshFrameEntry(S, Ps[0], N, ThisTy);
-              if (!Ptr)
-                return nullptr;
-              S.AddInitializerToDecl(This, Ptr, /*DirectInit=*/false);
-              StmtResult DS =
-                  S.ActOnDeclStmt(S.ConvertDeclToDeclGroup(This), Loc, Loc);
-              if (!DS.isUsable())
-                return nullptr;
-              Stmts.push_back(DS.get());
-              Run.This = This;
-            }
-            StmtResult Inst = S.InstantiateCppshStaged(SS, Locals, ResultType, Run);
-            cppshEndNeedDiagnostics(S);
-            if (!Inst.isUsable())
+    const QualType VoidPtrPtr = Ctx.getPointerType(Ctx.VoidPtrTy);
+    Sema::CppshStagedRun Run;
+    Run.KeepsResult = Keep;
+    Run.ReturnType = Keep ? QualType() : Outer ? Outer->getReturnType() : Ctx.VoidTy;
+    Run.AccessContext = Around;
+    Run.Staged = SS;
+    FunctionDecl *F = cppshDefineFunction(
+        S, "__cppsh_staged" + std::to_string(Count++), Ctx.IntTy,
+        {VoidPtrPtr, Ctx.VoidPtrTy},
+        [&](FunctionDecl *Fn, ArrayRef<ParmVarDecl *> Ps) -> Stmt * {
+          Run.Function = Fn;
+          Run.Slot = Ps[1];
+          // Known to code generation: staged code inside it leaves through
+          // it, and returns its value where its slot points.
+          Fn->addAttr(AnnotateAttr::CreateImplicit(Ctx, "cppsh.staged.run",
+                                                   nullptr, 0, SourceRange()));
+          SmallVector<Stmt *, 16> Stmts;
+          SmallVector<VarDecl *, 8> Locals;
+          // Each local: `T &name = *(T *)frame[I];`, its value bound.
+          for (unsigned I = 0; I < N; ++I) {
+            const QualType RefT = Ctx.getLValueReferenceType(Types[I]);
+            auto *L = VarDecl::Create(Ctx, Fn, Loc, Params[I]->getLocation(),
+                                      Params[I]->getIdentifier(), RefT,
+                                      Ctx.getTrivialTypeSourceInfo(RefT, Loc),
+                                      SC_None);
+            Expr *Ptr = cppshFrameEntry(S, Ps[0], I, Ctx.getPointerType(Types[I]));
+            ExprResult Obj =
+                Ptr ? S.CreateBuiltinUnaryOp(Loc, UO_Deref, Ptr) : ExprError();
+            if (!Obj.isUsable())
               return nullptr;
-            Stmts.push_back(Inst.get());
-            if (!Keep)
-              Stmts.push_back(ReturnStmt::Create(
-                  Ctx, Loc,
-                  IntegerLiteral::Create(
-                      Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), 0), Ctx.IntTy, Loc),
-                  nullptr));
-            return CompoundStmt::Create(Ctx, Stmts, FPOptionsOverride(), Loc, Loc);
-          });
-      if (F)
-        Interp.cppshAddBuilt(F);
-    }
-    // The result kept: `auto __cppsh_resK = F((void **)frame);`.
-    std::string ResultName;
-    if (F && Keep) {
-      const QualType VoidPtrPtr = Ctx.getPointerType(Ctx.VoidPtrTy);
-      Expr *Int = IntegerLiteral::Create(
-          Ctx, llvm::APInt(64, llvm::bit_cast<uintptr_t>(Frame)),
-          Ctx.UnsignedLongLongTy, Loc);
-      ExprResult FrameArg = S.BuildCStyleCastExpr(
-          Loc, Ctx.getTrivialTypeSourceInfo(VoidPtrPtr, Loc), Loc, Int);
-      ExprResult Callee = S.BuildDeclRefExpr(F, F->getType(), VK_LValue, Loc);
-      Expr *Arg = FrameArg.isUsable() ? FrameArg.get() : nullptr;
-      ExprResult Call =
-          Arg && Callee.isUsable()
-              ? S.BuildCallExpr(S.TUScope, Callee.get(), Loc, Arg, Loc)
-              : ExprError();
-      if (Call.isUsable() && !Call.get()->getType()->isVoidType()) {
-        ResultName = "__cppsh_res" + std::to_string(CppshContinuations++);
-        const QualType Auto = Ctx.getAutoDeductType();
-        auto *Res = VarDecl::Create(Ctx, Ctx.getTranslationUnitDecl(), Loc, Loc,
-                                    &Idents.get(ResultName), Auto,
-                                    Ctx.getTrivialTypeSourceInfo(Auto, Loc), SC_None);
-        S.AddInitializerToDecl(Res, Call.get(), /*DirectInit=*/false);
-        S.FinalizeDeclaration(Res);
-        S.PushOnScopeChains(Res, S.TUScope);
-        Interp.cppshAddBuilt(Res);
-      } else if (Call.isUsable()) {
-        TopLevelStmtDecl *Top = S.ActOnStartTopLevelStmtDecl(S.TUScope);
-        ExprResult Full = S.ActOnFinishFullExpr(Call.get(), /*DiscardedValue=*/true);
-        S.ActOnFinishTopLevelStmtDecl(
-            Top, Full.isUsable() ? static_cast<Stmt *>(Full.get())
-                                 : new (Ctx) NullStmt(Loc));
-        Interp.cppshAddBuilt(Top);
-      }
-    }
+            S.AddInitializerToDecl(L, Obj.get(), /*DirectInit=*/false);
+            if (L->isInvalidDecl())
+              return nullptr;
+            if (Known[I])
+              CppshParamValue[L] = *Known[I];
+            else if (Rebuilt[I])
+              CppshParamRebuild[L] = Rebuilt[I];
+            StmtResult DS = S.ActOnDeclStmt(S.ConvertDeclToDeclGroup(L), Loc, Loc);
+            if (!DS.isUsable())
+              return nullptr;
+            Stmts.push_back(DS.get());
+            Locals.push_back(L);
+          }
+          // `this`: `C *__cppsh_this = (C *)frame[N];`.
+          if (SD->usesThis()) {
+            const QualType ThisTy = SS->frame().back()->getType();
+            auto *This = VarDecl::Create(
+                Ctx, Fn, Loc, Loc, &Idents.get("__cppsh_this"), ThisTy,
+                Ctx.getTrivialTypeSourceInfo(ThisTy, Loc), SC_None);
+            Expr *Ptr = cppshFrameEntry(S, Ps[0], N, ThisTy);
+            if (!Ptr)
+              return nullptr;
+            S.AddInitializerToDecl(This, Ptr, /*DirectInit=*/false);
+            StmtResult DS =
+                S.ActOnDeclStmt(S.ConvertDeclToDeclGroup(This), Loc, Loc);
+            if (!DS.isUsable())
+              return nullptr;
+            Stmts.push_back(DS.get());
+            Run.This = This;
+          }
+          StmtResult Inst = S.InstantiateCppshStaged(SS, Locals, ResultType, Run);
+          cppshEndNeedDiagnostics(S);
+          if (!Inst.isUsable())
+            return nullptr;
+          Stmts.push_back(Inst.get());
+          Stmts.push_back(ReturnStmt::Create(
+              Ctx, Loc,
+              IntegerLiteral::Create(Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), 0),
+                                     Ctx.IntTy, Loc),
+              nullptr));
+          return CompoundStmt::Create(Ctx, Stmts, FPOptionsOverride(), Loc, Loc);
+        });
+    if (F)
+      Interp.cppshAddBuilt(F);
     if (!cppshReport(Interp.cppshEndBuildAndExecute()) || !F)
       return Fail("it did not compile for the values it runs with");
-    if (Keep) {
-      // Run as its unit ran: what it returned kept.
-      if (!ResultName.empty())
-        CppshLastResult = ResultName;
-      if (!Found)
-        Known2.push_back({Values, F, nullptr});
-      return 0;
-    }
     llvm::Expected<llvm::orc::ExecutorAddr> Addr =
         Interp.getSymbolAddress(GlobalDecl(F));
     if (!Addr) {
       llvm::consumeError(Addr.takeError());
       return Fail("its compiled function is not found");
     }
-    Known2.push_back({Values, F, Addr->toPtr<void *>()});
-    Found = &Known2.back();
+    Instances.push_back({Values, F, Addr->toPtr<void *>(), Run.ReturnType});
+    Found = &Instances.back();
   }
   if (!Found->Address)
     return Fail("its compiled function is not found");
+
+  // A staged function's rest: storage of its result's type, named by a
+  // global (`T &__cppsh_resK = *(T *)storage;`) -- what its return
+  // constructs is kept there, for the function's caller.
+  std::string ResultName;
+  if (Keep && !Found->Result.isNull() && !Found->Result->isVoidType()) {
+    const QualType T = Found->Result;
+    const CharUnits Size = Ctx.getTypeSizeInChars(T);
+    const CharUnits Align = Ctx.getTypeAlignInChars(T);
+    Slot = ::operator new(std::max<size_t>(Size.getQuantity(), 1),
+                          std::align_val_t(Align.getQuantity()));
+    if (!cppshReport(Interp.cppshBeginBuild()))
+      return Fail("no unit to keep its result in");
+    ResultName = "__cppsh_res" + std::to_string(CppshContinuations++);
+    const QualType RefT = Ctx.getLValueReferenceType(T);
+    auto *Res = VarDecl::Create(Ctx, Ctx.getTranslationUnitDecl(), Loc, Loc,
+                                &Idents.get(ResultName), RefT,
+                                Ctx.getTrivialTypeSourceInfo(RefT, Loc), SC_None);
+    Expr *Int = IntegerLiteral::Create(
+        Ctx, llvm::APInt(64, llvm::bit_cast<uintptr_t>(Slot)),
+        Ctx.UnsignedLongLongTy, Loc);
+    ExprResult Ptr = S.BuildCStyleCastExpr(
+        Loc, Ctx.getTrivialTypeSourceInfo(Ctx.getPointerType(T), Loc), Loc, Int);
+    ExprResult Obj = Ptr.isUsable() ? S.CreateBuiltinUnaryOp(Loc, UO_Deref, Ptr.get())
+                                    : ExprError();
+    if (Obj.isUsable()) {
+      S.AddInitializerToDecl(Res, Obj.get(), /*DirectInit=*/false);
+      S.FinalizeDeclaration(Res);
+      S.PushOnScopeChains(Res, S.TUScope);
+      Interp.cppshAddBuilt(Res);
+    }
+    if (!cppshReport(Interp.cppshEndBuildAndExecute()) || !Obj.isUsable())
+      return Fail("its result could not be kept");
+  } else if (Keep) {
+    Slot = nullptr;
+  }
+
   // The frame, with the staged result's object in its place.
   SmallVector<void *, 8> Entries(Objects.begin(), Objects.end());
   if (SD->usesThis())
     Entries.push_back(Frame[N]);
   Entries.push_back(nullptr);
   using StagedFn = int (*)(void **, void *);
-  return reinterpret_cast<StagedFn>(Found->Address)(Entries.data(), Slot);
+  const unsigned KeptBefore = CppshKeptResults;
+  const int Left = reinterpret_cast<StagedFn>(Found->Address)(Entries.data(), Slot);
+  // Its return kept the result -- unless code staged inside it did (that
+  // code's result kept already).
+  if (Keep && Left == 3 && !ResultName.empty() && CppshKeptResults == KeptBefore) {
+    CppshLastResult = ResultName;
+    ++CppshKeptResults;
+  }
+  return Left;
 }
 
 extern "C" int __cppsh_staged_run(const void *Node, void *const *Frame,

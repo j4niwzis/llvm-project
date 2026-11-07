@@ -4522,13 +4522,6 @@ LabelDecl *Sema::LookupOrCreateLabel(IdentifierInfo *II, SourceLocation Loc,
     return cast<LabelDecl>(Res);
   }
 
-  // cppsh: staged code is compiled into a function of its own -- no label
-  // of it reachable from the function it is in, nor one of that from it.
-  if (getCppshStagedJumpScope()) {
-    Diag(Loc, diag::err_cppsh_staged_label);
-    return nullptr;
-  }
-
   LabelDecl *Existing = LookupExistingLabel(II, Loc);
 
   // C++26 [stmt.label]p4 An identifier label shall not be enclosed by an

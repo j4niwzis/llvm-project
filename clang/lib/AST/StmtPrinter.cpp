@@ -498,6 +498,9 @@ void StmtPrinter::VisitCppshStagedExitStmt(CppshStagedExitStmt *Node) {
     }
     OS << ";";
     break;
+  case CppshStagedExitStmt::Goto:
+    Indent() << "goto <label " << Node->getTarget() << ">;";
+    break;
   }
   if (Policy.IncludeNewlines)
     OS << NL;

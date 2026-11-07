@@ -1844,12 +1844,19 @@ void ASTStmtWriter::VisitCppshStagedStmt(CppshStagedStmt *S) {
   Record.AddDeclRef(S->getStagedDecl());
   for (Stmt *Child : S->children())
     Record.AddStmt(Child);
+  Record.push_back(S->gotoTargets().size());
+  for (unsigned I = 0; I < S->gotoTargets().size(); ++I) {
+    Record.AddDeclRef(S->gotoTargets()[I]);
+    Record.push_back(static_cast<uint64_t>(
+        static_cast<int64_t>(S->gotoPropagation()[I])));
+  }
   Code = serialization::STMT_CPPSH_STAGED;
 }
 
 void ASTStmtWriter::VisitCppshStagedExitStmt(CppshStagedExitStmt *S) {
   VisitStmt(S);
   Record.push_back(S->getKind());
+  Record.push_back(S->getTarget());
   Record.AddSourceLocation(S->getExitLoc());
   Record.AddStmt(S->getValue());
   Record.AddStmt(S->getSlot());

@@ -9647,7 +9647,12 @@ StmtResult TreeTransform<Derived>::TransformCppshStagedStmt(CppshStagedStmt *S) 
     getDerived().transformedLocalDecl(Old->parameters()[I],
                                       {New->parameters()[I]});
   StmtResult Body = getDerived().TransformStmt(S->getBody());
-  return getSema().ActOnFinishCppshStagedInstantiation(New, Body, Frame, S);
+  SmallVector<LabelDecl *, 4> Targets;
+  for (LabelDecl *L : S->gotoTargets())
+    Targets.push_back(cast_or_null<LabelDecl>(
+        getDerived().TransformDecl(L->getLocation(), L)));
+  return getSema().ActOnFinishCppshStagedInstantiation(New, Body, Frame, S,
+                                                       Targets);
 }
 
 template <typename Derived>

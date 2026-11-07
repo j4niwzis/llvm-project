@@ -3372,6 +3372,15 @@ StmtResult Sema::FinishCXXForRangeStmt(Stmt *S, Stmt *B) {
 StmtResult Sema::ActOnGotoStmt(SourceLocation GotoLoc,
                                SourceLocation LabelLoc,
                                LabelDecl *TheDecl) {
+  // cppsh: in staged code compiled as it runs, a goto to a label outside it:
+  // its function leaves for that label (the function it is in jumps there).
+  if (CppshStagedRun *Run = CurrentCppshStagedRun;
+      Run && Run->Staged && !getCppshStagedJumpScope()) {
+    ArrayRef<LabelDecl *> Targets = Run->Staged->gotoTargets();
+    if (const auto *It = llvm::find(Targets, TheDecl); It != Targets.end())
+      return BuildCppshStagedExit(CppshStagedExitStmt::Goto, GotoLoc, nullptr,
+                                  It - Targets.begin());
+  }
   setFunctionHasBranchIntoScope();
 
   // If this goto is in a compute construct scope, we need to make sure we check

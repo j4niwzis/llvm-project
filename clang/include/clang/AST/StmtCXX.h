@@ -1134,6 +1134,9 @@ class CppshStagedStmt final
   unsigned NumFrame = 0;
   unsigned Leaves = 0;
   bool KeepsResult = false;
+  LabelDecl **Targets = nullptr;
+  int *Propagate = nullptr;
+  unsigned NumTargets = 0;
 
   // Trailing: the body, then the frame.
   CppshStagedStmt(EmptyShell Empty, unsigned NumFrame)
@@ -1148,6 +1151,7 @@ public:
     LeavesByBreak = 1,
     LeavesByContinue = 2,
     LeavesByReturn = 4,
+    LeavesByGoto = 8,
   };
 
   static CppshStagedStmt *Create(const ASTContext &C, CppshStagedDecl *D,
@@ -1172,6 +1176,15 @@ public:
   unsigned getLeaves() const { return Leaves; }
   bool leaves(unsigned How) const { return Leaves & How; }
   bool keepsResult() const { return KeepsResult; }
+
+  /// The labels outside it its body jumps to (`goto`): the body leaves with
+  /// code 4 + I for the I-th. Where the statement is in staged code compiled
+  /// as it runs and the label is outside that code too, the code that code's
+  /// function leaves with instead (gotoPropagation), else -1.
+  ArrayRef<LabelDecl *> gotoTargets() const { return {Targets, NumTargets}; }
+  ArrayRef<int> gotoPropagation() const { return {Propagate, NumTargets}; }
+  void setGotoTargets(const ASTContext &C, ArrayRef<LabelDecl *> L,
+                      ArrayRef<int> P);
 
   SourceLocation getBeginLoc() const { return BeginLoc; }
   SourceLocation getEndLoc() const { return EndLoc; }
@@ -1201,18 +1214,19 @@ public:
 /// body left (Leave: `return K;`, K the ExitKind).
 class CppshStagedExitStmt final : public Stmt {
 public:
-  enum ExitKind : unsigned { Break = 1, Continue = 2, Return = 3 };
+  enum ExitKind : unsigned { Break = 1, Continue = 2, Return = 3, Goto = 4 };
 
 private:
   enum { VALUE, SLOT, LEAVE, END };
   Stmt *SubStmts[END] = {};
   SourceLocation ExitLoc;
   ExitKind Kind = Break;
+  unsigned Target = 0;
 
 public:
   CppshStagedExitStmt(ExitKind K, SourceLocation Loc, Expr *Value,
-                      Expr *Slot, Stmt *Leave)
-      : Stmt(CppshStagedExitStmtClass), ExitLoc(Loc), Kind(K) {
+                      Expr *Slot, Stmt *Leave, unsigned Target = 0)
+      : Stmt(CppshStagedExitStmtClass), ExitLoc(Loc), Kind(K), Target(Target) {
     SubStmts[VALUE] = Value;
     SubStmts[SLOT] = Slot;
     SubStmts[LEAVE] = Leave;
@@ -1222,6 +1236,11 @@ public:
 
   ExitKind getKind() const { return Kind; }
   void setKind(ExitKind K) { Kind = K; }
+  /// A goto's: the index of its label among the statement's goto targets.
+  unsigned getTarget() const { return Target; }
+  void setTarget(unsigned T) { Target = T; }
+  /// What the body's function returns as it leaves this way.
+  unsigned getCode() const { return Kind == Goto ? 4 + Target : Kind; }
 
   Expr *getValue() const { return cast_or_null<Expr>(SubStmts[VALUE]); }
   void setValue(Expr *E) { SubStmts[VALUE] = E; }

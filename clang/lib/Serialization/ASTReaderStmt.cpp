@@ -1826,11 +1826,19 @@ void ASTStmtReader::VisitCppshStagedStmt(CppshStagedStmt *S) {
   S->StagedDecl = cast_or_null<CppshStagedDecl>(Record.readDeclRef());
   for (Stmt *&Child : S->children())
     Child = Record.readSubStmt();
+  SmallVector<LabelDecl *, 2> Targets;
+  SmallVector<int, 2> Propagate;
+  for (unsigned I = 0, E = Record.readInt(); I < E; ++I) {
+    Targets.push_back(cast_or_null<LabelDecl>(Record.readDeclRef()));
+    Propagate.push_back(static_cast<int>(static_cast<int64_t>(Record.readInt())));
+  }
+  S->setGotoTargets(Record.getContext(), Targets, Propagate);
 }
 
 void ASTStmtReader::VisitCppshStagedExitStmt(CppshStagedExitStmt *S) {
   VisitStmt(S);
   S->setKind(static_cast<CppshStagedExitStmt::ExitKind>(Record.readInt()));
+  S->setTarget(Record.readInt());
   S->setExitLoc(readSourceLocation());
   S->setValue(cast_or_null<Expr>(Record.readSubStmt()));
   S->setSlot(cast_or_null<Expr>(Record.readSubStmt()));
