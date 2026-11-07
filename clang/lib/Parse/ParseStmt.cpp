@@ -1457,7 +1457,11 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
                       Sema::LookupOrdinaryName);
     if (!Std || !Actions.LookupQualifiedName(OptR, Std))
       return false;
-    auto *Optional = OptR.getAsSingle<ClassTemplateDecl>();
+    // Through a using-declaration too (the std module exports it by one).
+    ClassTemplateDecl *Optional = nullptr;
+    for (NamedDecl *D : OptR)
+      if (auto *CTD = dyn_cast<ClassTemplateDecl>(D->getUnderlyingDecl()))
+        Optional = CTD;
     if (!Optional)
       return false;
     TemplateArgumentListInfo OptArgs(Begin, Begin);

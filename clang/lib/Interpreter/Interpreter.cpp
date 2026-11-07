@@ -1601,7 +1601,11 @@ static VarTemplateDecl *cppshRegionTagTemplate(Sema &S) {
   LookupResult R(S, &Idents.get("__cppsh_region_tag"), SourceLocation(),
                  Sema::LookupOrdinaryName);
   S.LookupQualifiedName(R, Sh);
-  return R.getAsSingle<VarTemplateDecl>();
+  // Through a using-declaration too (the std.sh module exports it by one).
+  for (NamedDecl *D : R)
+    if (auto *Tag = dyn_cast<VarTemplateDecl>(D->getUnderlyingDecl()))
+      return Tag;
+  return nullptr;
 }
 
 // A staged region run (Parser::CppshEmitRegion), as the function it is in
