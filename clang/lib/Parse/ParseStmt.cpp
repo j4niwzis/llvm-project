@@ -1213,6 +1213,19 @@ static bool cppshAlwaysReturns(const Stmt *S) {
   return false;
 }
 
+// The staged calls a statement made, each once: one written once is one call,
+// however many times Sema built it (a retried parse, an operand rebuilt) --
+// where it is written, the order the calls are made in.
+static SmallVector<Expr *, 2> cppshDistinctCalls(ArrayRef<Expr *> Calls) {
+  SmallVector<Expr *, 2> Distinct;
+  for (Expr *Call : Calls)
+    if (Call && llvm::none_of(Distinct, [&](const Expr *Seen) {
+          return Seen->getBeginLoc() == Call->getBeginLoc();
+        }))
+      Distinct.push_back(Call);
+  return Distinct;
+}
+
 // The locals live at Loc in the function being parsed, each the innermost of
 // its name, in the order declared -- and the iterators of the range-fors
 // being parsed, hidden from lookup.
@@ -1357,8 +1370,7 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     Locals.push_back(V);
     Needs.push_back({NE->getBeginLoc(), V});
   }
-  const SmallVector<Expr *, 2> StagedCalls(CppshCutStagedCalls.begin(),
-                                           CppshCutStagedCalls.end());
+  const SmallVector<Expr *, 2> StagedCalls = cppshDistinctCalls(CppshCutStagedCalls);
   CppshCutNeedExprs.clear();
   CppshCutStagedCalls.clear();
   const unsigned From = *B, To = *E;
@@ -3425,8 +3437,8 @@ void Parser::CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
         Locals.push_back(V);
         Needs.push_back({NE->getBeginLoc(), V});
       }
-      const SmallVector<Expr *, 2> StagedCalls(CppshCutStagedCalls.begin(),
-                                               CppshCutStagedCalls.end());
+      const SmallVector<Expr *, 2> StagedCalls =
+          cppshDistinctCalls(CppshCutStagedCalls);
       CppshCutNeedExprs.clear();
       CppshCutStagedCalls.clear();
       Made = Ok && CppshStageRest(
