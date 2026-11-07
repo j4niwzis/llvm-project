@@ -47,6 +47,11 @@ bool Parser::isImplicitAutoDeclaration() {
   return true;
 }
 
+// cppsh: the template parameters a concise function names after its name
+// (`input<T> text: std::string_view = {} = { ... }`), read by the rewrite of
+// the declaration they begin (below).
+static SmallVector<IdentifierInfo *, 4> CppshExplicitTemplateParams;
+
 void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
   if (!getLangOpts().CPlusPlus || !Tok.is(tok::identifier) ||
       PP.getSourceManager().isInSystemHeader(Tok.getLocation()) ||
@@ -168,6 +173,50 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
     R.suppressDiagnostics();
     return !R.empty();
   };
+  // `name<T, U> params = body`: a concise function of explicit template
+  // parameters (plain names, each maybe after `class` or `typename`), the
+  // rest of it as any other. The name and the list are taken off, the name
+  // put back, and the rest rewritten with those parameters.
+  if (NextToken().is(tok::less) &&
+      !isKnownCallableOrType(Tok.getIdentifierInfo(), Tok.getLocation())) {
+    SmallVector<IdentifierInfo *, 4> Names;
+    unsigned K = 2;
+    bool Ok = false;
+    while (true) {
+      Token LT = GetLookAheadToken(K);
+      if (LT.isOneOf(tok::kw_class, tok::kw_typename)) {
+        ++K;
+        continue;
+      }
+      if (!LT.is(tok::identifier))
+        break;
+      Names.push_back(LT.getIdentifierInfo());
+      Token Next = GetLookAheadToken(K + 1);
+      if (Next.is(tok::comma)) {
+        K += 2;
+        continue;
+      }
+      if (Next.is(tok::greater)) {
+        Token After = GetLookAheadToken(K + 2);
+        Ok = After.isOneOf(tok::l_paren, tok::identifier, tok::equal, tok::question,
+                           tok::kw_requires);
+        K += 2;
+      }
+      break;
+    }
+    if (Ok) {
+      Token Name = Tok;
+      for (unsigned I = 0; I < K; ++I)
+        ConsumeAnyToken();
+      CppshExplicitTemplateParams = Names;
+      SmallVector<Token, 2> Back{Name, Tok};
+      reinjectTokens(Back);
+      MaybeRewriteConciseDeclaration(AllowFunctionDef);
+      CppshExplicitTemplateParams.clear();
+      return;
+    }
+  }
+
   bool IsUnparenFunc = false;
   if (NextToken().is(tok::identifier) &&
       !isKnownCallableOrType(Tok.getIdentifierInfo(), Tok.getLocation())) {
@@ -205,7 +254,9 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
   if (HasParens)
     ConsumeParen(); // Eat '('
 
-  SmallVector<IdentifierInfo *, 4> TemplateParams;
+  SmallVector<IdentifierInfo *, 4> TemplateParams(CppshExplicitTemplateParams.begin(),
+                                                   CppshExplicitTemplateParams.end());
+  CppshExplicitTemplateParams.clear();
   auto normalizePrimeIdent = [&](Token &T) {
     if (T.is(tok::identifier) && T.getIdentifierInfo()) {
       StringRef Name = T.getIdentifierInfo()->getName();
@@ -286,6 +337,45 @@ void Parser::MaybeRewriteConciseDeclaration(bool AllowFunctionDef) {
       }
       ConvertedParams.push_back(ParamName);
 
+      // Without parentheses, a `=` after the type is the parameter's default
+      // where another `=` -- the body's -- follows it at depth 0; otherwise
+      // it is the body's own.
+      bool UnparenDefault = false;
+      if (!HasParens && Tok.is(tok::equal)) {
+        int Depth = 0;
+        for (unsigned K = 1;; ++K) {
+          Token LT = GetLookAheadToken(K);
+          if (LT.isOneOf(tok::eof, tok::semi) && Depth == 0)
+            break;
+          if (LT.isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
+            ++Depth;
+          else if (LT.isOneOf(tok::r_paren, tok::r_brace, tok::r_square))
+            --Depth;
+          else if (Depth == 0 && LT.is(tok::equal)) {
+            UnparenDefault = true;
+            break;
+          }
+          if (LT.is(tok::eof))
+            break;
+        }
+      }
+      if (UnparenDefault) {
+        ConvertedParams.push_back(Tok);
+        ConsumeToken();
+        int Depth = 0;
+        while (!Tok.is(tok::eof)) {
+          if (Tok.isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
+            ++Depth;
+          else if (Tok.isOneOf(tok::r_paren, tok::r_brace, tok::r_square))
+            --Depth;
+          else if (Depth == 0 &&
+                   (Tok.isOneOf(tok::equal, tok::comma) ||
+                    (Tok.is(tok::identifier) && NextToken().is(tok::colon))))
+            break;
+          ConvertedParams.push_back(Tok);
+          ConsumeAnyToken();
+        }
+      }
       if (HasParens && Tok.is(tok::equal)) {
         ConvertedParams.push_back(Tok);
         ConsumeToken();
