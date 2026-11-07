@@ -894,7 +894,7 @@ Decl *Parser::ParseConciseForwarder(IdentifierInfo *Name, SourceLocation Loc,
                            : StmtError();
       if (Ret.isUsable())
         Stmts.push_back(Ret.get());
-    } else if (Ok && !CppshStageRest(Stmts, CutLoc, CutLoc, Locals, {}, nullptr,
+    } else if (Ok && !CppshStageRest(Stmts, CutLoc, CutLoc, Locals, {}, {},
                                      std::nullopt, [&](StmtVector &Body) {
                                        CppshBuildForwardCall(Forward, Body);
                                      })) {

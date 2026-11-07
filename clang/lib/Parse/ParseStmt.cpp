@@ -1945,7 +1945,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
         const unsigned From = *B, To = *E;
         Made = CppshStageRest(
             Stmts, RestBegin, CppshInputTokens[To - 1].getEndLoc(),
-            CppshLiveLocals(RestBegin), {}, nullptr, From,
+            CppshLiveLocals(RestBegin), {}, {}, From,
             [&](StmtVector &Body) { ParseCppshRegionStatements(Body, From, To); });
       }
       if (!Made)
