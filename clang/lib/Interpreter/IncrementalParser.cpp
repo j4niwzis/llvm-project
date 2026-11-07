@@ -103,7 +103,32 @@ llvm::Error IncrementalParser::TakeBackPTU(llvm::StringRef Why) {
   TranslationUnitDecl *TU = S.getASTContext().getTranslationUnitDecl();
   if (CodeGenerator *CG = Act->getCodeGen())
     CG->DiscardIncrementalUnit(TU, /*ThrowModuleAway=*/true);
+  llvm::SmallVector<NamedDecl *, 8> Withdrawn;
+  for (Decl *D : TU->noload_decls())
+    if (auto *ND = dyn_cast<NamedDecl>(D); ND && ND->getDeclName())
+      Withdrawn.push_back(ND);
   CleanUpPTU(TU);
+  // cppsh: none of them found by name any more -- the unit now current's
+  // lookup, which a top-level declaration taken back for its staging was
+  // seen still to answer with (a snapshot of it compiled, its parse again a
+  // redefinition).
+  {
+    TranslationUnitDecl *Now = S.getASTContext().getTranslationUnitDecl();
+    for (NamedDecl *D : Withdrawn) {
+      DeclContext::lookup_result R = Now->lookup(D->getDeclName());
+      if (!llvm::is_contained(R, D))
+        continue;
+      if (cppshTraceStaging())
+        llvm::errs() << "cppsh-trace: " << D->getDeclName().getAsString()
+                     << " still found once taken back: removed\n";
+      for (DeclContext *DC : {static_cast<DeclContext *>(Now),
+                              static_cast<DeclContext *>(TU)})
+        if (StoredDeclsMap *Map = DC->getPrimaryContext()->getLookupPtr())
+          if (auto It = Map->find(D->getDeclName());
+              It != Map->end() && !It->second.isNull())
+            It->second.remove(D);
+    }
+  }
   // The translation-unit scope, and Sema's context, named the unit just
   // withdrawn: the one now current, so that what is parsed or built next
   // (a snapshot's unit before the next input) looks names up in a live one.
