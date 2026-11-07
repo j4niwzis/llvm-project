@@ -53,6 +53,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Plugins/PassPlugin.h"
+#include "llvm/Support/LockFileManager.h"
 #include "llvm/Support/AdvisoryLock.h"
 #include "llvm/Support/BuryPointer.h"
 #include "llvm/Support/CrashRecoveryContext.h"
@@ -2378,6 +2379,10 @@ void CompilerInstance::createModuleFromSource(SourceLocation ImportLoc,
   bool UseDiskCache = (ModuleName == "std" || ModuleName == "std.sh");
   SmallString<256> CachedPcmPath;
   SmallString<256> CachedMapPath;
+  // The cache's module built by one process at a time -- many start at once
+  // (lit's tests, each missing the cache after cppsh is rebuilt): the others
+  // wait for it and read what it built. Held until the module is in place.
+  std::optional<llvm::LockFileManager> CacheLock;
   if (UseDiskCache) {
     llvm::hash_code HC = llvm::hash_combine(
         Source, getInvocation().computeContextHash());
@@ -2416,15 +2421,54 @@ void CompilerInstance::createModuleFromSource(SourceLocation ImportLoc,
     DeleteBuiltModules = false;
     if (ModuleName == "std.sh")
       CppshStdShPcmPath = std::string(CachedPcmPath.str());
-    if (llvm::sys::fs::exists(CachedPcmPath) &&
-        llvm::sys::fs::exists(CachedMapPath)) {
+    auto UseCached = [&] {
+      if (!llvm::sys::fs::exists(CachedPcmPath) ||
+          !llvm::sys::fs::exists(CachedMapPath))
+        return false;
       BuiltModules[std::string(ModuleName)] = std::string(CachedPcmPath.str());
+      return true;
+    };
+    if (UseCached())
       return;
+    for (unsigned Attempt = 0; Attempt < 3; ++Attempt) {
+      CacheLock.emplace(CachedPcmPath);
+      bool Owned = false;
+      if (llvm::Error Err = CacheLock->tryLock().moveInto(Owned)) {
+        // No lock to be had: built all the same (what is written is renamed
+        // into place, read whole or not at all).
+        llvm::consumeError(std::move(Err));
+        CacheLock.reset();
+        break;
+      }
+      if (Owned) {
+        // Built by another process while the lock was being taken: used.
+        if (UseCached())
+          return;
+        break;
+      }
+      if (CacheLock->waitForUnlockFor(std::chrono::seconds(600)) ==
+          llvm::WaitForUnlockResult::Timeout)
+        (void)CacheLock->unsafeUnlock();
+      CacheLock.reset();
+      if (UseCached())
+        return;
     }
-    std::error_code MapEC;
-    llvm::raw_fd_ostream MapOS(CachedMapPath, MapEC, llvm::sys::fs::OF_None);
-    if (!MapEC)
-      MapOS << Source;
+    // The map, as the module is: written aside and renamed -- never changed
+    // in place under a process reading it (its size and time are what the
+    // module file it describes checks).
+    if (!llvm::sys::fs::exists(CachedMapPath)) {
+      int MapFD = -1;
+      SmallString<256> TmpMap;
+      if (!llvm::sys::fs::createUniqueFile(CachedMapPath + "-%%%%%%%%", MapFD,
+                                           TmpMap)) {
+        {
+          llvm::raw_fd_ostream MapOS(MapFD, /*shouldClose=*/true);
+          MapOS << Source;
+        }
+        if (llvm::sys::fs::rename(TmpMap, CachedMapPath))
+          llvm::sys::fs::remove(TmpMap);
+      }
+    }
   }
 
   // FIXME: Using a randomized filename here means that our intermediate .pcm
