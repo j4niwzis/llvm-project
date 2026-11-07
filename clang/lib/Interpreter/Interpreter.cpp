@@ -1501,7 +1501,8 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   // staging probe for either.
   bool WasNoProbe = CppshNoProbe;
   CppshNoProbe = true;
-  if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Globals))
+  if (llvm::Error Err = Globals.empty() ? llvm::Error::success()
+                                        : CppshActiveInterpreter->ParseAndExecute(Globals))
     llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
   else if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Code))
     llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
