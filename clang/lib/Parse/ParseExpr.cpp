@@ -2424,6 +2424,8 @@ Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
             // its value supplied.
             const SourceLocation At = LHS.get()->getBeginLoc();
             LHS = Supplied;
+            // Once: a member call on it () begins where it does.
+            CppshSuppliedExprs.erase(At.getRawEncoding());
             llvm::erase_if(CppshCutStagedCalls,
                            [&](Expr *Call) { return Call->getBeginLoc() == At; });
             if (CppshCutStagedCalls.empty() && CppshCutNeedExprs.empty() &&
