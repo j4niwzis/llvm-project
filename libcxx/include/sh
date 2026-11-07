@@ -555,6 +555,38 @@ constexpr auto __cppsh_variant_get(V &&v) {
   return std::__cppsh_member_fn<std::cppsh_placeholder_root, Cs...>{}(static_cast<V &&>(v));
 }
 
+// `obj.f(...)` on a variant, f a member function of its alternatives: the
+// member bound to the variant -- called, it calls f on the alternative held
+// (each alternative's f giving the same type); where a value is wanted
+// (`if (e.is_dir)`), what it gives called with nothing.
+template <typename V, char... Cs>
+struct __cppsh_variant_method {
+  V v;
+  static constexpr const char name[] = {Cs..., '\0'};
+  template <typename... Args>
+  constexpr decltype(auto) operator()(Args &&...args) const {
+    return std::visit(
+        [&](auto &&alt) -> decltype(auto) {
+          using A = std::remove_cvref_t<decltype(alt)>;
+          constexpr meta::info mem = meta::find_member(^^A, name);
+          return static_cast<decltype(alt) &&>(alt).[:mem:](
+              static_cast<Args &&>(args)...);
+        },
+        static_cast<V>(v));
+  }
+  template <typename R>
+    requires requires(const __cppsh_variant_method &m) {
+      { m() } -> std::convertible_to<R>;
+    }
+  constexpr operator R() const {
+    return (*this)();
+  }
+};
+template <char... Cs, typename V>
+constexpr auto __cppsh_variant_method_of(V &&v) {
+  return __cppsh_variant_method<V &&, Cs...>{static_cast<V &&>(v)};
+}
+
 // What `std::cin >> x` reads, asked for when the shell is on a terminal (the
 // compiler wraps the stream the user reads from in it): `x? `.
 inline std::istream &__cppsh_ask(std::istream &in, const char *what) {

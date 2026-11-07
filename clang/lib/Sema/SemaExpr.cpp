@@ -312,8 +312,32 @@ ExprResult cppshVariantMember(Sema &S, Expr *Base, const DeclarationNameInfo &Na
   auto *Sh = ShR.getAsSingle<NamespaceDecl>();
   if (!Sh)
     return ExprEmpty();
-  LookupResult R(S, &PP.getIdentifierTable().get("__cppsh_variant_get"), Loc,
-                 Sema::LookupOrdinaryName);
+  // A member function of the alternatives (`obj.size(…)`, `obj.is_dir()`):
+  // the member bound to the variant, a callable that calls it on the
+  // alternative held (std::sh::__cppsh_variant_method) -- converting, where a
+  // value is wanted, to what it gives called with nothing. A field: its
+  // value (std::sh::__cppsh_variant_get).
+  bool IsMethod = false;
+  if (const auto *Spec = dyn_cast<ClassTemplateSpecializationDecl>(RD))
+    if (Spec->getTemplateArgs().size() &&
+        Spec->getTemplateArgs()[0].getKind() == TemplateArgument::Pack)
+      for (const TemplateArgument &Alt : Spec->getTemplateArgs()[0].pack_elements())
+        if (Alt.getKind() == TemplateArgument::Type)
+          if (auto *AltRD = Alt.getAsType()->getAsCXXRecordDecl()) {
+            LookupResult Member(S, NameInfo, Sema::LookupMemberName);
+            S.LookupQualifiedName(Member, AltRD);
+            if (!Member.empty()) {
+              IsMethod = llvm::any_of(Member, [](NamedDecl *D) {
+                return isa<CXXMethodDecl, FunctionTemplateDecl>(
+                    D->getUnderlyingDecl());
+              });
+              break;
+            }
+          }
+  LookupResult R(S,
+                 &PP.getIdentifierTable().get(IsMethod ? "__cppsh_variant_method_of"
+                                                       : "__cppsh_variant_get"),
+                 Loc, Sema::LookupOrdinaryName);
   S.LookupQualifiedName(R, Sh);
   if (R.empty())
     return ExprEmpty();
