@@ -194,12 +194,15 @@ void IncrementalParser::AddBuilt(DeclGroupRef DG) {
 }
 
 llvm::Expected<TranslationUnitDecl *> IncrementalParser::EndBuild() {
-  // A unit built from the AST, not parsed: what its instantiations look up
-  // unqualified is the templates' own (and argument-dependent), never a
-  // scope of the parser's -- which, between the parsed units, is not one of
-  // this unit.
+  // A unit built from the AST, not parsed: its instantiations run in the
+  // translation unit's scope, naming this unit -- what they look up
+  // unqualified is the templates' own (and argument-dependent), but Sema
+  // still asks the scope of some (a range-for numbers the variables it
+  // invents by its depth): never a scope of a parse, nor none.
   Scope *const SavedScope = S.getCurScope();
-  S.setCurScopeForBuiltUnit(nullptr);
+  if (S.TUScope)
+    S.TUScope->setEntity(S.getASTContext().getTranslationUnitDecl());
+  S.setCurScopeForBuiltUnit(S.TUScope);
   llvm::Expected<TranslationUnitDecl *> TU =
       FinishPTU(*BuildLocalInstantiations, *BuildGlobalInstantiations);
   S.setCurScopeForBuiltUnit(SavedScope);
