@@ -94,9 +94,13 @@ public:
                 // current position.
     PhysicalStartOfLine =
         0x2000, // This token is at the start of a physical line.
+    CppshPrime = 0x4000, // cppsh: a primed name (`T'`), the quote not in it.
   };
 
   tok::TokenKind getKind() const { return Kind; }
+
+  /// cppsh: whether this identifier was primed (`T'`).
+  bool isCppshPrime() const { return getFlag(CppshPrime); }
   void setKind(tok::TokenKind K) { Kind = K; }
 
   /// is/isNot - Predicates to check if this token is a specific kind, as in

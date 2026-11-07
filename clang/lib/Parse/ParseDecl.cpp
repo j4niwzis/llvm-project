@@ -7782,67 +7782,13 @@ void Parser::ParseParameterDeclarationClause(
       MaybeParseMicrosoftAttributes(ArgDeclSpecAttrs);
     }
 
-    if (getLangOpts().CPlusPlus && Tok.is(tok::identifier) &&
-        NextToken().is(tok::colon) &&
-        !PP.getSourceManager().isInSystemHeader(Tok.getLocation())) {
-      Token ParamName = Tok;
-      ConsumeToken(); // param name
-      ConsumeToken(); // ':'
-      SmallVector<Token, 8> TypeToks;
-      int AngleDepth = 0;
-      while (!Tok.is(tok::eof)) {
-        if (Tok.is(tok::less))
-          ++AngleDepth;
-        else if (Tok.is(tok::greater) && AngleDepth > 0)
-          --AngleDepth;
-        else if (AngleDepth == 0 &&
-                 Tok.isOneOf(tok::comma, tok::r_paren, tok::equal))
-          break;
-        TypeToks.push_back(Tok);
-        ConsumeAnyToken();
-      }
-      bool HasBaseType = false;
-      for (const Token &T : TypeToks) {
-        if (!T.isOneOf(tok::amp, tok::ampamp, tok::star, tok::kw_const,
-                       tok::kw_volatile)) {
-          HasBaseType = true;
-          break;
-        }
-      }
-      SmallVector<Token, 16> Out;
-      auto makeAutoTok = [&](SourceLocation L) {
-        Token T;
-        T.startToken();
-        T.setKind(tok::kw_auto);
-        T.setLocation(L);
-        T.setIdentifierInfo(&PP.getIdentifierTable().get("auto"));
-        return T;
-      };
-      if (!HasBaseType) {
-        for (const Token &T : TypeToks)
-          if (T.isOneOf(tok::kw_const, tok::kw_volatile))
-            Out.push_back(T);
-        Out.push_back(makeAutoTok(ParamName.getLocation()));
-        for (const Token &T : TypeToks)
-          if (!T.isOneOf(tok::kw_const, tok::kw_volatile))
-            Out.push_back(T);
-      } else {
-        for (Token T : TypeToks) {
-          if (T.is(tok::identifier) && T.getIdentifierInfo() &&
-              T.getIdentifierInfo()->getName().ends_with("'"))
-            T = makeAutoTok(T.getLocation());
-          Out.push_back(T);
-        }
-      }
-      Out.push_back(ParamName);
-      Out.push_back(Tok);
-      MutableArrayRef<Token> Mem(
-          PP.getPreprocessorAllocator().Allocate<Token>(Out.size()),
-          Out.size());
-      std::copy(Out.begin(), Out.end(), Mem.begin());
-      PP.EnterTokenStream(std::move(Mem), /*DisableMacroExpansion=*/true,
-                          /*IsReinject=*/true);
-      ConsumeAnyToken(/*ConsumeCodeCompletionTok=*/true);
+    // cppsh: `a: T` -- the name first, then the type (ParseConcise.cpp).
+    IdentifierInfo *ConciseII = nullptr;
+    SourceLocation ConciseLoc, ConciseColon;
+    if (isConciseParameter()) {
+      ConciseII = Tok.getIdentifierInfo();
+      ConciseLoc = ConsumeToken();
+      ConciseColon = ConsumeToken();
     }
 
     SourceLocation DSStart = Tok.getLocation();
@@ -7850,13 +7796,16 @@ void Parser::ParseParameterDeclarationClause(
     // Parse a C++23 Explicit Object Parameter
     // We do that in all language modes to produce a better diagnostic.
     SourceLocation ThisLoc;
-    if (getLangOpts().CPlusPlus && Tok.is(tok::kw_this))
+    if (getLangOpts().CPlusPlus && !ConciseII && Tok.is(tok::kw_this))
       ThisLoc = ConsumeToken();
 
     ParsedTemplateInfo TemplateInfo;
-    ParseDeclarationSpecifiers(DS, TemplateInfo, AS_none,
-                               DeclSpecContext::DSC_normal,
-                               /*LateAttrs=*/nullptr, AllowImplicitTypename);
+    if (ConciseII)
+      ParseConciseType(DS, DeclSpecContext::DSC_normal, ConciseColon);
+    else
+      ParseDeclarationSpecifiers(DS, TemplateInfo, AS_none,
+                                 DeclSpecContext::DSC_normal,
+                                 /*LateAttrs=*/nullptr, AllowImplicitTypename);
 
     DS.takeAttributesAppendingingFrom(ArgDeclSpecAttrs);
 
@@ -7869,7 +7818,10 @@ void Parser::ParseParameterDeclarationClause(
                               : DeclaratorCtx == DeclaratorContext::LambdaExpr
                                   ? DeclaratorContext::LambdaExprParameter
                                   : DeclaratorContext::Prototype);
-    ParseDeclarator(ParmDeclarator);
+    if (ConciseII)
+      ParseConciseDeclarator(ParmDeclarator, ConciseII, ConciseLoc);
+    else
+      ParseDeclarator(ParmDeclarator);
 
     if (ThisLoc.isValid())
       ParmDeclarator.SetRangeBegin(ThisLoc);

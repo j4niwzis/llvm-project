@@ -8647,7 +8647,61 @@ private:
   ///
   bool isCXXDeclarationStatement(bool DisambiguatingWithExpression = false);
   bool isImplicitAutoDeclaration();
-  void MaybeRewriteConciseDeclaration(bool AllowFunctionDef = false);
+
+  /// cppsh: concise declarations (ParseConcise.cpp) -- `x: T = e`,
+  /// `f a: T = e`, `f<T, n: int = 3>(a: T) { ... }`, parsed into the Sema
+  /// actions of the C++ they stand for.
+  struct ConciseForwardArg {
+    bool IsType = true;
+    IdentifierInfo *II = nullptr;
+    SourceLocation Loc;
+    CachedTokens Type, Default; // a value's Default begins with its `=`
+  };
+  IdentifierInfo *ConciseName = nullptr;
+  SourceLocation ConciseNameLoc;
+  bool isConciseContext();
+  bool isConciseKnownName(const Token &T);
+  bool isConciseTypeStart(unsigned K);
+  bool scanConciseTemplateParams(unsigned K, unsigned &End, bool &AllDefaults);
+  bool isConciseVariable();
+  bool isConciseFunction();
+  bool isConciseParameter();
+  bool isConciseUnparenDefault();
+  void SetConciseAuto(DeclSpec &DS, SourceLocation Loc);
+  void ParseConciseType(DeclSpec &DS, DeclSpecContext DSC,
+                        SourceLocation AutoLoc);
+  void ParseConciseDeclarator(Declarator &D, IdentifierInfo *Name,
+                              SourceLocation NameLoc);
+  void ParseConciseDirectDeclarator(Declarator &D);
+  void ConsumeAndStoreConcise(CachedTokens &Toks, bool StopAtEqual);
+  void ConciseReplay(ArrayRef<Token> Toks, const void *Mark);
+  void ConciseEndReplay(const void *Mark);
+  DeclGroupPtrTy ParseConciseVariable(DeclaratorContext Ctx,
+                                      SourceLocation &DeclEnd);
+  DeclGroupPtrTy ParseConciseFunction(SourceLocation &DeclEnd);
+  Decl *ParseConciseForwarder(IdentifierInfo *Name, SourceLocation Loc,
+                              SourceLocation CutLoc, Decl *Template,
+                              MutableArrayRef<ConciseForwardArg> Args);
+  /// A function body `= expression`: a ReturnStmt built by Sema.
+  Decl *ParseFunctionExpressionBody(ParsingDeclarator &D,
+                                    const ParsedTemplateInfo &TemplateInfo);
+
+  /// cppsh: the cut of a function body (ParseStmt.cpp) -- the function
+  /// returns through std::sh::__cppsh_cut, its rest run with its live
+  /// locals' values.
+  unsigned CppshEmitCut(SmallVectorImpl<Stmt *> &Stmts, StringRef Rest,
+                        SourceLocation Loc, FunctionDecl *FD);
+  /// A return statement built here rather than read in a block (a concise
+  /// function's `= expression`, its forwarder), cut like a block's would be.
+  struct CppshBuiltBody {
+    SourceLocation Open;
+    size_t RangeBase = 0;
+    bool Cuts = false;
+  };
+  CppshBuiltBody CppshBeginBuiltReturn(SourceLocation Open);
+  void CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
+                              SmallVectorImpl<Stmt *> &Stmts, ExprResult E,
+                              SourceLocation Loc, StringRef Rest);
   ExprResult MaybeParseUnparenthesizedCallArgs(ExprResult LHS);
 
   /// isCXXSimpleDeclaration - C++-specialized function that disambiguates

@@ -22,6 +22,7 @@
 #include "clang/Sema/ScopeInfo.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/AST/QualTypeNames.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/Parse/RAIIObjectsForParser.h"
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
@@ -147,7 +148,11 @@ StmtResult Parser::ParseStatementOrDeclarationAfterAttributes(
   // the token to end in a semicolon (in which case SemiError should be set),
   // or they directly 'return;' if not.
 Retry:
-  MaybeRewriteConciseDeclaration(/*AllowFunctionDef=*/false);
+  if (isConciseVariable()) {
+    SourceLocation DeclStart = Tok.getLocation(), DeclEnd;
+    DeclGroupPtrTy G = ParseConciseVariable(DeclaratorContext::Block, DeclEnd);
+    return Actions.ActOnDeclStmt(G, DeclStart, DeclEnd);
+  }
   tok::TokenKind Kind  = Tok.getKind();
   SourceLocation AtLoc;
   switch (Kind) {
@@ -1558,6 +1563,93 @@ static ExprResult cppshShFunction(Sema &Actions, Preprocessor &PP, StringRef Nam
   return Actions.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
 }
 
+// The cut: the function returns through std::sh::__cppsh_cut, its rest
+// (Rest) compiled and run with the values of its live locals -- each in
+// scope at Loc, the innermost of a name -- handed over.
+unsigned Parser::CppshEmitCut(SmallVectorImpl<Stmt *> &Stmts, StringRef Rest,
+                              SourceLocation Loc, FunctionDecl *FD) {
+  SourceManager &SM = PP.getSourceManager();
+  SmallVector<VarDecl *, 8> Live;
+  llvm::SmallPtrSet<const IdentifierInfo *, 8> Seen;
+  for (Scope *Sc = getCurScope(); Sc; Sc = Sc->getParent()) {
+    SmallVector<VarDecl *, 8> Here;
+    for (Decl *D : Sc->decls())
+      if (auto *VD = dyn_cast<VarDecl>(D);
+          VD && VD->hasLocalStorage() && VD->getIdentifier() &&
+          SM.isBeforeInTranslationUnit(VD->getLocation(), Loc))
+        Here.push_back(VD);
+    llvm::sort(Here, [&](VarDecl *A, VarDecl *B) {
+      return SM.isBeforeInTranslationUnit(A->getLocation(), B->getLocation());
+    });
+    for (VarDecl *VD : Here)
+      if (Seen.insert(VD->getIdentifier()).second)
+        Live.push_back(VD);
+    if (Sc->getFlags() & Scope::FnScope)
+      break;
+  }
+  for (size_t R = CppshRangeBase; R < CppshRangeFors.size(); ++R)
+    for (Stmt *DSt : {CppshRangeFors[R]->getBeginStmt(), CppshRangeFors[R]->getEndStmt()})
+      if (auto *DS = dyn_cast_or_null<DeclStmt>(DSt))
+        if (auto *VD = dyn_cast_or_null<VarDecl>(DS->getSingleDecl());
+            VD && VD->getIdentifier() && Seen.insert(VD->getIdentifier()).second)
+          Live.push_back(VD);
+  std::vector<std::string> Names, Types;
+  PrintingPolicy Policy(Actions.Context.getLangOpts());
+  // The run-time template arguments of the statement cut at, their values
+  // as long long: evaluated here, once, handed over (__cppsh_need<i>).
+  SmallVector<Expr *, 4> NeedArgs;
+  for (Expr *E : CppshCutNeedExprs) {
+    ExprResult AsLL = Actions.BuildCStyleCastExpr(
+        Loc, Actions.Context.getTrivialTypeSourceInfo(Actions.Context.LongLongTy, Loc),
+        Loc, E);
+    if (AsLL.isUsable())
+      NeedArgs.push_back(AsLL.get());
+  }
+  CppshCutNeedExprs.clear();
+  for (VarDecl *VD : Live) {
+    Names.push_back(VD->getName().str());
+    // `&&` first: handed over by moving it (a type with no copy).
+    Types.push_back(std::string(cppshMoveOnly(Actions, VD->getType()) ? "&&" : "") +
+                    TypeName::getFullyQualifiedName(
+                        VD->getType().getNonReferenceType().getUnqualifiedType(),
+                        Actions.Context, Policy, /*WithGlobalNsPrefix=*/true));
+  }
+  for (size_t I = 0; I < NeedArgs.size(); ++I) {
+    Names.push_back("__cppsh_need" + std::to_string(I));
+    Types.push_back("long long");
+  }
+  unsigned Id = CppshCutRemainders.size();
+  CppshCutRemainders.push_back(cppshLineMark(SM, Loc) + Rest.str());
+  CppshCutLoopRests.emplace_back();
+  CppshCutLocalNames.push_back(std::move(Names));
+  CppshCutLocalTypes.push_back(std::move(Types));
+  CppshCutFunctions.insert(FD->getCanonicalDecl());
+  ExprResult Frame = cppshShFunction(Actions, PP, "__cppsh_frame", Loc);
+  ExprResult Cut = cppshShFunction(Actions, PP, "__cppsh_cut", Loc);
+  if (Frame.isUsable() && Cut.isUsable()) {
+    SmallVector<Expr *, 8> Refs;
+    for (VarDecl *VD : Live)
+      Refs.push_back(Actions.BuildDeclRefExpr(
+          VD, VD->getType().getNonReferenceType(), VK_LValue, Loc));
+    Refs.append(NeedArgs.begin(), NeedArgs.end());
+    ExprResult FrameCall =
+        Actions.ActOnCallExpr(getCurScope(), Frame.get(), Loc, Refs, Loc);
+    Expr *IdLit = IntegerLiteral::Create(Actions.Context, llvm::APInt(32, Id),
+                                         Actions.Context.UnsignedIntTy, Loc);
+    if (FrameCall.isUsable()) {
+      Expr *CutArgs[2] = {IdLit, FrameCall.get()};
+      ExprResult CutCall =
+          Actions.ActOnCallExpr(getCurScope(), Cut.get(), Loc, CutArgs, Loc);
+      if (CutCall.isUsable()) {
+        StmtResult Ret = Actions.ActOnReturnStmt(Loc, CutCall.get(), getCurScope());
+        if (Ret.isUsable())
+          Stmts.push_back(Ret.get());
+      }
+    }
+  }
+  return Id;
+}
+
 StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
   PrettyStackTraceLoc CrashInfo(PP.getSourceManager(),
                                 Tok.getLocation(),
@@ -1601,91 +1693,6 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
   const bool CppshCuts =
       !CppshCutNeeded &&
       (CppshBody || (!isStmtExpr && cppshCutsIn(Actions, getCurScope())));
-  // The cut: the function returns through std::sh::__cppsh_cut, its rest
-  // (Rest) compiled and run with the values of its live locals -- each in
-  // scope at Loc, the innermost of a name -- handed over.
-  auto CppshEmitCut = [&](StringRef Rest, SourceLocation Loc, FunctionDecl *FD) {
-    SourceManager &SM = PP.getSourceManager();
-    SmallVector<VarDecl *, 8> Live;
-    llvm::SmallPtrSet<const IdentifierInfo *, 8> Seen;
-    for (Scope *Sc = getCurScope(); Sc; Sc = Sc->getParent()) {
-      SmallVector<VarDecl *, 8> Here;
-      for (Decl *D : Sc->decls())
-        if (auto *VD = dyn_cast<VarDecl>(D);
-            VD && VD->hasLocalStorage() && VD->getIdentifier() &&
-            SM.isBeforeInTranslationUnit(VD->getLocation(), Loc))
-          Here.push_back(VD);
-      llvm::sort(Here, [&](VarDecl *A, VarDecl *B) {
-        return SM.isBeforeInTranslationUnit(A->getLocation(), B->getLocation());
-      });
-      for (VarDecl *VD : Here)
-        if (Seen.insert(VD->getIdentifier()).second)
-          Live.push_back(VD);
-      if (Sc->getFlags() & Scope::FnScope)
-        break;
-    }
-    for (size_t R = CppshRangeBase; R < CppshRangeFors.size(); ++R)
-      for (Stmt *DSt : {CppshRangeFors[R]->getBeginStmt(), CppshRangeFors[R]->getEndStmt()})
-        if (auto *DS = dyn_cast_or_null<DeclStmt>(DSt))
-          if (auto *VD = dyn_cast_or_null<VarDecl>(DS->getSingleDecl());
-              VD && VD->getIdentifier() && Seen.insert(VD->getIdentifier()).second)
-            Live.push_back(VD);
-    std::vector<std::string> Names, Types;
-    PrintingPolicy Policy(Actions.Context.getLangOpts());
-    // The run-time template arguments of the statement cut at, their values
-    // as long long: evaluated here, once, handed over (__cppsh_need<i>).
-    SmallVector<Expr *, 4> NeedArgs;
-    for (Expr *E : CppshCutNeedExprs) {
-      ExprResult AsLL = Actions.BuildCStyleCastExpr(
-          Loc, Actions.Context.getTrivialTypeSourceInfo(Actions.Context.LongLongTy, Loc),
-          Loc, E);
-      if (AsLL.isUsable())
-        NeedArgs.push_back(AsLL.get());
-    }
-    CppshCutNeedExprs.clear();
-    for (VarDecl *VD : Live) {
-      Names.push_back(VD->getName().str());
-      // `&&` first: handed over by moving it (a type with no copy).
-      Types.push_back(std::string(cppshMoveOnly(Actions, VD->getType()) ? "&&" : "") +
-                      TypeName::getFullyQualifiedName(
-                          VD->getType().getNonReferenceType().getUnqualifiedType(),
-                          Actions.Context, Policy, /*WithGlobalNsPrefix=*/true));
-    }
-    for (size_t I = 0; I < NeedArgs.size(); ++I) {
-      Names.push_back("__cppsh_need" + std::to_string(I));
-      Types.push_back("long long");
-    }
-    unsigned Id = CppshCutRemainders.size();
-    CppshCutRemainders.push_back(cppshLineMark(SM, Loc) + Rest.str());
-    CppshCutLoopRests.emplace_back();
-    CppshCutLocalNames.push_back(std::move(Names));
-    CppshCutLocalTypes.push_back(std::move(Types));
-    CppshCutFunctions.insert(FD->getCanonicalDecl());
-    ExprResult Frame = cppshShFunction(Actions, PP, "__cppsh_frame", Loc);
-    ExprResult Cut = cppshShFunction(Actions, PP, "__cppsh_cut", Loc);
-    if (Frame.isUsable() && Cut.isUsable()) {
-      SmallVector<Expr *, 8> Refs;
-      for (VarDecl *VD : Live)
-        Refs.push_back(Actions.BuildDeclRefExpr(
-            VD, VD->getType().getNonReferenceType(), VK_LValue, Loc));
-      Refs.append(NeedArgs.begin(), NeedArgs.end());
-      ExprResult FrameCall =
-          Actions.ActOnCallExpr(getCurScope(), Frame.get(), Loc, Refs, Loc);
-      Expr *IdLit = IntegerLiteral::Create(Actions.Context, llvm::APInt(32, Id),
-                                           Actions.Context.UnsignedIntTy, Loc);
-      if (FrameCall.isUsable()) {
-        Expr *CutArgs[2] = {IdLit, FrameCall.get()};
-        ExprResult CutCall =
-            Actions.ActOnCallExpr(getCurScope(), Cut.get(), Loc, CutArgs, Loc);
-        if (CutCall.isUsable()) {
-          StmtResult Ret = Actions.ActOnReturnStmt(Loc, CutCall.get(), getCurScope());
-          if (Ret.isUsable())
-            Stmts.push_back(Ret.get());
-        }
-      }
-    }
-    return Id;
-  };
 
   // "__label__ X, Y, Z;" is the GNU "Local Label" extension.  These are
   // only allowed at the start of a compound stmt regardless of the language.
@@ -1817,7 +1824,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
             CharSourceRange::getCharRange(CppshStmtBegin, Tok.getLocation()), SM,
             getLangOpts());
         const VarDecl *NeedVar = CppshCutNeedVar;
-        unsigned Id = CppshEmitCut(Rest, CppshStmtBegin, FD);
+        unsigned Id = CppshEmitCut(Stmts, Rest, CppshStmtBegin, FD);
         CppshCutNeedOf[Id] = NeedVar;
         if (!CppshBody)
           CppshOpenCuts.push_back(Id);
@@ -1847,7 +1854,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
         if (!cppshReturnsAlways(To, getLangOpts()))
           To = "{ " + To + " } " + cppshLineMark(SM, After) + Rest;
       }
-      unsigned Id = CppshEmitCut(Rest, After, FD);
+      unsigned Id = CppshEmitCut(Stmts, Rest, After, FD);
       // Made for what the cuts in the statement were made for, if one local.
       {
         const VarDecl *Common = nullptr;
@@ -3278,6 +3285,86 @@ Decl *Parser::ParseFunctionStatementBody(Decl *Decl, ParseScope &BodyScope) {
 
   BodyScope.Exit();
   return Actions.ActOnFinishFunctionBody(Decl, FnBody.get());
+}
+
+// cppsh: a concise function's body `= expression` -- the function returns
+// it, through a ReturnStmt built here (`= return e;`, `= ^e;` are a
+// statement as written).
+Decl *Parser::ParseFunctionExpressionBody(ParsingDeclarator &D,
+                                          const ParsedTemplateInfo &TemplateInfo) {
+  assert(Tok.is(tok::equal) && "a function body `= expression` expected");
+  const SourceLocation EqLoc = ConsumeToken();
+  TemplateParameterDepthRAII CurTemplateDepthTracker(TemplateParameterDepth);
+  ParseScope BodyScope(this, Scope::FnScope | Scope::DeclScope |
+                                 Scope::CompoundStmtScope);
+  Sema::FPFeaturesStateRAII SaveFPFeatures(Actions);
+  Decl *Res = Actions.ActOnStartOfFunctionDef(
+      getCurScope(), D,
+      TemplateInfo.TemplateParams ? *TemplateInfo.TemplateParams
+                                  : MultiTemplateParamsArg());
+  D.complete(Res);
+  D.getMutableDeclSpec().abort();
+  if (const auto *Template = dyn_cast_if_present<FunctionTemplateDecl>(Res);
+      Template && Template->isAbbreviated() &&
+      Template->getTemplateParameters()->getParam(0)->isImplicit())
+    CurTemplateDepthTracker.addDepth(1);
+
+  StmtResult Body;
+  {
+    Sema::CompoundScopeRAII CompoundScope(Actions);
+    StmtVector Stmts;
+    const SourceLocation Begin = Tok.getLocation();
+    if (Tok.isOneOf(tok::kw_return, tok::caret)) {
+      StmtResult S = ParseStatement();
+      if (S.isUsable())
+        Stmts.push_back(S.get());
+    } else {
+      CppshBuiltBody Saved = CppshBeginBuiltReturn(EqLoc);
+      ExprResult E = ParseExpression();
+      // The continuation, if it is cut here, is text yet.
+      std::string Rest =
+          "return " +
+          Lexer::getSourceText(CharSourceRange::getCharRange(Begin, Tok.getLocation()),
+                               PP.getSourceManager(), getLangOpts())
+              .str() +
+          ";";
+      CppshFinishBuiltReturn(Saved, Stmts, E, Begin, Rest);
+      if (Tok.isNot(tok::eof))
+        ExpectAndConsumeSemi(diag::err_expected_semi_after_expr);
+    }
+    Body = Actions.ActOnCompoundStmt(EqLoc, PrevTokLocation, Stmts,
+                                     /*isStmtExpr=*/false);
+  }
+  BodyScope.Exit();
+  return Actions.ActOnFinishFunctionBody(Res, Body.get());
+}
+
+Parser::CppshBuiltBody Parser::CppshBeginBuiltReturn(SourceLocation Open) {
+  CppshBuiltBody Saved{CppshBodyOpen, CppshRangeBase, !CppshCutNeeded};
+  CppshBodyOpen = Open;
+  CppshRangeBase = CppshRangeFors.size();
+  if (Saved.Cuts) {
+    CppshCutNeeded = false;
+    CppshCutNeedExprs.clear();
+  }
+  return Saved;
+}
+
+void Parser::CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
+                                    SmallVectorImpl<Stmt *> &Stmts,
+                                    ExprResult E, SourceLocation Loc,
+                                    StringRef Rest) {
+  FunctionDecl *FD = Actions.getCurFunctionDecl();
+  if (Saved.Cuts && CppshCutNeeded && FD) {
+    CppshCutNeeded = false;
+    CppshEmitCut(Stmts, Rest, Loc, FD);
+  } else if (E.isUsable()) {
+    StmtResult R = Actions.ActOnReturnStmt(Loc, E.get(), getCurScope());
+    if (R.isUsable())
+      Stmts.push_back(R.get());
+  }
+  CppshBodyOpen = Saved.Open;
+  CppshRangeBase = Saved.RangeBase;
 }
 
 Decl *Parser::ParseFunctionTryBlock(Decl *Decl, ParseScope &BodyScope) {

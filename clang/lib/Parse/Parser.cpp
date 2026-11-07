@@ -1003,7 +1003,14 @@ Parser::ParseExternalDeclaration(ParsedAttributes &Attrs,
       ConsumeToken();
       return nullptr;
     }
-    MaybeRewriteConciseDeclaration(/*AllowFunctionDef=*/true);
+    if (isConciseVariable()) {
+      SourceLocation DeclEnd;
+      return ParseConciseVariable(DeclaratorContext::File, DeclEnd);
+    }
+    if (isConciseFunction()) {
+      SourceLocation DeclEnd;
+      return ParseConciseFunction(DeclEnd);
+    }
     if (Tok.is(tok::kw_template)) {
       SourceLocation DeclEnd;
       return ParseDeclaration(DeclaratorContext::File, DeclEnd, Attrs,

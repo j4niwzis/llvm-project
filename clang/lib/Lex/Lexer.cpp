@@ -2042,6 +2042,8 @@ static const char *fastParseASCIIIdentifier(const char *CurPtr,
 bool Lexer::LexIdentifierContinue(Token &Result, const char *CurPtr) {
   // Match [_A-Za-z0-9]*, we have already matched an identifier start.
 
+  // cppsh: the size of a prime ending the name (`T'`), if one does.
+  unsigned PrimeSize = 0;
   while (true) {
 
     CurPtr = fastParseASCIIIdentifier(CurPtr, BufferEnd);
@@ -2083,6 +2085,7 @@ bool Lexer::LexIdentifierContinue(Token &Result, const char *CurPtr) {
         !(CurPtr + Size + 1 < BufferEnd &&
           (*(CurPtr + Size + 1) == '\'' || *(CurPtr + Size) == '\\'))) {
       CurPtr = ConsumeChar(CurPtr, Size, Result);
+      PrimeSize = Size;
       break;
     }
     // Neither an expected Unicode codepoint nor a UCN.
@@ -2092,6 +2095,12 @@ bool Lexer::LexIdentifierContinue(Token &Result, const char *CurPtr) {
   const char *IdStart = BufferPtr;
   FormTokenWithChars(Result, CurPtr, tok::raw_identifier);
   Result.setRawIdentifierData(IdStart);
+  // cppsh: a primed name is the name, marked -- the quote is not part of it
+  // (a concise function declares it a type parameter: ParseConcise.cpp).
+  if (PrimeSize) {
+    Result.setLength(Result.getLength() - PrimeSize);
+    Result.setFlag(Token::CppshPrime);
+  }
 
   // If we are in raw mode, return this identifier raw.  There is no need to
   // look up identifier information or attempt to macro expand it.
