@@ -44,7 +44,11 @@
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Options/OptionUtils.h"
 #include "clang/Options/Options.h"
+#include "clang/AST/QualTypeNames.h"
+#include "clang/Sema/CppshStaging.h"
 #include "clang/Sema/Lookup.h"
+#include "clang/Sema/Sema.h"
+#include "llvm/ADT/bit.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ModuleCache.h"
 #include "clang/Serialization/ObjectFilePCHContainerReader.h"
@@ -1425,7 +1429,6 @@ extern std::vector<std::string> CppshCutLoopRests;
 extern bool CppshTopNeed;
 extern std::vector<APValue> CppshActiveNeeds;
 extern size_t CppshActiveNeedsTaken;
-extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
 extern SourceLocation CppshHoistBegin, CppshHoistEnd;
 extern bool CppshInHoist;
 
@@ -1434,106 +1437,214 @@ extern bool CppshInHoist;
 static std::string CppshLastResult;
 static unsigned CppshContinuations = 0;
 
-// A staged function's rest, as its cut left it: compiled and run as an input
-// of its own --
-//   auto &__cppsh_fK_x = *static_cast<T *>((void *)ADDR);   each live local
+// The global naming a live local in a cut's frame, built: `T &Name = *(T *)
+// Addr;`.
+static VarDecl *cppshFrameGlobal(Sema &S, IdentifierInfo *Name, QualType T,
+                                 void *Addr) {
+  ASTContext &Ctx = S.Context;
+  const SourceLocation Loc;
+  const QualType RefT = Ctx.getLValueReferenceType(T);
+  auto *VD = VarDecl::Create(Ctx, Ctx.getTranslationUnitDecl(), Loc, Loc, Name,
+                             RefT, Ctx.getTrivialTypeSourceInfo(RefT, Loc),
+                             SC_None);
+  Expr *Int = IntegerLiteral::Create(
+      Ctx, llvm::APInt(64, llvm::bit_cast<uintptr_t>(Addr)),
+      Ctx.UnsignedLongLongTy, Loc);
+  ExprResult Ptr = S.BuildCStyleCastExpr(
+      Loc, Ctx.getTrivialTypeSourceInfo(Ctx.getPointerType(T), Loc), Loc, Int);
+  ExprResult Obj = Ptr.isUsable()
+                       ? S.CreateBuiltinUnaryOp(Loc, UO_Deref, Ptr.get())
+                       : ExprError();
+  if (!Obj.isUsable())
+    return nullptr;
+  S.AddInitializerToDecl(VD, Obj.get(), /*DirectInit=*/false);
+  S.FinalizeDeclaration(VD);
+  S.PushOnScopeChains(VD, S.TUScope);
+  return VD;
+}
+
+namespace {
+// What a continuation gave: nothing (it could not be called), staged (it
+// returned nothing, or was staged on in turn), or a value in __cppsh_resK.
+enum class CppshResult { None, Staged, Value };
+} // namespace
+
+// The continuation called with the frame's globals, built: a top-level
+// statement where it returns nothing, its result a global (__cppsh_resK)
+// otherwise.
+static CppshResult
+cppshBuildResult(Sema &S, Interpreter &Interp, const std::string &Tag,
+                 ArrayRef<std::pair<const CppshCutLocal *, VarDecl *>> Globals) {
+  ASTContext &Ctx = S.Context;
+  IdentifierTable &Idents = S.getPreprocessor().getIdentifierTable();
+  const SourceLocation Loc;
+  LookupResult R(S, &Idents.get("__cppsh_cont" + Tag), Loc,
+                 Sema::LookupOrdinaryName);
+  S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl());
+  if (R.empty())
+    return CppshResult::None;
+  CXXScopeSpec SS;
+  ExprResult Callee = S.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
+  if (!Callee.isUsable())
+    return CppshResult::None;
+  SmallVector<Expr *, 8> Args;
+  for (const auto &Global : Globals) {
+    const CppshCutLocal &L = *Global.first;
+    Expr *Ref = S.BuildDeclRefExpr(Global.second, L.Type, VK_LValue, Loc);
+    if (L.Move)
+      Ref = ImplicitCastExpr::Create(Ctx, L.Type, CK_NoOp, Ref, nullptr,
+                                     VK_XValue, FPOptionsOverride());
+    Args.push_back(Ref);
+  }
+  TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(S.TUScope);
+  ExprResult Call = S.BuildCallExpr(S.TUScope, Callee.get(), Loc, Args, Loc);
+  if (Call.isUsable() && Call.get()->getType()->isVoidType()) {
+    ExprResult Full = S.ActOnFinishFullExpr(Call.get(), /*DiscardedValue=*/true);
+    S.ActOnFinishTopLevelStmtDecl(
+        Stmt, Full.isUsable() ? static_cast<clang::Stmt *>(Full.get())
+                              : new (Ctx) NullStmt(Loc));
+    Interp.cppshAddBuilt(Stmt);
+    return CppshResult::Staged;
+  }
+  S.ActOnFinishTopLevelStmtDecl(Stmt, new (Ctx) NullStmt(Loc));
+  Interp.cppshAddBuilt(Stmt);
+  if (!Call.isUsable())
+    return CppshResult::None;
+  const QualType T =
+      Call.get()->getType().getNonReferenceType().getUnqualifiedType();
+  auto *Res = VarDecl::Create(Ctx, Ctx.getTranslationUnitDecl(), Loc, Loc,
+                              &Idents.get("__cppsh_res" + Tag), T,
+                              Ctx.getTrivialTypeSourceInfo(T, Loc), SC_None);
+  S.AddInitializerToDecl(Res, Call.get(), /*DirectInit=*/false);
+  S.FinalizeDeclaration(Res);
+  S.PushOnScopeChains(Res, S.TUScope);
+  Interp.cppshAddBuilt(Res);
+  if (auto *RD = T->getAsCXXRecordDecl();
+      RD && RD->getIdentifier() && RD->getName() == "staged")
+    return CppshResult::Staged;
+  return CppshResult::Value;
+}
+
+// A staged function's rest, as its cut left it, run --
+//   T &__cppsh_fK_x = *(T *)ADDR;                each live local (built)
 //   auto __cppsh_contK(auto x, ...) { <the rest of the body> }
-//   auto __cppsh_resK = std::sh::__cppsh_value([] { return __cppsh_contK(
-//       __cppsh_fK_x, ...); });
+//   auto __cppsh_resK = __cppsh_contK(__cppsh_fK_x, ...);          (built)
 // -- the continuation specialized on the locals' values, read through the
-// references (staged as an input is, where they are needed); its result in
+// globals (staged as an input is, where they are needed); its result in
 // __cppsh_resK for whoever waits for it.
 extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   if (!CppshActiveInterpreter || Id >= CppshCutRemainders.size())
     return;
-  unsigned K = CppshContinuations++;
-  std::string Tag = std::to_string(K);
-  const std::vector<std::string> &Names = CppshCutLocalNames[Id];
-  const std::vector<std::string> &Types = CppshCutLocalTypes[Id];
-  std::string Globals, Code, Params, Args;
-  // A type marked `&&` (no copy): moved -- the frame it is in is left as
-  // soon as the continuation has run.
-  std::vector<std::string> Tys;
-  // The run-time template arguments' values (__cppsh_need<i>, long long):
-  // read here, for the continuation's compile to take in order -- not its
-  // parameters.
+  Interpreter &Interp = *CppshActiveInterpreter;
+  Sema &S = Interp.getCompilerInstance()->getSema();
+  ASTContext &Ctx = S.Context;
+  IdentifierTable &Idents = S.getPreprocessor().getIdentifierTable();
+  const std::string Tag = std::to_string(CppshContinuations++);
+  const std::vector<CppshCutLocal> &Locals = CppshCutLocals[Id];
+  const unsigned Count = std::min<unsigned>(N, Locals.size());
+  auto Report = [](llvm::Error Err) {
+    if (!Err)
+      return true;
+    llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
+    return false;
+  };
+
+  // Laid out here, and known: no staging probe; no hoisting.
+  const bool WasHoist = std::exchange(CppshInHoist, false);
+  const bool WasNoProbe = std::exchange(CppshNoProbe, true);
+  std::vector<APValue> OuterNeeds = std::exchange(CppshActiveNeeds, {});
+  const size_t OuterTaken = std::exchange(CppshActiveNeedsTaken, 0);
+
+  // The run-time template arguments' values, for the continuation's compile
+  // to take in order; each live local a global naming it in the frame --
+  // run first, so that the continuation's value specialization reads their
+  // values.
   std::vector<APValue> Needs;
-  for (unsigned I = 0; I < N && I < Names.size(); ++I) {
-    if (llvm::StringRef(Names[I]).starts_with("__cppsh_need")) {
-      long long V = *static_cast<const long long *>(Frame[I]);
-      Needs.push_back(APValue(llvm::APSInt(llvm::APInt(64, static_cast<uint64_t>(V), true),
-                                           /*isUnsigned=*/false)));
+  SmallVector<std::pair<const CppshCutLocal *, VarDecl *>, 8> Globals;
+  bool Ok = true;
+  const bool AnyLocal =
+      llvm::any_of(llvm::ArrayRef<CppshCutLocal>(Locals).take_front(Count),
+                   [](const CppshCutLocal &L) { return L.Name != nullptr; });
+  const bool Building = AnyLocal && Report(Interp.cppshBeginBuild());
+  Ok = !AnyLocal || Building;
+  for (unsigned I = 0; I < Count; ++I) {
+    const CppshCutLocal &L = Locals[I];
+    if (!L.Name) {
+      const long long V = *static_cast<const long long *>(Frame[I]);
+      Needs.push_back(APValue(llvm::APSInt(
+          llvm::APInt(64, static_cast<uint64_t>(V), /*isSigned=*/true),
+          /*isUnsigned=*/false)));
       continue;
     }
-    std::string Ty = Types[I];
-    bool Move = llvm::StringRef(Ty).starts_with("&&");
-    if (Move)
-      Ty = Ty.substr(2);
-    Tys.push_back(Ty);
-    std::string Global = "__cppsh_f" + Tag + "_" + Names[I];
-    Globals += "auto &" + Global + " = *static_cast<" + Ty + " *>((void *)" +
-               std::to_string(reinterpret_cast<uintptr_t>(Frame[I])) + "ULL);\n";
-    Params += std::string(Params.empty() ? "" : ", ") + "auto " + Names[I];
-    Args += std::string(Args.empty() ? "" : ", ") +
-            (Move ? "static_cast<" + Ty + " &&>(" + Global + ")" : Global);
+    if (!Building)
+      continue;
+    VarDecl *G = cppshFrameGlobal(
+        S, &Idents.get("__cppsh_f" + Tag + "_" + L.Name->getName().str()),
+        L.Type, Frame[I]);
+    if (!G) {
+      Ok = false;
+      continue;
+    }
+    Interp.cppshAddBuilt(G);
+    Globals.emplace_back(&L, G);
+  }
+  if (Building)
+    Ok = Report(Interp.cppshEndBuildAndExecute()) && Ok;
+
+  // The continuation itself: the rest of the body, as the cut kept it.
+  std::string Params, RefParams, RefArgs;
+  PrintingPolicy Policy(Ctx.getLangOpts());
+  for (unsigned I = 0; I < Count; ++I) {
+    const CppshCutLocal &L = Locals[I];
+    if (!L.Name)
+      continue;
+    const std::string Name = L.Name->getName().str();
+    const std::string Ty = TypeName::getFullyQualifiedName(
+        L.Type, Ctx, Policy, /*WithGlobalNsPrefix=*/true);
+    Params += (Params.empty() ? "auto " : ", auto ") + Name;
+    // By value: a function, not a template -- no value specialization of
+    // its parameters (the next iteration changes them); moved, with no copy.
+    RefParams += (RefParams.empty() ? "" : ", ") + Ty + " " + Name;
+    RefArgs += (RefArgs.empty() ? "" : ", ") +
+               (L.Move ? "static_cast<" + Ty + " &&>(" + Name + ")" : Name);
   }
   const std::string &LoopRest =
       Id < CppshCutLoopRests.size() ? CppshCutLoopRests[Id] : std::string();
   // After the text taken from the user's input (its #line marks, ParseStmt),
   // what is generated here said to be so.
   const std::string Generated = "\n#line 1 \"<cppsh continuation>\"\n";
+  std::string Code;
   if (LoopRest.empty()) {
-    Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {\n" + CppshCutRemainders[Id] +
-            Generated + "}\n";
+    Code = "auto __cppsh_cont" + Tag + "(" + Params + ") {\n" +
+           CppshCutRemainders[Id] + Generated + "}\n";
   } else {
     // Made in a loop: the iteration finished with the values it has, as
-    // constants; the loop run on (__cppsh_loopK, a plain function) with them
-    // -- never constants there, as the next iteration changes them; its need
-    // cut again.
-    std::string RefParams, RefArgs;
-    for (unsigned I = 0, T = 0; I < N && I < Names.size(); ++I) {
-      if (llvm::StringRef(Names[I]).starts_with("__cppsh_need"))
-        continue;
-      (void)T;
-      // By value: a function, not a template -- no value specialization of
-      // its parameters (the next iteration changes them); the continuation
-      // locals, values it was specialized on, are copied (moved, with no copy).
-      bool Move = llvm::StringRef(Types[I]).starts_with("&&");
-      std::string Ty = Move ? Types[I].substr(2) : Types[I];
-      RefParams += std::string(RefParams.empty() ? "" : ", ") + Ty + " " + Names[I];
-      RefArgs += std::string(RefArgs.empty() ? "" : ", ") +
-                 (Move ? "static_cast<" + Ty + " &&>(" + Names[I] + ")" : Names[I]);
-    }
-    // The flag a `break` of the iteration sets: the loop not run on.
-    std::string Flag = "__cppsh_brk" + std::to_string(Id);
-    RefParams += std::string(RefParams.empty() ? "" : ", ") + "bool " + Flag;
-    RefArgs += std::string(RefArgs.empty() ? "" : ", ") + Flag;
-    Code += "auto __cppsh_loop" + Tag + "(" + RefParams + ") {\n" + LoopRest + Generated +
-            "}\n";
-    Code += "auto __cppsh_cont" + Tag + "(" + Params + ") {\nbool " + Flag +
-            " = false;\ndo { " + CppshCutRemainders[Id] + Generated +
-            "} while (false);\nreturn __cppsh_loop" + Tag + "(" + RefArgs + ");\n}\n";
+    // constants; the loop run on (__cppsh_loopK, a plain function) with them,
+    // its need cut again. The flag a `break` of the iteration sets: the loop
+    // not run on.
+    const std::string Flag = "__cppsh_brk" + std::to_string(Id);
+    RefParams += (RefParams.empty() ? "" : ", ") + ("bool " + Flag);
+    RefArgs += (RefArgs.empty() ? "" : ", ") + Flag;
+    Code = "auto __cppsh_loop" + Tag + "(" + RefParams + ") {\n" + LoopRest +
+           Generated + "}\n" + "auto __cppsh_cont" + Tag + "(" + Params +
+           ") {\nbool " + Flag + " = false;\ndo { " + CppshCutRemainders[Id] +
+           Generated + "} while (false);\nreturn __cppsh_loop" + Tag + "(" +
+           RefArgs + ");\n}\n";
   }
-  Code += "auto __cppsh_res" + Tag +
-          " = ::std::sh::__cppsh_value([] { return __cppsh_cont" + Tag + "(" + Args +
-          "); });\n";
-  bool WasHoist = CppshInHoist;
-  CppshInHoist = false;
-  // Laid out here, and known: the frame's globals first (run, so that the
-  // rest reads their values), then the continuation and its result -- no
-  // staging probe for either.
-  bool WasNoProbe = CppshNoProbe;
-  CppshNoProbe = true;
-  std::vector<APValue> OuterNeeds = std::exchange(CppshActiveNeeds, {});
-  size_t OuterTaken = std::exchange(CppshActiveNeedsTaken, 0);
-  if (llvm::Error Err = Globals.empty() ? llvm::Error::success()
-                                        : CppshActiveInterpreter->ParseAndExecute(Globals))
-    llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
-  else {
+  if (Ok)
+    Ok = Report(Interp.ParseAndExecute(Code));
+
+  // Called with the frame's locals, the run-time template arguments' values
+  // known as it is compiled.
+  CppshResult Result = CppshResult::None;
+  if (Ok) {
     CppshActiveNeeds = std::move(Needs);
     CppshActiveNeedsTaken = 0;
-    if (llvm::Error Err = CppshActiveInterpreter->ParseAndExecute(Code))
-      llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
+    if (Report(Interp.cppshBeginBuild())) {
+      Result = cppshBuildResult(S, Interp, Tag, Globals);
+      if (!Report(Interp.cppshEndBuildAndExecute()))
+        Result = CppshResult::None;
+    }
   }
   CppshActiveNeeds = std::move(OuterNeeds);
   CppshActiveNeedsTaken = OuterTaken;
@@ -1541,17 +1652,7 @@ extern "C" void __cppsh_cut_run(unsigned Id, void *const *Frame, unsigned N) {
   CppshInHoist = WasHoist;
   // The result: that of this continuation -- unless it was staged on in turn
   // (a staged{} of its own): then that of the innermost, set as it ran.
-  bool Staged = false;
-  {
-    Sema &S = CppshActiveInterpreter->getCompilerInstance()->getSema();
-    LookupResult R(S, &S.getPreprocessor().getIdentifierTable().get("__cppsh_res" + Tag),
-                   SourceLocation(), Sema::LookupOrdinaryName);
-    S.LookupQualifiedName(R, S.Context.getTranslationUnitDecl());
-    if (auto *VD = R.getAsSingle<VarDecl>())
-      if (auto *RD = VD->getType()->getAsCXXRecordDecl())
-        Staged = RD->getIdentifier() && RD->getName() == "staged";
-  }
-  if (!Staged)
+  if (Result == CppshResult::Value)
     CppshLastResult = "__cppsh_res" + Tag;
 }
 
@@ -2138,6 +2239,18 @@ Interpreter::compileKeepingObject(llvm::StringRef Code) {
       return std::move(Err);
   }
   return std::make_pair(std::move(Object), std::move(Defines));
+}
+
+llvm::Error Interpreter::cppshBeginBuild() { return IncrParser->BeginBuild(); }
+
+void Interpreter::cppshAddBuilt(Decl *D) { IncrParser->AddBuilt(DeclGroupRef(D)); }
+
+llvm::Error Interpreter::cppshEndBuildAndExecute() {
+  llvm::Expected<TranslationUnitDecl *> TU = IncrParser->EndBuild();
+  if (!TU)
+    return TU.takeError();
+  PartialTranslationUnit &PTU = IncrParser->RegisterPTU(*TU);
+  return PTU.TheModule ? Execute(PTU) : llvm::Error::success();
 }
 
 llvm::Error Interpreter::loadCompiledObject(llvm::StringRef Object,

@@ -181,6 +181,12 @@ public:
   llvm::Error loadCompiledObject(llvm::StringRef Object,
                                  llvm::ArrayRef<std::string> Defines);
 
+  /// cppsh: a unit built by Sema rather than parsed -- begun, each
+  /// declaration of it handed over, then compiled and run.
+  llvm::Error cppshBeginBuild();
+  void cppshAddBuilt(Decl *D);
+  llvm::Error cppshEndBuildAndExecute();
+
   llvm::Expected<PartialTranslationUnit &> Parse(llvm::StringRef Code);
   llvm::Error Execute(PartialTranslationUnit &T);
   llvm::Error ParseAndExecute(llvm::StringRef Code, Value *V = nullptr);

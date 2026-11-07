@@ -20,6 +20,7 @@
 #include "clang/Parse/Parser.h"
 #include <set>
 #include "clang/Sema/ScopeInfo.h"
+#include "clang/Sema/CppshStaging.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/AST/QualTypeNames.h"
 #include "clang/AST/DeclTemplate.h"
@@ -1160,7 +1161,6 @@ bool cppshMoveOnly(Sema &S, QualType T);
 extern const VarDecl *CppshCutNeedVar;
 extern std::vector<Expr *> CppshCutNeedExprs;
 bool cppshMutates(const Stmt *S, const VarDecl *VD);
-extern std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
 } // namespace clang
 
 // The next compound statement parsed is a function's body (cppsh: the block a
@@ -1602,8 +1602,7 @@ unsigned Parser::CppshEmitCut(SmallVectorImpl<Stmt *> &Stmts, StringRef Rest,
         if (auto *VD = dyn_cast_or_null<VarDecl>(DS->getSingleDecl());
             VD && VD->getIdentifier() && Seen.insert(VD->getIdentifier()).second)
           Live.push_back(VD);
-  std::vector<std::string> Names, Types;
-  PrintingPolicy Policy(Actions.Context.getLangOpts());
+  std::vector<CppshCutLocal> Locals;
   // The run-time template arguments of the statement cut at, their values
   // as long long: evaluated here, once, handed over (__cppsh_need<i>).
   SmallVector<Expr *, 4> NeedArgs;
@@ -1615,23 +1614,16 @@ unsigned Parser::CppshEmitCut(SmallVectorImpl<Stmt *> &Stmts, StringRef Rest,
       NeedArgs.push_back(AsLL.get());
   }
   CppshCutNeedExprs.clear();
-  for (VarDecl *VD : Live) {
-    Names.push_back(VD->getName().str());
-    // `&&` first: handed over by moving it (a type with no copy).
-    Types.push_back(std::string(cppshMoveOnly(Actions, VD->getType()) ? "&&" : "") +
-                    TypeName::getFullyQualifiedName(
-                        VD->getType().getNonReferenceType().getUnqualifiedType(),
-                        Actions.Context, Policy, /*WithGlobalNsPrefix=*/true));
-  }
-  for (size_t I = 0; I < NeedArgs.size(); ++I) {
-    Names.push_back("__cppsh_need" + std::to_string(I));
-    Types.push_back("long long");
-  }
+  for (VarDecl *VD : Live)
+    Locals.push_back({VD->getIdentifier(),
+                      VD->getType().getNonReferenceType().getUnqualifiedType(),
+                      cppshMoveOnly(Actions, VD->getType())});
+  for (size_t I = 0; I < NeedArgs.size(); ++I)
+    Locals.push_back({nullptr, Actions.Context.LongLongTy, false});
   unsigned Id = CppshCutRemainders.size();
   CppshCutRemainders.push_back(cppshLineMark(SM, Loc) + Rest.str());
   CppshCutLoopRests.emplace_back();
-  CppshCutLocalNames.push_back(std::move(Names));
-  CppshCutLocalTypes.push_back(std::move(Types));
+  CppshCutLocals.push_back(std::move(Locals));
   CppshCutFunctions.insert(FD->getCanonicalDecl());
   ExprResult Frame = cppshShFunction(Actions, PP, "__cppsh_frame", Loc);
   ExprResult Cut = cppshShFunction(Actions, PP, "__cppsh_cut", Loc);

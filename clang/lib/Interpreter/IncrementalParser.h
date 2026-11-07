@@ -17,7 +17,10 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
 
+#include "clang/Sema/Sema.h"
+
 #include <list>
+#include <optional>
 #include <memory>
 
 namespace clang {
@@ -63,12 +66,33 @@ public:
 
   void CleanUpPTU(TranslationUnitDecl *MostRecentTU);
 
+  /// cppsh: a unit built by Sema rather than parsed -- begun, each
+  /// declaration of it handed over, then finished as a parsed one is.
+  llvm::Error BeginBuild();
+  void AddBuilt(DeclGroupRef DG);
+  llvm::Expected<TranslationUnitDecl *> EndBuild();
+
   /// Register a PTU produced by Parse.
   PartialTranslationUnit &RegisterPTU(TranslationUnitDecl *TU,
                                       std::unique_ptr<llvm::Module> M = {});
 
 private:
   llvm::Expected<TranslationUnitDecl *> ParseOrWrapTopLevelDecl();
+
+  /// A new unit, the scope of the last one left.
+  void StartPTU();
+  /// The unit taken back whole (it failed): why, as the error.
+  llvm::Error TakeBackPTU(llvm::StringRef Why);
+  /// The unit finished: its instantiations performed, code generated.
+  llvm::Expected<TranslationUnitDecl *>
+  FinishPTU(Sema::LocalEagerInstantiationScope &LocalInstantiations,
+            Sema::GlobalEagerInstantiationScope &GlobalInstantiations);
+
+  /// The consumer rejected a declaration of the unit being built.
+  bool ConsumerFailed = false;
+  /// The instantiation scopes of the unit being built.
+  std::optional<Sema::GlobalEagerInstantiationScope> BuildGlobalInstantiations;
+  std::optional<Sema::LocalEagerInstantiationScope> BuildLocalInstantiations;
 
   /// Rebuild the translation unit redeclaration chain without \p MostRecentTU,
   /// making its predecessor the current unit again.

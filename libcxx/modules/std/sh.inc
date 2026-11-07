@@ -47,7 +47,6 @@ export namespace std {
     using std::sh::fg;
     using std::sh::job_entry;
     using std::sh::jobs;
-    using std::sh::__cppsh_value;
     using std::sh::command;
     using std::sh::pipeline;
     using std::sh::last_status;

@@ -49,6 +49,7 @@
 #include "clang/Sema/Designator.h"
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Initialization.h"
+#include "clang/Sema/CppshStaging.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Overload.h"
 #include "clang/Sema/ParsedTemplate.h"
@@ -133,7 +134,7 @@ std::vector<std::string> CppshCutRemainders;
 // Per cut: where it was made in a loop, the loop run on from its next step,
 // and what follows it (__cppsh_loopK); empty otherwise.
 std::vector<std::string> CppshCutLoopRests;
-std::vector<std::vector<std::string>> CppshCutLocalNames, CppshCutLocalTypes;
+std::vector<std::vector<CppshCutLocal>> CppshCutLocals;
 // A call of a staged function among the user's top-level statements: the
 // statement is staged and the call hoisted -- run on its own, its result put
 // in its place (Interpreter::ParseAndExecute) -- unless it is that hoisted
@@ -478,15 +479,11 @@ void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
         if (auto *VD = dyn_cast<VarDecl>(D);
             VD && VD->hasLocalStorage() && VD->getIdentifier())
           Live.push_back(VD);
-  std::vector<std::string> Names, Types;
-  PrintingPolicy Policy(S.Context.getLangOpts());
-  for (VarDecl *VD : Live) {
-    Names.push_back(VD->getName().str());
-    Types.push_back(std::string(cppshMoveOnly(S, VD->getType()) ? "&&" : "") +
-                    TypeName::getFullyQualifiedName(
-                        VD->getType().getNonReferenceType().getUnqualifiedType(),
-                        S.Context, Policy, /*WithGlobalNsPrefix=*/true));
-  }
+  std::vector<CppshCutLocal> Locals;
+  for (VarDecl *VD : Live)
+    Locals.push_back({VD->getIdentifier(),
+                      VD->getType().getNonReferenceType().getUnqualifiedType(),
+                      cppshMoveOnly(S, VD->getType())});
   // The run-time template arguments, their values as long long.
   SmallVector<Expr *, 4> NeedArgs;
   for (size_t I = 0; I < CppshCutNeedExprs.size(); ++I) {
@@ -495,16 +492,14 @@ void cppshCutInstantiation(Sema &S, const CompoundStmt *Body, const Stmt *At,
         CppshCutNeedExprs[I]);
     if (!AsLL.isUsable())
       continue;
-    Names.push_back("__cppsh_need" + std::to_string(NeedArgs.size()));
-    Types.push_back("long long");
+    Locals.push_back({nullptr, S.Context.LongLongTy, false});
     NeedArgs.push_back(AsLL.get());
   }
   CppshCutNeedExprs.clear();
   unsigned Id = CppshCutRemainders.size();
   CppshCutRemainders.push_back(cppshLineMark(SM, Loc) + Rest.str());
   CppshCutLoopRests.emplace_back();
-  CppshCutLocalNames.push_back(std::move(Names));
-  CppshCutLocalTypes.push_back(std::move(Types));
+  CppshCutLocals.push_back(std::move(Locals));
   CppshCutFunctions.insert(FD->getCanonicalDecl());
   ExprResult Frame = cppshShCallee(S, "__cppsh_frame", Loc);
   ExprResult Cut = cppshShCallee(S, "__cppsh_cut", Loc);

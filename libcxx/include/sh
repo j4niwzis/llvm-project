@@ -1828,7 +1828,7 @@ void __cppsh_snapshot(const T &v) {
 // from std::cin, given to ls -- is cut there by the compiler: it returns
 // __cppsh_cut(id, __cppsh_frame(its live locals...)), and the interpreter
 // compiles the rest as a continuation, its locals' values known, runs it,
-// and keeps its result (__cppsh_value) for the caller, which is compiled
+// and keeps its result (__cppsh_resK) for the caller, which is compiled
 // once it is there. What a staged function returns as it is compiled: staged.
 struct staged {
   friend constexpr bool operator==(staged, staged) noexcept { return true; }
@@ -1855,18 +1855,6 @@ template <std::size_t N>
 staged __cppsh_cut(unsigned id, std::array<void *, N> frame) {
   ::__cppsh_cut_run(id, frame.data(), static_cast<unsigned>(N));
   return {};
-}
-
-// A continuation's result, kept: what it returns, or staged where it
-// returns nothing.
-template <typename F>
-auto __cppsh_value(F f) {
-  if constexpr (std::is_void_v<decltype(f())>) {
-    f();
-    return staged{};
-  } else {
-    return f();
-  }
 }
 
 } // namespace sh
