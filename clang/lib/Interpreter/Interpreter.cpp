@@ -1494,6 +1494,10 @@ llvm::Error Interpreter::cppshSnapshot(ArrayRef<VarDecl *> Vars) {
       S.ActOnFinishTopLevelStmtDecl(
           Stmt, Full.isUsable() ? static_cast<clang::Stmt *>(Full.get())
                                 : new (Ctx) NullStmt(Loc));
+      // ActOnStartTopLevelStmtDecl made the statement the scope's entity
+      // (as the parser's own scope for it would be); the translation unit's
+      // scope names the translation unit again.
+      S.TUScope->setEntity(Ctx.getTranslationUnitDecl());
       Interp.cppshAddBuilt(Stmt);
     }
   }
@@ -1998,6 +2002,7 @@ static VarDecl *cppshRunTokens(Interpreter &Interp, unsigned Begin, unsigned End
     S.ActOnFinishTopLevelStmtDecl(
         Stmt, Full.isUsable() ? static_cast<clang::Stmt *>(Full.get())
                               : new (Ctx) NullStmt(Loc));
+    S.TUScope->setEntity(Ctx.getTranslationUnitDecl());
     Interp.cppshAddBuilt(Stmt);
   }
   if (Keep && E.isUsable()) {
