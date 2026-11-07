@@ -1730,6 +1730,10 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
       ResultType = Result->getType().getNonReferenceType();
       T = ResultType;
       Objects[I] = Addr->toPtr<void *>();
+      // A reference naming the storage the result was constructed in (a
+      // staged function's kept result): that storage.
+      if (Result->getType()->isReferenceType())
+        Objects[I] = *static_cast<void **>(Objects[I]);
     }
     if (T->isDependentType())
       return Fail("a type of its frame is not known");
