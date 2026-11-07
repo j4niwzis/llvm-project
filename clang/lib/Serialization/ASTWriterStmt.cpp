@@ -1850,6 +1850,9 @@ void ASTStmtWriter::VisitCppshStagedStmt(CppshStagedStmt *S) {
     Record.push_back(static_cast<uint64_t>(
         static_cast<int64_t>(S->gotoPropagation()[I])));
   }
+  Record.push_back(S->entries().size());
+  for (Stmt *E : S->entries())
+    Record.AddStmt(E);
   Code = serialization::STMT_CPPSH_STAGED;
 }
 

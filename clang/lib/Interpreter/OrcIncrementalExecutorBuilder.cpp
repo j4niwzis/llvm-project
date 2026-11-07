@@ -91,7 +91,7 @@ __int128 __cppsh_modti3(__int128, __int128);
 }
 #endif
 // A staged region, instantiated and run as its function runs (Interpreter.cpp).
-extern "C" int __cppsh_staged_run(const void *, void *const *, void *);
+extern "C" int __cppsh_staged_run(const void *, void *const *, void *, int);
 
 #if CLANG_HAVE_EMUTLS_GET_ADDRESS
 extern "C" void *__emutls_get_address(void *);

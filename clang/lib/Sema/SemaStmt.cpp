@@ -583,14 +583,6 @@ static bool DiagnoseSwitchCaseInExpansionStmt(Sema &S, SourceLocation KwLoc,
   // after the expansion statement is instantiated, at which point we will have
   // have already complained about duplicate case labels, which is not exactly
   // great QOI.
-  // cppsh: likewise staged code, compiled into a function of its own.
-  if (S.getCppshStagedJumpScope() &&
-      S.getCurFunction()->SwitchStack.back().EnclosingDC != S.CurContext) {
-    S.Diag(KwLoc, diag::err_cppsh_staged_case) << IsDefault;
-    S.Diag(S.getCurFunction()->SwitchStack.back().getPointer()->getSwitchLoc(),
-           diag::note_enclosing_switch_statement_here);
-    return true;
-  }
   if (S.CurContext->isExpansionStmt() &&
       S.getCurFunction()->SwitchStack.back().EnclosingDC != S.CurContext) {
     S.Diag(KwLoc, diag::err_expansion_stmt_case) << IsDefault;
@@ -609,6 +601,11 @@ Sema::ActOnCaseStmt(SourceLocation CaseLoc, ExprResult LHSVal,
   assert((DotDotDotLoc.isInvalid() ? RHSVal.isUnset()
                                    : RHSVal.isInvalid() || RHSVal.get()) &&
          "missing RHS value");
+
+  // cppsh: of a switch around staged code compiled as it runs: an entry.
+  if (StmtResult Entry = ActOnCppshStagedEntry(CaseLoc, nullptr);
+      Entry.isUsable())
+    return Entry;
 
   if (getCurFunction()->SwitchStack.empty()) {
     Diag(CaseLoc, diag::err_case_not_in_switch);
@@ -637,12 +634,22 @@ Sema::ActOnCaseStmt(SourceLocation CaseLoc, ExprResult LHSVal,
 }
 
 void Sema::ActOnCaseStmtBody(Stmt *S, Stmt *SubStmt) {
+  // cppsh: a case made an entry's label (ActOnCppshStagedEntry).
+  if (auto *LS = dyn_cast<LabelStmt>(S)) {
+    LS->setSubStmt(SubStmt);
+    return;
+  }
   cast<CaseStmt>(S)->setSubStmt(SubStmt);
 }
 
 StmtResult
 Sema::ActOnDefaultStmt(SourceLocation DefaultLoc, SourceLocation ColonLoc,
                        Stmt *SubStmt, Scope *CurScope) {
+  // cppsh: of a switch around staged code compiled as it runs: an entry.
+  if (StmtResult Entry = ActOnCppshStagedEntry(DefaultLoc, SubStmt);
+      Entry.isUsable())
+    return Entry;
+
   if (getCurFunction()->SwitchStack.empty()) {
     Diag(DefaultLoc, diag::err_default_not_in_switch);
     return SubStmt;

@@ -4551,7 +4551,13 @@ LabelDecl *Sema::LookupOrCreateLabel(IdentifierInfo *II, SourceLocation Loc,
 
   // Declare non-local labels outside any expansion statements; this is required
   // to support jumping out of an expansion statement.
-  ContextRAII Ctx{*this, CurContext->getEnclosingNonExpansionStatementContext(),
+  //
+  // cppsh: a label created in staged code is of that code's context, so
+  // that each time it is compiled it has one of its own.
+  ContextRAII Ctx{*this,
+                  getCppshStagedJumpScope()
+                      ? CurContext
+                      : CurContext->getEnclosingNonExpansionStatementContext(),
                   /*NewThisContext=*/false};
 
   // Not a GNU local label. Create the backing decl.

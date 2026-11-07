@@ -1833,6 +1833,10 @@ void ASTStmtReader::VisitCppshStagedStmt(CppshStagedStmt *S) {
     Propagate.push_back(static_cast<int>(static_cast<int64_t>(Record.readInt())));
   }
   S->setGotoTargets(Record.getContext(), Targets, Propagate);
+  SmallVector<Stmt *, 2> Entries;
+  for (unsigned I = 0, E = Record.readInt(); I < E; ++I)
+    Entries.push_back(Record.readSubStmt());
+  S->setEntries(Record.getContext(), Entries);
 }
 
 void ASTStmtReader::VisitCppshStagedExitStmt(CppshStagedExitStmt *S) {

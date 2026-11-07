@@ -337,6 +337,13 @@ void CppshStagedStmt::setGotoTargets(const ASTContext &C,
   }
 }
 
+void CppshStagedStmt::setEntries(const ASTContext &C, ArrayRef<Stmt *> E) {
+  NumEntries = E.size();
+  Entries = NumEntries ? new (C) Stmt *[NumEntries] : nullptr;
+  for (unsigned I = 0; I < NumEntries; ++I)
+    Entries[I] = E[I];
+}
+
 SourceLocation CppshStagedExitStmt::getEndLoc() const {
   if (const Expr *V = getValue())
     return V->getEndLoc();

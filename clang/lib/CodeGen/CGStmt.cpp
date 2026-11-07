@@ -1514,6 +1514,51 @@ CodeGenFunction::EmitCXXForRangeStmt(const CXXForRangeStmt &S,
 void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
   ArrayRef<Expr *> Frame = S.frame();
   llvm::PointerType *PtrTy = Builder.getPtrTy();
+  // Where it is entered: 0 at its start; I + 1 at its I-th entry -- a label
+  // in it a goto reaches, a case or default label of a switch around it.
+  Address EntryAddr = CreateTempAlloca(Int32Ty, CharUnits::fromQuantity(4),
+                                       "cppsh.entry");
+  ArrayRef<Stmt *> Entries = S.entries();
+  llvm::BasicBlock *RunBB = createBasicBlock("cppsh.run");
+  if (!Entries.empty()) {
+    Builder.CreateStore(Builder.getInt32(0), EntryAddr);
+    EmitBranch(RunBB);
+    for (unsigned I = 0; I < Entries.size(); ++I) {
+      const Stmt *E = Entries[I];
+      if (const auto *LS = dyn_cast<LabelStmt>(E)) {
+        EmitLabel(LS->getDecl());
+      } else if (const auto *CS = dyn_cast<CaseStmt>(E)) {
+        if (!SwitchInsn)
+          continue;
+        llvm::BasicBlock *CaseBB = createBasicBlock("cppsh.case");
+        EmitBlock(CaseBB);
+        llvm::APSInt LHS = CS->getLHS()->EvaluateKnownConstInt(getContext());
+        llvm::APSInt RHS = CS->getRHS()
+                               ? CS->getRHS()->EvaluateKnownConstInt(getContext())
+                               : LHS;
+        for (llvm::APSInt V = LHS; V <= RHS; ++V) {
+          SwitchInsn->addCase(Builder.getInt(V), CaseBB);
+          if (SwitchWeights)
+            SwitchWeights->push_back(0);
+          if (SwitchLikelihood)
+            SwitchLikelihood->push_back(Stmt::LH_None);
+          if (V == RHS)
+            break;
+        }
+      } else if (isa<DefaultStmt>(E)) {
+        if (!SwitchInsn)
+          continue;
+        EmitBlock(SwitchInsn->getDefaultDest());
+      } else {
+        continue;
+      }
+      Builder.CreateStore(Builder.getInt32(I + 1), EntryAddr);
+      EmitBranch(RunBB);
+    }
+  } else {
+    Builder.CreateStore(Builder.getInt32(0), EntryAddr);
+  }
+  EmitBlock(RunBB);
   llvm::ArrayType *FrameTy = llvm::ArrayType::get(PtrTy, Frame.size() + 1);
   Address FrameAddr = CreateTempAlloca(FrameTy, getPointerAlign(), "cppsh.frame");
   for (unsigned I = 0; I < Frame.size(); ++I) {
@@ -1541,7 +1586,7 @@ void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
     if (FD)
       for (const auto *A : FD->specific_attrs<AnnotateAttr>())
         if (A->getAnnotation() == "cppsh.staged.run")
-          InRunFn = FD->getNumParams() == 2;
+          InRunFn = FD->getNumParams() == 3;
     if (InRunFn)
       Slot = Builder.CreateLoad(GetAddrOfLocalVar(FD->getParamDecl(1)));
     else if (ReturnValue.isValid())
@@ -1550,11 +1595,14 @@ void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
   // The statement itself, which the interpreter compiles: in this process.
   llvm::Value *Node = Builder.CreateIntToPtr(
       llvm::ConstantInt::get(IntPtrTy, reinterpret_cast<uintptr_t>(&S)), PtrTy);
-  llvm::FunctionType *FnTy =
-      llvm::FunctionType::get(Int32Ty, {PtrTy, PtrTy, PtrTy}, /*isVarArg=*/false);
+  llvm::FunctionType *FnTy = llvm::FunctionType::get(
+      Int32Ty, {PtrTy, PtrTy, PtrTy, Int32Ty}, /*isVarArg=*/false);
   llvm::FunctionCallee Run = CGM.CreateRuntimeFunction(FnTy, "__cppsh_staged_run");
   llvm::Value *Code = EmitRuntimeCallOrInvoke(
-      Run, {Node, FrameAddr.emitRawPointer(*this), Slot}, "cppsh.left");
+      Run,
+      {Node, FrameAddr.emitRawPointer(*this), Slot,
+       Builder.CreateLoad(EntryAddr, "cppsh.entered")},
+      "cppsh.left");
   // In staged code compiled as it runs (a function of the interpreter's):
   // where the function around both returns its value is that function's
   // slot, and a way out of that code too is that function's leaving.
@@ -1563,7 +1611,7 @@ void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
   if (RunFD)
     for (const auto *A : RunFD->specific_attrs<AnnotateAttr>())
       if (A->getAnnotation() == "cppsh.staged.run")
-        InRun = RunFD->getNumParams() == 2;
+        InRun = RunFD->getNumParams() == 3;
   auto LeaveRun = [&](unsigned K) {
     Builder.CreateStore(Builder.getInt32(K), ReturnValue);
     EmitBranchThroughCleanup(ReturnBlock);

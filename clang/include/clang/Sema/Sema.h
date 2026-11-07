@@ -16108,6 +16108,10 @@ public:
     VarDecl *This = nullptr;
     /// The statement instantiated (its goto targets the body's exits).
     CppshStagedStmt *Staged = nullptr;
+    /// The parameter saying where the body is entered (0: its start; I + 1:
+    /// the statement's I-th entry), and the label each entry is in it.
+    ParmVarDecl *Entry = nullptr;
+    SmallVector<LabelDecl *, 4> EntryLabels;
   };
   CppshStagedRun *CurrentCppshStagedRun = nullptr;
 
@@ -16159,6 +16163,10 @@ public:
 
   /// `this`, in a staged statement's body compiled as it runs.
   Expr *CppshStagedThis(SourceLocation Loc);
+
+  /// In a staged statement's body compiled as it runs, a case or default
+  /// label of a switch around the statement (at Loc): the label of an entry.
+  StmtResult ActOnCppshStagedEntry(SourceLocation Loc, Stmt *SubStmt);
   ///@}
 };
 

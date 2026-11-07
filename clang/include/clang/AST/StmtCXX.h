@@ -1137,6 +1137,8 @@ class CppshStagedStmt final
   LabelDecl **Targets = nullptr;
   int *Propagate = nullptr;
   unsigned NumTargets = 0;
+  Stmt **Entries = nullptr;
+  unsigned NumEntries = 0;
 
   // Trailing: the body, then the frame.
   CppshStagedStmt(EmptyShell Empty, unsigned NumFrame)
@@ -1185,6 +1187,13 @@ public:
   ArrayRef<int> gotoPropagation() const { return {Propagate, NumTargets}; }
   void setGotoTargets(const ASTContext &C, ArrayRef<LabelDecl *> L,
                       ArrayRef<int> P);
+
+  /// Where the function around it may enter its body other than at its
+  /// start: each label in it (a goto from outside), each case or default
+  /// label of a switch around it. Entry I + 1 is the I-th: the statement is
+  /// run starting there.
+  ArrayRef<Stmt *> entries() const { return {Entries, NumEntries}; }
+  void setEntries(const ASTContext &C, ArrayRef<Stmt *> E);
 
   SourceLocation getBeginLoc() const { return BeginLoc; }
   SourceLocation getEndLoc() const { return EndLoc; }

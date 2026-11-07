@@ -54,6 +54,50 @@ struct CppshJumps : RecursiveASTVisitor<CppshJumps> {
   }
 };
 
+// Where code may be entered from outside it: its labels, and the case and
+// default labels of a switch around it (not of one in it).
+struct CppshEntries : RecursiveASTVisitor<CppshEntries> {
+  SmallVector<Stmt *, 4> Entries;
+  unsigned SwitchDepth = 0;
+  bool TraverseSwitchStmt(SwitchStmt *S) {
+    ++SwitchDepth;
+    bool Result = RecursiveASTVisitor::TraverseSwitchStmt(S);
+    --SwitchDepth;
+    return Result;
+  }
+  // A lambda's body is its own.
+  bool TraverseLambdaExpr(LambdaExpr *) { return true; }
+  bool VisitCaseStmt(CaseStmt *S) {
+    if (!SwitchDepth)
+      Entries.push_back(S);
+    return true;
+  }
+  bool VisitDefaultStmt(DefaultStmt *S) {
+    if (!SwitchDepth)
+      Entries.push_back(S);
+    return true;
+  }
+  bool VisitLabelStmt(LabelStmt *S) {
+    Entries.push_back(S);
+    return true;
+  }
+};
+
+static SmallVector<Stmt *, 4> cppshEntriesOf(Stmt *Body) {
+  CppshEntries E;
+  E.TraverseStmt(Body);
+  return std::move(E.Entries);
+}
+
+// The location an entry is known by.
+static SourceLocation cppshEntryLoc(const Stmt *E) {
+  if (const auto *SC = dyn_cast<SwitchCase>(E))
+    return SC->getKeywordLoc();
+  if (const auto *L = dyn_cast<LabelStmt>(E))
+    return L->getIdentLoc();
+  return SourceLocation();
+}
+
 // The declarations code names.
 struct CppshUses : RecursiveASTVisitor<CppshUses> {
   llvm::SmallPtrSet<const Decl *, 16> Used;
@@ -195,6 +239,7 @@ StmtResult Sema::ActOnFinishCppshStaged(CppshStagedDecl *SD, Stmt *Body,
   auto *S = CppshStagedStmt::Create(Context, SD, Body, Frame, Info.Leaves,
                                     Info.KeepsResult, Loc, EndLoc);
   S->setGotoTargets(Context, Targets, SmallVector<int, 4>(Targets.size(), -1));
+  S->setEntries(Context, cppshEntriesOf(Body));
   SD->setStagedStmt(S);
   return S;
 }
@@ -415,6 +460,7 @@ StmtResult Sema::ActOnFinishCppshStagedInstantiation(
         Propagate[I] = 4 + (It - Outer.begin());
   }
   S->setGotoTargets(Context, Targets, Propagate);
+  S->setEntries(Context, cppshEntriesOf(Body.get()));
   SD->setStagedStmt(S);
   return S;
 }
@@ -459,11 +505,78 @@ StmtResult Sema::InstantiateCppshStaged(CppshStagedStmt *S,
       CppshSuppliedExprs[Loc.getRawEncoding()] = BuildDeclRefExpr(
           Locals[Index], Locals[Index]->getType().getNonReferenceType(),
           VK_LValue, Loc);
+  // A label outside the body it jumps to: that same label (its function
+  // leaves for it).
+  for (LabelDecl *L : S->gotoTargets())
+    Scope.InstantiatedLocal(L, L);
+  Run.EntryLabels.assign(S->entries().size(), nullptr);
   NonSFINAEContext NonSFINAE(*this);
   InstantiatingTemplate Inst(*this, S->getBeginLoc(), S, S->getSourceRange());
   if (Inst.isInvalid())
     return StmtError();
-  return SubstStmt(S->getBody(), Args);
+  StmtResult Body = SubstStmt(S->getBody(), Args);
+  if (Body.isInvalid())
+    return Body;
+  // Entered elsewhere than at its start: `if (entry == I + 1) goto L;` for
+  // each entry, L the label it is in the body compiled -- a label's own
+  // instantiation, a case's made of it (ActOnCppshStagedEntry).
+  SmallVector<Stmt *, 8> Stmts;
+  ArrayRef<Stmt *> Entries = S->entries();
+  for (unsigned I = 0; I < Entries.size() && Run.Entry; ++I) {
+    LabelDecl *L = Run.EntryLabels[I];
+    if (const auto *LS = dyn_cast<LabelStmt>(Entries[I]))
+      if (auto *Found = Scope.getInstantiationOfIfExists(LS->getDecl()))
+        if (Decl *D = dyn_cast<Decl *>(*Found))
+          L = dyn_cast<LabelDecl>(D);
+    if (!L)
+      continue;
+    const SourceLocation Loc = cppshEntryLoc(Entries[I]);
+    ExprResult Entry = DefaultLvalueConversion(
+        BuildDeclRefExpr(Run.Entry, Run.Entry->getType(), VK_LValue, Loc));
+    Expr *Index = IntegerLiteral::Create(
+        Context, llvm::APInt(Context.getIntWidth(Context.IntTy), I + 1),
+        Context.IntTy, Loc);
+    ExprResult Cond = Entry.isUsable()
+                          ? CreateBuiltinBinOp(Loc, BO_EQ, Entry.get(), Index)
+                          : ExprError();
+    ConditionResult C = Cond.isUsable()
+                            ? ActOnCondition(nullptr, Loc, Cond.get(),
+                                             ConditionKind::Boolean)
+                            : ConditionError();
+    if (C.isInvalid())
+      return StmtError();
+    L->markUsed(Context);
+    Stmt *Goto = new (Context) GotoStmt(L, Loc, Loc);
+    StmtResult If = ActOnIfStmt(Loc, IfStatementKind::Ordinary, Loc, nullptr, C,
+                                Loc, Goto, SourceLocation(), nullptr);
+    if (If.isUsable())
+      Stmts.push_back(If.get());
+  }
+  if (Stmts.empty())
+    return Body;
+  Stmts.push_back(Body.get());
+  return CompoundStmt::Create(Context, Stmts, FPOptionsOverride(),
+                              S->getBeginLoc(), S->getEndLoc());
+}
+
+StmtResult Sema::ActOnCppshStagedEntry(SourceLocation Loc, Stmt *SubStmt) {
+  CppshStagedRun *Run = CurrentCppshStagedRun;
+  if (!Run || !Run->Staged || !getCurFunction() ||
+      !getCurFunction()->SwitchStack.empty())
+    return StmtEmpty();
+  // A label of its own, in the function compiled; jumped to as the body is
+  // entered there (from the statement's entries, where it is one of them).
+  auto *L = LabelDecl::Create(Context, CurContext, Loc,
+                              &PP.getIdentifierTable().get("__cppsh_entry"));
+  auto *LS = new (Context) LabelStmt(Loc, L, SubStmt);
+  L->setStmt(LS);
+  if (!getCppshStagedJumpScope()) {
+    ArrayRef<Stmt *> Entries = Run->Staged->entries();
+    for (unsigned I = 0; I < Entries.size() && I < Run->EntryLabels.size(); ++I)
+      if (isa<SwitchCase>(Entries[I]) && cppshEntryLoc(Entries[I]) == Loc)
+        Run->EntryLabels[I] = L;
+  }
+  return LS;
 }
 
 Expr *Sema::CppshStagedThis(SourceLocation Loc) {

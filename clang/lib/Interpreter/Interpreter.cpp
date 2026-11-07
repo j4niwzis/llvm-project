@@ -1686,7 +1686,7 @@ unsigned CppshKeptResults = 0;
 // storage of its type made for it, named by a global, __cppsh_resK, kept for
 // the function's caller.
 static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
-                          void *Slot) {
+                          void *Slot, int Entry) {
   if (!CppshActiveInterpreter || !Staged || !Staged->getStagedDecl())
     return 0;
   Interpreter &Interp = *CppshActiveInterpreter;
@@ -1797,10 +1797,11 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     Run.Staged = SS;
     FunctionDecl *F = cppshDefineFunction(
         S, "__cppsh_staged" + std::to_string(Count++), Ctx.IntTy,
-        {VoidPtrPtr, Ctx.VoidPtrTy},
+        {VoidPtrPtr, Ctx.VoidPtrTy, Ctx.IntTy},
         [&](FunctionDecl *Fn, ArrayRef<ParmVarDecl *> Ps) -> Stmt * {
           Run.Function = Fn;
           Run.Slot = Ps[1];
+          Run.Entry = Ps[2];
           // Known to code generation: staged code inside it leaves through
           // it, and returns its value where its slot points.
           Fn->addAttr(AnnotateAttr::CreateImplicit(Ctx, "cppsh.staged.run",
@@ -1918,9 +1919,10 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
   if (SD->usesThis())
     Entries.push_back(Frame[N]);
   Entries.push_back(nullptr);
-  using StagedFn = int (*)(void **, void *);
+  using StagedFn = int (*)(void **, void *, int);
   const unsigned KeptBefore = CppshKeptResults;
-  const int Left = reinterpret_cast<StagedFn>(Found->Address)(Entries.data(), Slot);
+  const int Left =
+      reinterpret_cast<StagedFn>(Found->Address)(Entries.data(), Slot, Entry);
   // Its return kept the result -- unless code staged inside it did (that
   // code's result kept already).
   if (Keep && Left == 3 && !ResultName.empty() && CppshKeptResults == KeptBefore) {
@@ -1931,12 +1933,13 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
 }
 
 extern "C" int __cppsh_staged_run(const void *Node, void *const *Frame,
-                                  void *Slot) {
+                                  void *Slot, int Entry) {
   if (!CppshActiveInterpreter) {
     llvm::errs() << "error: cppsh: a staged statement cannot run: no interpreter\n";
     return 0;
   }
-  return cppshRunStaged(static_cast<const CppshStagedStmt *>(Node), Frame, Slot);
+  return cppshRunStaged(static_cast<const CppshStagedStmt *>(Node), Frame, Slot,
+                        Entry);
 }
 
 // An expression parsed from the recorded tokens [Begin, End), compiled and
