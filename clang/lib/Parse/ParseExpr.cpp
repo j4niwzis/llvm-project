@@ -2406,6 +2406,14 @@ Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
               Actions.CreateRecoveryExpr(Fn->getBeginLoc(), RParLoc, ArgExprs);
         }
         PT.consumeClose();
+        // cppsh: in a staged region, the call of a staged function its first
+        // statement made: the value it gave, the region's parameter for it
+        // (Parser::CppshEmitRegion).
+        if (!CppshRegionArgs.empty() && LHS.isUsable())
+          if (ParmVarDecl *P = CppshRegionArgs.lookup(
+                  LHS.get()->getBeginLoc().getRawEncoding()))
+            LHS = Actions.BuildDeclRefExpr(P, P->getType().getNonReferenceType(),
+                                           VK_LValue, LHS.get()->getBeginLoc());
       }
 
       break;

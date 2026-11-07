@@ -117,6 +117,9 @@ const VarDecl *CppshCutNeedVar = nullptr;
 // parsed (a call's value as a default, input<int>()): evaluated where the body
 // is cut, once, and handed over in the frame (__cppsh_need<i>, as long long).
 std::vector<Expr *> CppshCutNeedExprs;
+// The calls of staged functions met in the statement being parsed: their
+// values exist once they ran (a staged region takes each as a parameter).
+std::vector<Expr *> CppshCutStagedCalls;
 // A top-level statement met a run-time template argument: it is compiled
 // again inside a function (Interpreter::ParseAndExecute).
 bool CppshTopNeed = false;
@@ -7557,12 +7560,13 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         // ever returns: its result is the staging's, kept as it runs.
         !(Callee->getIdentifier() && Callee->getName().starts_with("__cppsh_loop")) &&
         cppshInUserInput(*this, CE->getBeginLoc())) {
-      if (FunctionDecl *Cur = getCurFunctionDecl();
-          Cur && !Cur->isDependentContext()) {
+      if (FunctionDecl *Cur = cppshNeedFunction(*this)) {
         CppshCutNeeded = true; // its caller's body cut here too
         CppshCutNeedVar = nullptr;
         CppshCutNeedFunction = Cur;
-      } else if (!CppshInHoist && !CppshStageAt.isValid()) {
+        CppshCutStagedCalls.push_back(Call.get());
+      } else if ((!getCurFunctionDecl() || getCurFunctionDecl()->isDependentContext()) &&
+                 !CppshInHoist && !CppshStageAt.isValid()) {
         CppshStageAt = CE->getBeginLoc(); // a top-level statement: hoisted
         CppshHoistBegin = CE->getBeginLoc();
         CppshHoistEnd = CE->getEndLoc();

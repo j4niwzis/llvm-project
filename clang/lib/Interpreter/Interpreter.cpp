@@ -1736,6 +1736,22 @@ static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
   if (!cppshFrameGlobals(Interp, S, Unit, Locals, Addresses.data(), Needs, Globals) ||
       Globals.size() != N + 1)
     return;
+  // A staged function's call it was handed (a std::sh::staged): the result
+  // that call left, its value, in its place.
+  for (unsigned I = 0; I < N; ++I) {
+    auto *Arg = Locals[I].Type->getAsCXXRecordDecl();
+    if (!Arg || !Arg->getIdentifier() || Arg->getName() != "staged")
+      continue;
+    LookupResult R(S, &Idents.get(CppshLastResult), Loc, Sema::LookupOrdinaryName);
+    auto *Result = !CppshLastResult.empty() &&
+                           S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl())
+                       ? R.getAsSingle<VarDecl>()
+                       : nullptr;
+    if (!Result)
+      return;
+    Locals[I].Type = Result->getType().getNonReferenceType();
+    Globals[I].second = Result;
+  }
 
   // The values it is compiled with: each parameter it does not change.
   Stmt *Body = Pattern->getBody();

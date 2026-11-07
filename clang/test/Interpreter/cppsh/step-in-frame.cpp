@@ -1,4 +1,4 @@
-// RUN: printf '3\n4\n5\n6\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '3\n4\n5\n6\n7\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
 
 // A statement that needs a value read as its function runs, and declares
 // nothing: compiled with the value when it runs, against the function's own
@@ -37,3 +37,8 @@ std::println("r {}", r());
 auto s() { int n = 0; std::cin >> n; std::array<int, n> a{}; return a; }
 std::println("s {}", s().size());
 // CHECK: s 6
+
+// A staged function called in another: the call the region's argument.
+t() = { auto a = s(); return a.size(); };
+std::println("t {}", t());
+// CHECK: t 7

@@ -1160,6 +1160,7 @@ extern std::vector<std::string> CppshCutLoopRests;
 bool cppshMoveOnly(Sema &S, QualType T);
 extern const VarDecl *CppshCutNeedVar;
 extern std::vector<Expr *> CppshCutNeedExprs;
+extern std::vector<Expr *> CppshCutStagedCalls;
 bool cppshMutates(const Stmt *S, const VarDecl *VD);
 } // namespace clang
 
@@ -1705,7 +1706,10 @@ SmallVector<VarDecl *, 8> Parser::CppshLiveLocals(SourceLocation Loc) {
 // result, not a value's need): the caller cuts instead, or says so.
 bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
                              SourceLocation Begin, bool AtBody) {
-  if (!R.isUsable() || (!CppshCutNeedVar && CppshCutNeedExprs.empty()))
+  // What it needs: a local's value, a run-time template argument's, or a
+  // staged function's result -- one, the last a staged call leaves.
+  if (!R.isUsable() || CppshCutStagedCalls.size() > 1 ||
+      (!CppshCutNeedVar && CppshCutNeedExprs.empty() && CppshCutStagedCalls.empty()))
     return false;
   std::optional<unsigned> B = cppshTokenIndex(Begin);
   // A region's first statement needing a value again: what it needs is no
@@ -1815,12 +1819,19 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   }
   // The run-time template arguments the statement met: evaluated here, each
   // handed over as a parameter of its own.
+  // And the call of a staged function it made: made here, before it, its
+  // value the result it leaves (the interpreter hands that over).
   SmallVector<SourceLocation, 2> NeedLocs;
   for (Expr *NE : CppshCutNeedExprs) {
     NeedLocs.push_back(NE->getBeginLoc());
     Args.push_back(NE);
   }
+  for (Expr *Call : CppshCutStagedCalls) {
+    NeedLocs.push_back(Call->getBeginLoc());
+    Args.push_back(Call);
+  }
   CppshCutNeedExprs.clear();
+  CppshCutStagedCalls.clear();
   const bool SavedReturns = std::exchange(CppshRegionReturns, Returns && !Staged);
   IdentifierInfo *const SavedSlot =
       std::exchange(CppshRegionReturnSlot, RetVar ? RetName : nullptr);
@@ -2058,6 +2069,7 @@ void Parser::ParseCppshRegionStatements(StmtVector &Stmts, unsigned Begin,
     const SourceLocation StmtBegin = Tok.getLocation();
     CppshCutNeeded = false;
     CppshCutNeedExprs.clear();
+    CppshCutStagedCalls.clear();
     StmtResult R = ParseStatementOrDeclaration(Stmts, ParsedStmtContext::Compound);
     if (CppshCutNeeded) {
       CppshCutNeeded = false;
@@ -2235,6 +2247,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
     if (CppshCuts) {
       CppshCutNeeded = false;
       CppshCutNeedExprs.clear();
+      CppshCutStagedCalls.clear();
     }
     if (Tok.isNot(tok::kw___extension__)) {
       R = ParseStatementOrDeclaration(Stmts, SubStmtCtx);
