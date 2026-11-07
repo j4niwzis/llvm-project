@@ -239,7 +239,13 @@ IncrementalParser::ParseNextTopLevel(bool First, bool &Done) {
   const bool AtEOF = First ? P->ParseFirstTopLevelDecl(ADecl, ImportState)
                            : P->ParseTopLevelDecl(ADecl, ImportState);
   (void)AtEOF;
-  if (ADecl && !Consumer->HandleTopLevelDecl(ADecl.get()))
+  // One to be taken back for its staging (FinishPTU): not handed to code
+  // generation -- what it declares is not what it will be (a staged call's
+  // result, void until it runs).
+  const bool Staging =
+      CppshTopNeed ||
+      (CppshHoistBegin.isValid() && CppshHoistEnd.isValid() && !CppshInHoist);
+  if (ADecl && !Staging && !Consumer->HandleTopLevelDecl(ADecl.get()))
     return TakeBackPTU("Parsing failed. The consumer rejected a decl");
   return FinishPTU(LocalInstantiations, GlobalInstantiations);
 }
