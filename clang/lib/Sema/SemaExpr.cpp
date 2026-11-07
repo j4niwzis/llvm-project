@@ -8385,6 +8385,10 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         // once the call is built.
         SmallVector<std::pair<ParmVarDecl *, std::optional<APValue>>, 4> SavedValues;
         auto setValue = [&](ParmVarDecl *P, APValue V) {
+          if (cppshTraceStaging())
+            llvm::errs() << "cppsh-trace: parameter " << P->getName() << " of "
+                         << cast<FunctionDecl>(P->getDeclContext())->getNameAsString()
+                         << " bound\n";
           auto Known = CppshParamValue.find(P);
           SavedValues.push_back(
               {P, Known == CppshParamValue.end() ? std::nullopt

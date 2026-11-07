@@ -3177,8 +3177,15 @@ public:
     }
     for (auto [It, End] = CppshSpecializations.equal_range(Head.computeHash());
          It != End; ++It)
-      if (It->second->matches(Head, Params))
+      if (It->second->matches(Head, Params)) {
+        if (cppshTraceStaging())
+          llvm::errs() << "cppsh-trace: value specialization of "
+                       << D->getNameAsString() << " found\n";
         return It->second->Function;
+      }
+    if (cppshTraceStaging())
+      llvm::errs() << "cppsh-trace: value specialization of "
+                   << D->getNameAsString() << " made\n";
     Window.emplace();
     return nullptr;
   }
