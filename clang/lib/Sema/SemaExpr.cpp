@@ -422,6 +422,18 @@ static FunctionDecl *cppshNeedFunction(Sema &S) {
   return Cur;
 }
 
+// The top-level statement (the REPL's) being written, outside any function.
+static const TopLevelStmtDecl *cppshTopStatement(Sema &S) {
+  if (S.getCurFunctionDecl(/*AllowLambda=*/true))
+    return nullptr;
+  for (const DeclContext *DC = S.CurContext; DC; DC = DC->getParent())
+    if (const auto *Top = dyn_cast<TopLevelStmtDecl>(DC))
+      return Top;
+  return nullptr;
+}
+
+bool cppshInTopStatement(Sema &S) { return cppshTopStatement(S) != nullptr; }
+
 const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E) {
   FunctionDecl *Cur = S.getCurFunctionDecl(/*AllowLambda=*/true);
   if (!E || !Cur || !E->isValueDependent() || !Cur->isDependentContext() ||
@@ -445,21 +457,33 @@ const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E) {
 }
 
 const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
-  FunctionDecl *Cur = cppshNeedFunction(S);
-  if (!E || !Cur || !cppshInUserInput(S, Cur->getLocation()))
+  if (!E)
     return nullptr;
-  if (S.CodeSynthesisContexts.empty()
-          ? Cur->isTemplateInstantiation()
-          : !(S.CodeSynthesisContexts.back().Kind ==
-                  Sema::CodeSynthesisContext::TemplateInstantiation &&
-              S.CodeSynthesisContexts.back().Entity == Cur))
+  // Whose locals: the function's -- or the top-level statement's (a loop's
+  // body the user typed at the prompt).
+  const DeclContext *Owner = nullptr;
+  if (FunctionDecl *Cur = cppshNeedFunction(S)) {
+    if (!cppshInUserInput(S, Cur->getLocation()))
+      return nullptr;
+    if (S.CodeSynthesisContexts.empty()
+            ? Cur->isTemplateInstantiation()
+            : !(S.CodeSynthesisContexts.back().Kind ==
+                    Sema::CodeSynthesisContext::TemplateInstantiation &&
+                S.CodeSynthesisContexts.back().Entity == Cur))
+      return nullptr;
+    Owner = Cur;
+  } else if (const TopLevelStmtDecl *Top = cppshTopStatement(S);
+             Top && cppshInUserInput(S, E->getBeginLoc())) {
+    Owner = Top;
+  } else {
     return nullptr;
+  }
   auto Find = [&](const Stmt *X, auto &Self) -> const VarDecl * {
     if (!X)
       return nullptr;
     if (auto *DRE = dyn_cast<DeclRefExpr>(X))
       if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
-          VD && VD->hasLocalStorage() && VD->getParentFunctionOrMethod() == Cur &&
+          VD && VD->hasLocalStorage() && VD->getParentFunctionOrMethod() == Owner &&
           !CppshParamValue.count(dyn_cast<ParmVarDecl>(VD)))
         return VD;
     for (const Stmt *C : X->children())
@@ -474,14 +498,17 @@ const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
 // written: a body the user typed, outside a lambda, not a template's pattern.
 bool cppshExprNeedHere(Sema &S, const Expr *E) {
   FunctionDecl *Cur = cppshNeedFunction(S);
-  return E && Cur && !E->isValueDependent() && !E->containsErrors() &&
-         cppshInUserInput(S, Cur->getLocation()) &&
+  return E && (Cur ? cppshInUserInput(S, Cur->getLocation())
+                   : cppshTopStatement(S) != nullptr) &&
+         !E->isValueDependent() && !E->containsErrors() &&
          cppshInUserInput(S, E->getBeginLoc());
 }
-// Whether it is one of a top-level statement the user typed.
+// Whether it is one of a top-level declaration the user typed (a
+// statement's is a staged region's, as in a function).
 bool cppshTopNeedHere(Sema &S, const Expr *E) {
-  return E && !S.getCurFunctionDecl() && !E->isValueDependent() &&
-         !E->containsErrors() && cppshInUserInput(S, E->getBeginLoc());
+  return E && !S.getCurFunctionDecl() && !cppshTopStatement(S) &&
+         !E->isValueDependent() && !E->containsErrors() &&
+         cppshInUserInput(S, E->getBeginLoc());
 }
 // In a continuation, the value of the next run-time template argument met
 // in it, as the cut handed it over; none where they are all taken.
@@ -7586,8 +7613,9 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         // ever returns: its result is the staging's, kept as it runs.
         !(Callee->getIdentifier() && Callee->getName().starts_with("__cppsh_loop")) &&
         cppshInUserInput(*this, CE->getBeginLoc())) {
-      if (FunctionDecl *Cur = cppshNeedFunction(*this)) {
-        CppshCutNeeded = true; // its caller's body cut here too
+      if (FunctionDecl *Cur = cppshNeedFunction(*this);
+          Cur || cppshTopStatement(*this)) {
+        CppshCutNeeded = true; // a staged region's argument
         CppshCutNeedVar = nullptr;
         CppshCutNeedFunction = Cur;
         CppshCutStagedCalls.push_back(Call.get());

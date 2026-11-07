@@ -8721,6 +8721,9 @@ private:
   /// cppsh: in a region being parsed, the parameter each run-time template
   /// argument of its first statement is supplied by, by its location.
   llvm::DenseMap<SourceLocation::UIntTy, ParmVarDecl *> CppshRegionArgs;
+  /// cppsh: where the block a need may be met in opens (ParseStmt.cpp's), for
+  /// a top-level statement's.
+  static SourceLocation &CppshTopBodyOpen();
   /// cppsh: where the region being parsed begins in the recorded tokens.
   std::optional<unsigned> CppshRegionBegin;
   /// cppsh: in a region being parsed, the slot a break or continue of a loop

@@ -38,6 +38,12 @@
 
 using namespace clang;
 
+namespace clang {
+extern bool CppshCutNeeded;
+extern std::vector<Expr *> CppshCutNeedExprs;
+extern std::vector<Expr *> CppshCutStagedCalls;
+} // namespace clang
+
 //===----------------------------------------------------------------------===//
 // C99 6.7: Declarations.
 //===----------------------------------------------------------------------===//
@@ -5933,7 +5939,24 @@ Parser::DeclGroupPtrTy Parser::ParseTopLevelStmtDecl() {
   ParseScope FnScope(this, Scope::FnScope | Scope::DeclScope |
                                Scope::CompoundStmtScope);
   TopLevelStmtDecl *TLSD = Actions.ActOnStartTopLevelStmtDecl(getCurScope());
+  // cppsh: a need met in it -- a local of a block of it, a run-time template
+  // argument, a staged function's result -- makes a staged region, as in a
+  // function's body.
+  const SourceLocation CppshStmtBegin = Tok.getLocation();
+  const SourceLocation CppshSavedOpen = std::exchange(CppshTopBodyOpen(), CppshStmtBegin);
+  CppshCutNeeded = false;
+  CppshCutNeedExprs.clear();
+  CppshCutStagedCalls.clear();
   StmtResult R = ParseStatementOrDeclaration(Stmts, SubStmtCtx);
+  if (CppshCutNeeded) {
+    CppshCutNeeded = false;
+    StmtVector Region;
+    if (CppshEmitRegion(Region, R, CppshStmtBegin) && Region.size() == 1)
+      R = Region.front();
+    else
+      CppshRegionError(CppshStmtBegin);
+  }
+  CppshTopBodyOpen() = CppshSavedOpen;
   Actions.ActOnFinishTopLevelStmtDecl(TLSD, R.get());
   if (!R.isUsable()) {
     R = Actions.ActOnNullStmt(Tok.getLocation());

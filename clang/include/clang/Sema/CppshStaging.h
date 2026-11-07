@@ -64,6 +64,10 @@ bool cppshIsRegion(const FunctionDecl *FD);
 /// (a need, met as the body is parsed). None elsewhere: Sema meets those
 /// as the argument is checked.
 const VarDecl *cppshTemplateLocalIn(Sema &S, const Expr *E);
+
+/// Whether what is being parsed is in a top-level statement (the REPL's),
+/// outside any function: a need met there makes a staged region too.
+bool cppshInTopStatement(Sema &S);
 } // namespace clang
 
 #endif // LLVM_CLANG_SEMA_CPPSHSTAGING_H

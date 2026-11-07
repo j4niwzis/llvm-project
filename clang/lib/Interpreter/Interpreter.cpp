@@ -2201,32 +2201,6 @@ static std::vector<llvm::StringRef> cppshStatements(llvm::StringRef Code) {
   return Out;
 }
 
-// Whether a statement is a loop, an if, a switch or a block -- a statement no
-// declaration begins as -- after any spaces and comments.
-static bool cppshTopControl(llvm::StringRef Code) {
-  llvm::StringRef S = Code;
-  for (;;) {
-    S = S.ltrim();
-    if (S.starts_with("//")) {
-      size_t NL = S.find('\n');
-      S = NL == llvm::StringRef::npos ? llvm::StringRef() : S.drop_front(NL + 1);
-    } else if (S.starts_with("/*")) {
-      size_t End = S.find("*/");
-      S = End == llvm::StringRef::npos ? llvm::StringRef() : S.drop_front(End + 2);
-    } else {
-      break;
-    }
-  }
-  if (S.starts_with("{"))
-    return true;
-  for (llvm::StringRef W : {"while", "for", "do", "if", "switch"})
-    if (S.starts_with(W) && (S.size() == W.size() ||
-                             !(std::isalnum(static_cast<unsigned char>(S[W.size()])) ||
-                               S[W.size()] == '_')))
-      return true;
-  return false;
-}
-
 // Whether an input holds a preprocessor directive (a line beginning with
 // `#`): its statements are not split -- an #if may open in one and close in
 // another (the interpreter's own runtime prelude does).
@@ -2344,16 +2318,8 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
 
 // One statement as it is (ParseAndExecute: the rest of it).
 llvm::Error Interpreter::cppshParseAndExecuteOnce(llvm::StringRef Code, Value *V) {
-  // A top-level loop, if, switch or block: the body of a function of its
-  // own, called at once -- where a need in it (a value read at run time, a
-  // template argument of it) cuts as in any function: each iteration of a
-  // loop its own types.
-  if (!CppshNoProbe && cppshTopControl(Code)) {
-    static unsigned Tops = 0;
-    std::string Name = "__cppsh_top" + std::to_string(Tops++);
-    std::string Wrapped = "auto " + Name + "() {\n" + Code.str() + "\n}\n" + Name + "();";
-    return ParseAndExecute(Wrapped, V);
-  }
+  // (A top-level loop, if, switch or block needs no function around it: a
+  // need in it makes a staged region, as in a function's body.)
   // The input as staging rewrites it: a hoisted call replaced by its result.
   std::string Rewritten;
   for (;;) {

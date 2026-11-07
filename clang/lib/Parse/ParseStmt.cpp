@@ -1543,10 +1543,15 @@ static void cppshWrapSwitch(Sema &S, size_t OpenBefore, StmtResult &Res) {
 // Whether a block parsed in this scope may be cut: in the body of a function
 // (not a lambda): a loop a continuation runs on from its next step
 // (cppshWrapLoop), a switch it finishes the case of (cppshWrapSwitch).
+SourceLocation &Parser::CppshTopBodyOpen() { return CppshBodyOpen; }
+
 static bool cppshCutsIn(Sema &S, Scope *Sc) {
   FunctionDecl *FD = S.getCurFunctionDecl();
   FunctionDecl *Inner = S.getCurFunctionDecl(/*AllowLambda=*/true);
-  if (!FD || (Inner != FD && !cppshIsRegion(Inner)) || CppshBodyOpen.isInvalid())
+  // A top-level statement's blocks too: no function, a staged region alike.
+  const bool Top = !Inner && cppshInTopStatement(S);
+  if ((!FD && !Top) || (FD && Inner != FD && !cppshIsRegion(Inner)) ||
+      CppshBodyOpen.isInvalid())
     return false;
   while (Sc && !(Sc->getFlags() & Scope::FnScope))
     Sc = Sc->getParent();
@@ -1718,9 +1723,10 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
     return false;
   if (isa<DeclStmt>(R.get()))
     SkipUntil(tok::r_brace, StopBeforeMatch);
-  std::optional<unsigned> E = Tok.is(tok::eof) && CppshReplayEnd
-                                  ? CppshReplayEnd
-                                  : cppshTokenIndex(Tok.getLocation());
+  std::optional<unsigned> E =
+      !Tok.is(tok::eof) ? cppshTokenIndex(Tok.getLocation())
+      : CppshReplayEnd  ? CppshReplayEnd
+                        : std::optional<unsigned>(CppshInputTokens.size());
   if (!E || *E <= *B)
     return false;
   ArrayRef<Token> Toks = ArrayRef<Token>(CppshInputTokens).slice(*B, *E - *B);
@@ -2305,8 +2311,8 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
         LastIsError = false;
         continue;
       }
-      // In a region itself: no cut is made there.
-      if (cppshIsRegion(Actions.getCurFunctionDecl(/*AllowLambda=*/true))) {
+      // In a region itself, or a top-level statement: no cut is made there.
+      if (!FD || cppshIsRegion(Actions.getCurFunctionDecl(/*AllowLambda=*/true))) {
         CppshRegionError(CppshStmtBegin);
         SkipUntil(tok::r_brace, StopBeforeMatch);
         LastIsError = true;
