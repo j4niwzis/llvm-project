@@ -1697,6 +1697,25 @@ struct CppshBound {
 // Each time a staged function's result is kept: so that a staged statement
 // whose body left by a return knows whether code staged inside it kept one.
 unsigned CppshKeptResults = 0;
+
+// cppsh: a quiet attempt's diagnostics: counted, not shown -- the first
+// error's text kept (its location, its message), for the trace.
+namespace {
+struct CppshQuietConsumer : DiagnosticConsumer {
+  std::string First;
+  void HandleDiagnostic(DiagnosticsEngine::Level Level,
+                        const Diagnostic &Info) override {
+    DiagnosticConsumer::HandleDiagnostic(Level, Info);
+    if (Level < DiagnosticsEngine::Error || !First.empty())
+      return;
+    SmallString<128> Message;
+    Info.FormatDiagnostic(Message);
+    if (Info.hasSourceManager() && Info.getLocation().isValid())
+      First = Info.getLocation().printToString(Info.getSourceManager()) + ": ";
+    First += Message.str();
+  }
+};
+} // namespace
 } // namespace
 
 // A staged statement, reached as its function runs (CodeGen's
@@ -1861,9 +1880,16 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
       if (!cppshReport(Interp.cppshBeginBuild()))
         return Fail("no unit to compile it in");
       // A quiet attempt: its diagnostics counted (an error fails it), not
-      // shown.
+      // shown -- the first error kept, for the trace. Every attempt with its
+      // diagnostics live: no hold of a statement's left over (the reporting
+      // one would show nothing), none suppressed.
       DiagnosticsEngine &Diags = S.getDiagnostics();
-      IgnoringDiagConsumer Quiet;
+      cppshEndNeedDiagnostics(S);
+      const bool WasSuppressed = Diags.getSuppressAllDiagnostics();
+      Diags.setSuppressAllDiagnostics(false);
+      auto RestoreSuppressed = llvm::scope_exit(
+          [&] { Diags.setSuppressAllDiagnostics(WasSuppressed); });
+      CppshQuietConsumer Quiet;
       DiagnosticConsumer *const Client = Diags.getClient();
       const bool OwnsClient = Diags.ownsClient();
       std::unique_ptr<DiagnosticConsumer> OwnedClient;
@@ -2025,6 +2051,17 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
           Want.push_back(It->second);
           More = true;
         }
+      if (!F && !Report && cppshTraceStaging()) {
+        llvm::errs() << "cppsh-trace: attempt at "
+                     << SS->getBeginLoc().printToString(S.getSourceManager())
+                     << " failed: "
+                     << (Quiet.First.empty() ? std::string("no error")
+                                             : Quiet.First)
+                     << "; wanted:";
+        for (const VarDecl *VD : CppshStagedWanted)
+          llvm::errs() << " " << VD->getName();
+        llvm::errs() << "\n";
+      }
       if (F) {
         Interp.cppshAddBuilt(F);
         KeptType = Run.ReturnType;
