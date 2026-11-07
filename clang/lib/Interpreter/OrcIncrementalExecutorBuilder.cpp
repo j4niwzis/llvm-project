@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <cstdlib>
 #include "clang/Interpreter/OrcIncrementalExecutorBuilder.h"
 #include "OrcIncrementalExecutor.h"
 
@@ -142,12 +143,21 @@ OrcIncrementalExecutorBuilder::getHostJITTriple() const {
 
 static llvm::Expected<llvm::orc::JITTargetMachineBuilder>
 createJITTargetMachineBuilder(const llvm::Triple &TT) {
-  if (TT.getTriple() == llvm::sys::getProcessTriple())
-    // This fails immediately if the target backend is not registered
-    return llvm::orc::JITTargetMachineBuilder::detectHost();
-
-  // If the target backend is not registered, LLJITBuilder::create() will fail
-  return llvm::orc::JITTargetMachineBuilder(TT);
+  llvm::Expected<llvm::orc::JITTargetMachineBuilder> JTMB =
+      TT.getTriple() == llvm::sys::getProcessTriple()
+          // This fails immediately if the target backend is not registered
+          ? llvm::orc::JITTargetMachineBuilder::detectHost()
+          // If the target backend is not registered, LLJITBuilder::create()
+          // will fail
+          : llvm::Expected<llvm::orc::JITTargetMachineBuilder>(
+                llvm::orc::JITTargetMachineBuilder(TT));
+  // The backend at -O0 (FastISel, the fast register allocator), as the IR it
+  // is given is: the builder's default is the -O2 backend, which spent most
+  // of an input's JIT time on code that runs once. CLANG_REPL_JIT_OPT=1 for
+  // the optimizing one.
+  if (JTMB && !std::getenv("CLANG_REPL_JIT_OPT"))
+    JTMB->setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
+  return JTMB;
 }
 
 static llvm::Expected<std::unique_ptr<llvm::orc::LLJITBuilder>>
@@ -156,8 +166,10 @@ createDefaultJITBuilder(llvm::orc::JITTargetMachineBuilder JTMB) {
   JITBuilder->setJITTargetMachineBuilder(std::move(JTMB));
   JITBuilder->setPrePlatformSetup([](llvm::orc::LLJIT &J) {
     // Try to enable debugging of JIT'd code (only works with JITLink for
-    // ELF and MachO).
-    consumeError(llvm::orc::enableDebuggerSupport(J));
+    // ELF and MachO) -- where asked for (CLANG_REPL_JIT_DEBUG): it copies
+    // and registers every object linked, an input's worth of work each time.
+    if (std::getenv("CLANG_REPL_JIT_DEBUG"))
+      consumeError(llvm::orc::enableDebuggerSupport(J));
     return llvm::Error::success();
   });
   return std::move(JITBuilder);
