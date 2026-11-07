@@ -1558,7 +1558,28 @@ int main(int argc, const char **argv) {
     LE.setHintWatch([] { return hintFd(); }, [] { collectHint(); });
     LE.setPrompt(buildBashPrompt(LastFailed));
 
-    while (std::optional<std::string> Line = LE.readLine()) {
+    // Before each prompt, the jobs that ended or stopped reported, as bash
+    // does (`[1]+  Done  sleep 30`): std::sh's reaper, compiled once here and
+    // called through its address -- nothing compiled at each prompt.
+    void (*ReapJobs)() = nullptr;
+    if (!NoStdSh) {
+      if (llvm::Error Err = Interp->ParseAndExecute(
+              "extern \"C\" void __cppsh_reap_now() { std::sh::__cppsh_reap_jobs(); }"))
+        llvm::consumeError(std::move(Err));
+      else if (auto Addr = Interp->getSymbolAddressFromLinkerName("__cppsh_reap_now"))
+        ReapJobs = Addr->toPtr<void (*)()>();
+      else
+        llvm::consumeError(Addr.takeError());
+    }
+    auto readNext = [&] {
+      if (ReapJobs) {
+        ReapJobs();
+        std::fflush(nullptr);
+      }
+      return LE.readLine();
+    };
+
+    while (std::optional<std::string> Line = readNext()) {
       // The line entered: a hint still being worked out is for nothing now.
       cancelHint();
       // Ctrl+C (the LineEditor's "\x03"): what was typed, continued lines
