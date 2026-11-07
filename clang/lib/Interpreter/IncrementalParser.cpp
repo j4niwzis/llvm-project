@@ -108,9 +108,12 @@ llvm::Error IncrementalParser::TakeBackPTU(llvm::StringRef Why) {
     if (auto *ND = dyn_cast<NamedDecl>(D); ND && ND->getDeclName())
       Withdrawn.push_back(ND);
   if (cppshTraceStaging()) {
-    llvm::errs() << "cppsh-trace: unit taken back (" << Why << "), its names:";
-    for (NamedDecl *D : Withdrawn)
-      llvm::errs() << " " << D->getDeclName().getAsString();
+    llvm::errs() << "cppsh-trace: unit taken back (" << Why << "), its decls:";
+    for (Decl *D : TU->noload_decls()) {
+      llvm::errs() << " " << D->getDeclKindName();
+      if (auto *ND = dyn_cast<NamedDecl>(D))
+        llvm::errs() << ":" << ND->getDeclName().getAsString();
+    }
     llvm::errs() << "\n";
   }
   CleanUpPTU(TU);
@@ -299,10 +302,20 @@ IncrementalParser::ParseNextTopLevel(bool First, bool &Done) {
   const bool Staging =
       CppshTopNeed ||
       (CppshHoistBegin.isValid() && CppshHoistEnd.isValid() && !CppshInHoist);
-  if (cppshTraceStaging())
+  if (cppshTraceStaging()) {
     llvm::errs() << "cppsh-trace: top-level declaration "
-                 << (!ADecl ? "none" : Staging ? "held back" : "handed to code generation")
-                 << "\n";
+                 << (!ADecl ? "none" : Staging ? "held back" : "handed to code generation");
+    if (ADecl)
+      for (Decl *D : ADecl.get()) {
+        llvm::errs() << " [" << D->getDeclKindName();
+        if (auto *ND = dyn_cast<NamedDecl>(D))
+          llvm::errs() << " " << ND->getDeclName().getAsString();
+        if (D->getTranslationUnitDecl() != S.getASTContext().getTranslationUnitDecl())
+          llvm::errs() << ", of another unit";
+        llvm::errs() << "]";
+      }
+    llvm::errs() << "\n";
+  }
   if (ADecl && !Staging && !Consumer->HandleTopLevelDecl(ADecl.get()))
     return TakeBackPTU("Parsing failed. The consumer rejected a decl");
   return FinishPTU(LocalInstantiations, GlobalInstantiations);
