@@ -1662,7 +1662,12 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
           return Err;
       if (LastValue.isValid()) {
         if (!V) {
+          // What the input's own code wrote (stdio, buffered where the
+          // output is a pipe or a file) first, then the value (llvm::outs):
+          // otherwise the value came out before what was printed ahead of it.
+          std::fflush(nullptr);
           LastValue.dump();
+          llvm::outs().flush();
           LastValue.clear();
         } else
           *V = std::move(LastValue);

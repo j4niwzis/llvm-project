@@ -200,7 +200,12 @@ static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Cod
   clang::CppshBeforeChunk = [](clang::Interpreter &I, llvm::StringRef Piece) {
     snapshotNamed(I, Piece);
   };
-  return Interp.ParseAndExecute(Code);
+  llvm::Error Err = Interp.ParseAndExecute(Code);
+  // An input's output out before the next input runs, stdio's and LLVM's
+  // streams alike, in the order it was written.
+  std::fflush(nullptr);
+  llvm::outs().flush();
+  return Err;
 }
 
 // The type of the expression at the cursor, for the line editor's hint:
