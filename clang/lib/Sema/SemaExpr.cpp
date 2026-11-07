@@ -7595,6 +7595,10 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         CppshStageAt = CE->getBeginLoc(); // a top-level statement: hoisted
         CppshHoistBegin = CE->getBeginLoc();
         CppshHoistEnd = CE->getEndLoc();
+        // What the declaration gives without the call's result is not what
+        // it will be: its diagnostics held, as a need's are (the declaration
+        // is taken back and parsed again with the result).
+        cppshHoldDiagnostics(*this);
       }
     }
   if (LangOpts.CPlusPlus) {
