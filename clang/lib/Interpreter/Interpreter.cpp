@@ -1872,6 +1872,7 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
       }
       const size_t PendingBefore = S.PendingInstantiations.size();
       const size_t LocalPendingBefore = S.PendingLocalImplicitInstantiations.size();
+      const size_t SpecsBefore = cppshSpecializationMark();
       llvm::DenseMap<const VarDecl *, unsigned> IndexOf;
       CppshStagedWanted.clear();
       Sema::CppshStagedRun Run;
@@ -2031,7 +2032,9 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
         break;
       }
       // Not compiled: what it queued for instantiation dropped (each function
-      // so dropped queued again by its next use), the unit ended empty.
+      // so dropped queued again by its next use), the unit ended empty; the
+      // specializations on argument values it made forgotten.
+      cppshForgetSpecializationsSince(SpecsBefore);
       for (size_t I = PendingBefore; I < S.PendingInstantiations.size(); ++I)
         if (auto *FD = dyn_cast_or_null<FunctionDecl>(S.PendingInstantiations[I].first);
             FD && !FD->isDefined()) {

@@ -400,20 +400,6 @@ bool cppshMutates(const Stmt *S, const VarDecl *VD) {
   return false;
 }
 
-// The local an expression reads whose value exists only as the function being
-// written runs (cppsh): one of its own locals, outside a lambda, in a body the
-// user typed (or instantiated from one), not a parameter whose value is known
-// -- what a need is made of (a value-specialized call's argument, a template
-// argument). None where the expression reads no such local.
-bool cppshIsRegion(const FunctionDecl *FD) {
-  if (!FD)
-    return false;
-  for (const auto *A : FD->specific_attrs<AnnotateAttr>())
-    if (A->getAnnotation() == "cppsh.region")
-      return true;
-  return false;
-}
-
 // The function a need would be met in: the one being written -- a lambda's
 // call operator as any other (staged code of it compiled as it runs, as a
 // function's) -- not a template's body (cppshTemplateLocalIn's).
@@ -487,6 +473,11 @@ void cppshNeedForTemplateCall(Sema &S, Expr *Fn, ArrayRef<Expr *> Args) {
   }
 }
 
+// The local an expression reads whose value exists only as the function being
+// written runs (cppsh): one of its own locals, outside a lambda, in a body the
+// user typed (or instantiated from one), not a parameter whose value is known
+// -- what a need is made of (a value-specialized call's argument, a template
+// argument). None where the expression reads no such local.
 const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E) {
   if (!E)
     return nullptr;
@@ -8339,51 +8330,11 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
               return CallExpr::Create(Context, Fn, ArgExprs, Context.DependentTy,
                                       VK_PRValue, RParenLoc,
                                       CurFPFeatureOverrides());
-        // On demand: built as any call first (its diagnostics held back);
-        // only where that fails -- an instantiation needing a value its
-        // arguments have -- built again, with those values bound.
-        if (AnyValueCandidate && !CurContext->isDependentContext()) {
-          DiagnosticsEngine &Diags = getDiagnostics();
-          const bool WasSuppressed = Diags.getSuppressAllDiagnostics();
-          // What the statement has met so far: a need the probe meets (a
-          // run-time default template argument, a staged call inside) is the
-          // statement's -- met once, not again by a second build.
-          const bool HeldBefore = CppshNeedHolding;
-          const bool CutBefore = CppshCutNeeded, TopBefore = CppshTopNeed;
-          const size_t CutExprsBefore = CppshCutNeedExprs.size(),
-                       TopExprsBefore = CppshTopNeedExprs.size(),
-                       StagedCallsBefore = CppshCutStagedCalls.size();
-          const bool StageBefore = CppshStageAt.isValid();
-          Diags.setSuppressAllDiagnostics(true);
-          ExprResult Plain = BuildOverloadedCallExpr(
-              Scope, Fn, ULE, LParenLoc, ArgExprs, RParenLoc, ExecConfig,
-              /*AllowTypoCorrection=*/false, find.IsAddressOfOperand);
-          // A hold begun in the probe holds the statement's diagnostics: what
-          // it puts back is what they were before the probe, and it stays.
-          if (!HeldBefore && CppshNeedHolding)
-            CppshNeedWasSuppressed = WasSuppressed;
-          Diags.setSuppressAllDiagnostics(WasSuppressed || CppshNeedHolding);
-          if (CppshCutNeeded != CutBefore || CppshTopNeed != TopBefore ||
-              CppshCutNeedExprs.size() != CutExprsBefore ||
-              CppshTopNeedExprs.size() != TopExprsBefore ||
-              CppshCutStagedCalls.size() != StagedCallsBefore ||
-              CppshStageAt.isValid() != StageBefore)
-            // The statement is staged (or taken back) for it: this call as
-            // the probe built it, its diagnostics held with the statement's.
-            return Plain.isUsable()
-                       ? Plain
-                       : CreateRecoveryExpr(Fn->getBeginLoc(), RParenLoc, ArgExprs);
-          bool Fine = Plain.isUsable() && !Plain.get()->containsErrors();
-          if (Fine)
-            if (auto *CE = dyn_cast<CallExpr>(Plain.get()))
-              if (const FunctionDecl *Callee = CE->getDirectCallee())
-                Fine = !Callee->isInvalidDecl();
-          if (Fine)
-            return BuildOverloadedCallExpr(Scope, Fn, ULE, LParenLoc, ArgExprs,
-                                           RParenLoc, ExecConfig,
-                                           /*AllowTypoCorrection=*/true,
-                                           find.IsAddressOfOperand);
-        }
+        // Each argument's value bound to its parameter, where it is known:
+        // the specialization made tells itself apart by only the values its
+        // making reads (TemplateDeclInstantiator::VisitFunctionDecl) -- the
+        // others it takes at run time, one specialization for every value of
+        // them.
         for (NamedDecl *ND : ULE->decls()) {
           auto *FTD = dyn_cast<FunctionTemplateDecl>(ND->getUnderlyingDecl());
           if (!FTD)

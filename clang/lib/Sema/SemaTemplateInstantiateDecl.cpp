@@ -9,6 +9,7 @@
 //
 //===----------------------------------------------------------------------===/
 
+#include "clang/Sema/CppshStaging.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include <unordered_map>
@@ -3076,6 +3077,25 @@ struct CppshReadWindow {
 static std::unordered_multimap<unsigned, std::unique_ptr<CppshValueSpec>>
     CppshSpecializations;
 static llvm::DenseMap<const FunctionDecl *, CppshValueSpec *> CppshSpecOf;
+// In the order made (cppshForgetSpecializationsSince).
+static std::vector<CppshValueSpec *> CppshSpecLog;
+
+size_t clang::cppshSpecializationMark() { return CppshSpecLog.size(); }
+
+void clang::cppshForgetSpecializationsSince(size_t Mark) {
+  for (size_t I = Mark; I < CppshSpecLog.size(); ++I) {
+    CppshValueSpec *Spec = CppshSpecLog[I];
+    CppshSpecOf.erase(Spec->Function);
+    for (auto [It, End] = CppshSpecializations.equal_range(Spec->Head.computeHash());
+         It != End; ++It)
+      if (It->second.get() == Spec) {
+        CppshSpecializations.erase(It);
+        break;
+      }
+  }
+  if (CppshSpecLog.size() > Mark)
+    CppshSpecLog.resize(Mark);
+}
 
 Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     FunctionDecl *D, TemplateParameterList *TemplateParams,
@@ -3378,6 +3398,7 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
       Spec->Read.resize(CppshParams.size());
       CppshMade = Spec.get();
       CppshSpecOf[Function] = Spec.get();
+      CppshSpecLog.push_back(Spec.get());
       CppshSpecializations.emplace(CppshHead.computeHash(), std::move(Spec));
     }
   } else if (isFriend && D->isThisDeclarationADefinition()) {

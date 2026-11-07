@@ -52,11 +52,6 @@ void cppshRecordToken(const SourceManager &SM, const Token &T);
 /// Where the token at Loc is in CppshInputTokens; none where it is not one.
 std::optional<unsigned> cppshTokenIndex(SourceLocation Loc);
 
-/// Whether a function is a staged region's call operator (Parser::
-/// CppshEmitRegion): code whose types may depend on values that exist only as
-/// its function runs, a need met in it a region of its own.
-bool cppshIsRegion(const FunctionDecl *FD);
-
 /// In a template's body the user wrote, the local a value-dependent template
 /// argument names -- not a parameter, not a constant: a value that exists
 /// only as the function runs, whatever the template is instantiated with
@@ -88,6 +83,12 @@ void cppshEndNeedDiagnostics(Sema &S);
 /// Whether what is being parsed is in a top-level statement (the REPL's),
 /// outside any function: a need met there makes a staged region too.
 bool cppshInTopStatement(Sema &S);
+// The specializations on argument values made from here on: forgotten --
+// not found again -- if what made them failed (a quiet attempt of staged
+// code's): a body made without a value it needed may have failed short of
+// marking its function invalid.
+size_t cppshSpecializationMark();
+void cppshForgetSpecializationsSince(size_t Mark);
 } // namespace clang
 
 #endif // LLVM_CLANG_SEMA_CPPSHSTAGING_H
