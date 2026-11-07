@@ -101,6 +101,13 @@ llvm::Error IncrementalParser::TakeBackPTU(llvm::StringRef Why) {
   if (CodeGenerator *CG = Act->getCodeGen())
     CG->DiscardIncrementalUnit(TU, /*ThrowModuleAway=*/true);
   CleanUpPTU(TU);
+  // The translation-unit scope, and Sema's context, named the unit just
+  // withdrawn: the one now current, so that what is parsed or built next
+  // (a snapshot's unit before the next input) looks names up in a live one.
+  if (S.TUScope && S.TUScope == P->getCurScope()) {
+    S.CurContext = nullptr;
+    S.ActOnTranslationUnitScope(S.TUScope);
+  }
   DiagnosticsEngine &Diags = S.getDiagnostics();
   Diags.Reset(/*soft=*/true);
   Diags.getClient()->clear();
