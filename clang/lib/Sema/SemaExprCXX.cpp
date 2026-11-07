@@ -1303,6 +1303,21 @@ static void buildLambdaThisCaptureFixit(Sema &Sema, LambdaScopeInfo *LSI) {
 bool Sema::CheckCXXThisCapture(SourceLocation Loc, const bool Explicit,
     bool BuildAndDiagnose, const unsigned *const FunctionScopeIndexToStopAt,
     const bool ByCopy) {
+  // cppsh: in staged code compiled as its function runs, `this` is the
+  // variable holding that function's (CppshStagedThis): a lambda capturing
+  // `this` captures it -- by copy, a pointer as `this` is.
+  if (CurrentCppshStagedRun && CurrentCppshStagedRun->This &&
+      getFunctionLevelDeclContext() == CurrentCppshStagedRun->Function) {
+    if (BuildAndDiagnose) {
+      QualType CaptureType, DeclRefType;
+      tryCaptureVariable(CurrentCppshStagedRun->This, Loc,
+                         Explicit ? TryCaptureKind::ExplicitByVal
+                                  : TryCaptureKind::Implicit,
+                         SourceLocation(), /*BuildAndDiagnose=*/true,
+                         CaptureType, DeclRefType, FunctionScopeIndexToStopAt);
+    }
+    return false;
+  }
   // We don't need to capture this in an unevaluated context.
   if (isUnevaluatedContext() && !Explicit)
     return true;
