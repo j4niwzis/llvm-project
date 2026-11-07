@@ -1925,6 +1925,7 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
       const size_t PendingBefore = S.PendingInstantiations.size();
       const size_t LocalPendingBefore = S.PendingLocalImplicitInstantiations.size();
       const size_t SpecsBefore = cppshSpecializationMark();
+      const size_t UndefinedBefore = S.UndefinedButUsed.size();
       llvm::DenseMap<const VarDecl *, unsigned> IndexOf;
       CppshStagedWanted.clear();
       Sema::CppshStagedRun Run;
@@ -2106,6 +2107,9 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
       // so dropped queued again by its next use), the unit ended empty; the
       // specializations on argument values it made forgotten.
       cppshForgetSpecializationsSince(SpecsBefore);
+      // And what only it used, not defined: no warning of it.
+      while (S.UndefinedButUsed.size() > UndefinedBefore)
+        S.UndefinedButUsed.pop_back();
       for (size_t I = PendingBefore; I < S.PendingInstantiations.size(); ++I)
         if (auto *FD = dyn_cast_or_null<FunctionDecl>(S.PendingInstantiations[I].first);
             FD && !FD->isDefined()) {

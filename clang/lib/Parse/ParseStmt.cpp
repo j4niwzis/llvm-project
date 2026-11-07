@@ -1626,11 +1626,16 @@ void Parser::CppshRewind(unsigned Begin, unsigned End) {
 
 Parser::CppshPending Parser::CppshPendingNow() {
   return {Actions.PendingInstantiations.size(),
-          Actions.PendingLocalImplicitInstantiations.size()};
+          Actions.PendingLocalImplicitInstantiations.size(),
+          Actions.UndefinedButUsed.size()};
 }
 
 void Parser::CppshDropPendingSince(const CppshPending &Since) {
   CppshDropped.clear();
+  // What only the dropped parse used, not defined: no warning that it is
+  // not (what stays uses it again, if anything does).
+  while (Actions.UndefinedButUsed.size() > Since.UndefinedUsed)
+    Actions.UndefinedButUsed.pop_back();
   for (size_t I = Since.Global; I < Actions.PendingInstantiations.size(); ++I)
     CppshDropped.push_back({false, Actions.PendingInstantiations[I]});
   for (size_t I = Since.Local; I < Actions.PendingLocalImplicitInstantiations.size();

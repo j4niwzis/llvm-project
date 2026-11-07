@@ -8751,6 +8751,9 @@ private:
   /// (that parse is not kept).
   struct CppshPending {
     size_t Global = 0, Local = 0;
+    /// How many functions were used and not defined (Sema::UndefinedButUsed):
+    /// those a dropped first parse added were used by nothing that stays.
+    size_t UndefinedUsed = 0;
   };
   CppshPending CppshPendingNow();
   void CppshDropPendingSince(const CppshPending &Since);
