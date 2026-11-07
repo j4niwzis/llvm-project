@@ -1,4 +1,4 @@
-// RUN: printf '4\n3\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '4\n3\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // A run-time local as a template argument in a template's body -- a generic
 // lambda's, a function template's: the statement staged as the body is

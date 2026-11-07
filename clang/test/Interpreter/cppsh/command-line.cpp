@@ -1,4 +1,4 @@
-// RUN: cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // A line beginning with `$`: the rest of it run by the system shell, as it
 // is written -- its pipes, arithmetic and quoting the shell's.

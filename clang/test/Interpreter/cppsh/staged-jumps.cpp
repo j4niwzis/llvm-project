@@ -1,4 +1,4 @@
-// RUN: printf '3\n2\n5\n2\n2\n3\n4\n4\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '3\n2\n5\n2\n2\n3\n4\n4\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // A goto out of staged code, to a label of its function before it: the
 // function jumps there.

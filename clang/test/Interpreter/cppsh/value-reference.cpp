@@ -1,4 +1,4 @@
-// RUN: cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // A parameter taken by reference to const, specialized on its argument's
 // value as one taken by value is: the `if` on it folded, each branch's

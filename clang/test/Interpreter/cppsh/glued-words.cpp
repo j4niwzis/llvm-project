@@ -1,7 +1,7 @@
 // RUN: rm -rf %t && mkdir -p %t/bin %t/d/sub && touch %t/d/sub/notes.txt
 // RUN: printf '#!/bin/sh\necho "ran: $*"\n' > %t/bin/my-tool && chmod +x %t/bin/my-tool
 // RUN: cp %t/bin/my-tool %t/bin/llvm-lit
-// RUN: cd %t/d && env PATH=%t/bin:/usr/bin:/bin cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: cd %t/d && env PATH=%t/bin:/usr/bin:/bin cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // kebab-case: a '-' between two parts of a name is one name -- a command's
 // (my-tool) or an argument's (some-thing); paths and files one word each.

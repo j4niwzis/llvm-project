@@ -1,5 +1,5 @@
 // RUN: rm -rf %t && mkdir -p %t/d/sub && touch %t/d/a.txt
-// RUN: cd %t/d && printf '1\n0\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: cd %t/d && printf '1\n0\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // A need in a loop body: each iteration finished with its own value, the
 // loop run on by a plain function; one type per iteration. n changed in the

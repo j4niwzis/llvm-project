@@ -1,4 +1,4 @@
-// RUN: cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // A member function template specialized on its arguments' values as a free
 // one is: each value its own specialization, its own symbol.

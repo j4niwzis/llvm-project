@@ -1,4 +1,4 @@
-// RUN: printf '2\n3\n0\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '2\n3\n0\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // A value read at run time as a template argument, in a loop at the top
 // level: the loop the body of a function of its own, cut at the need, each

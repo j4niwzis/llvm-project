@@ -1,4 +1,4 @@
-// RUN: printf '3\n4\n5\n6\n1\n2\n3\n4\n5\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '3\n4\n5\n6\n1\n2\n3\n4\n5\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // Several staged calls in one statement: each staged function's result (of
 // a type known once it ran) a parameter of its own, in the order the calls

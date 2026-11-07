@@ -1,4 +1,4 @@
-// RUN: printf '3\n4\n5\n6\n7\n8\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '3\n4\n5\n6\n7\n8\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // A statement that needs a value read as its function runs, and declares
 // nothing: compiled with the value when it runs, against the function's own

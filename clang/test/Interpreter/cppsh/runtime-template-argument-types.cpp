@@ -1,4 +1,4 @@
-// RUN: printf '2.5\n3 4\n5\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '2.5\n3 4\n5\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // Run-time template arguments of types other than integers: evaluated once
 // where they are used, the rest compiled with their values.

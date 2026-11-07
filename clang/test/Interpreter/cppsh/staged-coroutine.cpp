@@ -1,4 +1,4 @@
-// RUN: printf '3\n5\n4\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '3\n5\n4\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // Staged code that yields from the coroutine it is in: compiled as a
 // coroutine of its own, its co_yield the outer generator's.

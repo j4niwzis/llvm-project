@@ -1,4 +1,4 @@
-// RUN: printf '41\n3\n7\n5\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '41\n3\n7\n5\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // A concise function of explicit template parameters, a parameter with a
 // default without parentheses, ^ for return.

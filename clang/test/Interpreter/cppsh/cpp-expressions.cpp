@@ -1,4 +1,4 @@
-// RUN: cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // Ordinary C++ expressions are C++, not commands with words: the shell's
 // call without parentheses (`ls -l`, `ls *.cpp`) never takes a value, a

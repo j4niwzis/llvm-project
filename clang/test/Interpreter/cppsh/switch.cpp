@@ -1,6 +1,6 @@
 // RUN: rm -rf %t && mkdir -p %t/d/sub && touch %t/d/a.txt
-// RUN: cd %t/d && printf '1\n' | cppsh %s 2>&1 | FileCheck %s --check-prefix=CASE --implicit-check-not=error:
-// RUN: cd %t/d && printf '2\n' | cppsh %s 2>&1 | FileCheck %s --check-prefix=DEFAULT --implicit-check-not=error:
+// RUN: cd %t/d && printf '1\n' | cppsh %s 2>&1 | FileCheck %s --check-prefix=CASE --implicit-check-not=error: --implicit-check-not=warning:
+// RUN: cd %t/d && printf '2\n' | cppsh %s 2>&1 | FileCheck %s --check-prefix=DEFAULT --implicit-check-not=error: --implicit-check-not=warning:
 
 // A cut in a switch: the rest of the case in do { } while (false), its labels
 // dropped; what follows the switch not appended after a rest that returns.

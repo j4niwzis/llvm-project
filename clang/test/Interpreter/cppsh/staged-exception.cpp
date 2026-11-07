@@ -1,4 +1,4 @@
-// RUN: printf '3\n2\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error:
+// RUN: printf '3\n2\n' | cppsh %s 2>&1 | FileCheck %s --implicit-check-not=error: --implicit-check-not=warning:
 
 // An exception thrown by staged code: through the code compiled for it,
 // into the function around it, and on to whoever catches it.
