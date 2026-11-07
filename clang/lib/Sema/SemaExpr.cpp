@@ -8336,6 +8336,9 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         // function it is a need of), a staged local.
         SmallVector<std::pair<const VarDecl *, FunctionDecl *>, 2> PendingNeeds;
         SmallVector<const VarDecl *, 2> PendingStaged;
+        // A global this same input defines, not run yet (where it is
+        // passed): the input staged there if the callee reads it.
+        SmallVector<std::pair<const VarDecl *, SourceLocation>, 2> PendingStage;
         // An argument whose value is not known yet (a template parameter's,
         // a staged parameter's in a staged statement) for a candidate that
         // would be specialized on it: the call's type may depend on that
@@ -8485,10 +8488,13 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                   // known now, nor its initializer's to be trusted (a read
                   // from std::cin may come between) -- the input is staged
                   // here, the rest compiled once what defines it has run.
+                  // Pending on it: staged there only if the callee reads it.
                   if (VD->hasGlobalStorage() &&
                       VD->getTranslationUnitDecl() == Context.getTranslationUnitDecl()) {
-                    if (!CppshStageAt.isValid())
-                      CppshStageAt = ArgE->getBeginLoc();
+                    if (!PatFD->getParamDecl(I)->getType()->isReferenceType()) {
+                      setPending(PatFD->getParamDecl(I), VD);
+                      PendingStage.push_back({VD, ArgE->getBeginLoc()});
+                    }
                     continue;
                   }
                   // A variable a statement already run defined: its value
@@ -8596,6 +8602,13 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         const bool StagedRead = llvm::any_of(PendingStaged, [](const VarDecl *V) {
           return CppshPendingReads.count(V) != 0;
         });
+        bool StageRead = false;
+        for (const auto &[Source, At] : PendingStage)
+          if (CppshPendingReads.count(Source)) {
+            StageRead = true;
+            if (!CppshStageAt.isValid())
+              CppshStageAt = At;
+          }
         CppshPendingReads.insert(SavedReads.begin(), SavedReads.end());
         for (auto &[P, Was] : llvm::reverse(SavedPending)) {
           if (Was)
@@ -8617,7 +8630,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
         }
         // A value read that was not there: what was made without it is no
         // specialization of anything -- forgotten.
-        if (NeedRead || StagedRead)
+        if (NeedRead || StagedRead || StageRead)
           cppshForgetSpecializationsSince(SpecsBefore);
         // This call needs what only running its function gives (cppsh): the
         // body is cut at its statement -- the call a recovery expression of
