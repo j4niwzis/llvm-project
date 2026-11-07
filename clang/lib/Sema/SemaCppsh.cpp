@@ -792,9 +792,15 @@ bool Sema::BuildCppshStagedSuspend(CppshStagedStmt *SS) {
                                             getCurScope(), false);
   if (Step.isNull())
     return false;
+  // Its braced list, as the parser makes one: what a list-initialization
+  // takes (the one InitListExpr, not its elements).
   Expr *StepArgs[] = {Ref(StateV), Ref(Promise)};
+  ExprResult StepList = ActOnInitList(Loc, StepArgs, Loc);
+  if (!StepList.isUsable())
+    return false;
+  Expr *StepInit[] = {StepList.get()};
   ExprResult StepE = BuildCXXTypeConstructExpr(C.getTrivialTypeSourceInfo(Step, Loc),
-                                               Loc, StepArgs, Loc,
+                                               Loc, StepInit, Loc,
                                                /*ListInitialization=*/true);
   ExprResult Await =
       StepE.isUsable() ? ActOnCoawaitExpr(getCurScope(), Loc, StepE.get()) : ExprError();
