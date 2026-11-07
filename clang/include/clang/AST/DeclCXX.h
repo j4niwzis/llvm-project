@@ -2166,6 +2166,7 @@ class CppshStagedDecl : public Decl, public DeclContext {
   unsigned NumParams = 0;
   TemplateTypeParmDecl *ResultType = nullptr;
   bool UsesThis = false;
+  bool Suspends = false;
   std::pair<SourceLocation, unsigned> *Supplies = nullptr;
   unsigned NumSupplies = 0;
 
@@ -2198,6 +2199,12 @@ public:
   /// Whether the statement uses `this`: its frame's last entry then.
   bool usesThis() const { return UsesThis; }
   void setUsesThis(bool V) { UsesThis = V; }
+
+  /// Whether its code suspends the coroutine it is in (co_await, co_yield,
+  /// co_return): compiled as a coroutine of its own, which the outer one
+  /// awaits (CppshStagedStmt::getSuspend).
+  bool suspends() const { return Suspends; }
+  void setSuspends(bool V) { Suspends = V; }
 
   /// The run-time template arguments the body uses: where each is (a
   /// default template argument's location, met implicitly as a template is

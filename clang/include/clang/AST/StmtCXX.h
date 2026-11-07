@@ -1141,7 +1141,8 @@ class CppshStagedStmt final
   unsigned NumEntries = 0;
   bool PrintsValue = false;
 
-  // Trailing: the body, then the frame.
+  // Trailing: the body, the frame, then what a coroutine runs it by (its
+  // step loop and how it left: getSuspend, getLeft).
   CppshStagedStmt(EmptyShell Empty, unsigned NumFrame)
       : Stmt(CppshStagedStmtClass, Empty), NumFrame(NumFrame) {}
   CppshStagedStmt(CppshStagedDecl *D, Stmt *Body, ArrayRef<Expr *> Frame,
@@ -1168,6 +1169,17 @@ public:
 
   Stmt *getBody() const { return getTrailingObjects()[0]; }
   void setBody(Stmt *S) { getTrailingObjects()[0] = S; }
+
+  /// In a coroutine, where its code suspends it: what the coroutine runs it
+  /// by -- awaiting its steps until it is done -- and how it left (an int).
+  Stmt *getSuspend() const { return getTrailingObjects()[1 + NumFrame]; }
+  Expr *getLeft() const {
+    return cast_or_null<Expr>(getTrailingObjects()[2 + NumFrame]);
+  }
+  void setSuspend(Stmt *S, Expr *Left) {
+    getTrailingObjects()[1 + NumFrame] = S;
+    getTrailingObjects()[2 + NumFrame] = Left;
+  }
 
   unsigned getNumFrame() const { return NumFrame; }
   ArrayRef<Expr *> frame() const {
@@ -1206,11 +1218,11 @@ public:
 
   child_range children() {
     Stmt **S = getTrailingObjects();
-    return child_range(S, S + 1 + NumFrame);
+    return child_range(S, S + 3 + NumFrame);
   }
   const_child_range children() const {
     Stmt *const *S = getTrailingObjects();
-    return const_child_range(S, S + 1 + NumFrame);
+    return const_child_range(S, S + 3 + NumFrame);
   }
 
   static bool classof(const Stmt *T) {

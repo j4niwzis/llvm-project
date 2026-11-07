@@ -16094,6 +16094,8 @@ public:
     SmallVector<VarDecl *, 8> Locals;
     Expr *StagedCall = nullptr;
     DeclContext *Outer = nullptr;
+    /// Whether its code suspends the coroutine it is in.
+    bool Suspends = false;
   };
   SmallVector<CppshStagedScope, 2> CppshStagedScopes;
 
@@ -16118,6 +16120,10 @@ public:
     /// What shows an expression's value (the interpreter's), for a body
     /// whose last statement's value is shown.
     llvm::function_ref<Expr *(Expr *)> PrintValue;
+    /// Compiled as a coroutine (code that suspends the one it is in): its
+    /// ways out co_returns, a co_return of its code the outer promise's.
+    bool Coroutine = false;
+    ParmVarDecl *OuterPromise = nullptr;
   };
   CppshStagedRun *CurrentCppshStagedRun = nullptr;
 
@@ -16174,6 +16180,10 @@ public:
 
   /// `this`, in a staged statement's body compiled as it runs.
   Expr *CppshStagedThis(SourceLocation Loc);
+
+  /// A staged statement in a coroutine whose code suspends it: what the
+  /// coroutine runs it by (CppshStagedStmt::setSuspend).
+  bool BuildCppshStagedSuspend(CppshStagedStmt *S);
 
   /// In a staged statement's body compiled as it runs, a case or default
   /// label of a switch around the statement (at Loc): the label of an entry.

@@ -1514,6 +1514,13 @@ CodeGenFunction::EmitCXXForRangeStmt(const CXXForRangeStmt &S,
 void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
   ArrayRef<Expr *> Frame = S.frame();
   llvm::PointerType *PtrTy = Builder.getPtrTy();
+  // In a coroutine whose code suspends it: run by awaiting its steps (built
+  // by Sema), how it left then read.
+  llvm::Value *Code = nullptr;
+  if (const Stmt *Suspend = S.getSuspend()) {
+    EmitStmt(Suspend);
+    Code = EmitScalarExpr(S.getLeft());
+  } else {
   // Where it is entered: 0 at its start; I + 1 at its I-th entry -- a label
   // in it a goto reaches, a case or default label of a switch around it.
   Address EntryAddr = CreateTempAlloca(Int32Ty, CharUnits::fromQuantity(4),
@@ -1598,11 +1605,12 @@ void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
   llvm::FunctionType *FnTy = llvm::FunctionType::get(
       Int32Ty, {PtrTy, PtrTy, PtrTy, Int32Ty}, /*isVarArg=*/false);
   llvm::FunctionCallee Run = CGM.CreateRuntimeFunction(FnTy, "__cppsh_staged_run");
-  llvm::Value *Code = EmitRuntimeCallOrInvoke(
+  Code = EmitRuntimeCallOrInvoke(
       Run,
       {Node, FrameAddr.emitRawPointer(*this), Slot,
        Builder.CreateLoad(EntryAddr, "cppsh.entered")},
       "cppsh.left");
+  }
   // In staged code compiled as it runs (a function of the interpreter's):
   // where the function around both returns its value is that function's
   // slot, and a way out of that code too is that function's leaving.
@@ -1642,7 +1650,9 @@ void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
   }
   if (S.leaves(CppshStagedStmt::LeavesByReturn))
     Leave(3, [&] {
-      if (InRun)
+      if (CurCoro.Data)
+        EmitCppshCoroutineFinalJump();
+      else if (InRun)
         LeaveRun(3);
       else
         EmitBranchThroughCleanup(ReturnBlock);

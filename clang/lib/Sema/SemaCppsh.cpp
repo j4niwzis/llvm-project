@@ -246,6 +246,11 @@ StmtResult Sema::ActOnFinishCppshStaged(CppshStagedDecl *SD, Stmt *Body,
   S->setGotoTargets(Context, Targets, SmallVector<int, 4>(Targets.size(), -1));
   S->setEntries(Context, cppshEntriesOf(Body));
   SD->setStagedStmt(S);
+  if (Info.Suspends) {
+    SD->setSuspends(true);
+    if (!BuildCppshStagedSuspend(S))
+      return StmtError();
+  }
   return S;
 }
 
@@ -347,6 +352,10 @@ StmtResult Sema::BuildCppshStagedExit(unsigned K, SourceLocation Loc,
   // instantiation; a nested statement's, as the one around it is
   // instantiated): leaving that one.
   if (CppshStagedScope *Info = getCppshStagedJumpScope()) {
+    if (Kind == CppshStagedExitStmt::Return && Info->Suspends) {
+      Info->Leaves |= CppshStagedStmt::LeavesByReturn;
+      return new (Context) CppshStagedExitStmt(Kind, Loc, Value, nullptr, nullptr);
+    }
     if (Kind == CppshStagedExitStmt::Return)
       return ActOnCppshStagedReturn(*Info, Loc, Value, /*CurScope=*/nullptr);
     Info->Leaves |= Kind == CppshStagedExitStmt::Break
@@ -362,8 +371,53 @@ StmtResult Sema::BuildCppshStagedExit(unsigned K, SourceLocation Loc,
   auto Leave = [&](unsigned Code) -> Stmt * {
     Expr *Lit = IntegerLiteral::Create(
         C, llvm::APInt(C.getIntWidth(C.IntTy), Code), C.IntTy, Loc);
+    if (Run->Coroutine) {
+      StmtResult R = BuildCoreturnStmt(Loc, Lit, /*IsImplicit=*/true);
+      return R.isUsable() ? R.get() : nullptr;
+    }
     return ReturnStmt::Create(C, Loc, Lit, /*NRVOCandidate=*/nullptr);
   };
+  // A co_return of the code, compiled as a coroutine: the outer coroutine's
+  // own -- its promise's return_value (or return_void) -- then the code's
+  // way out.
+  if (Kind == CppshStagedExitStmt::Return && Run->Coroutine) {
+    if (!Run->OuterPromise)
+      return StmtError();
+    ExprResult Ptr = DefaultLvalueConversion(BuildDeclRefExpr(
+        Run->OuterPromise, Run->OuterPromise->getType(), VK_LValue, Loc));
+    ExprResult Promise =
+        Ptr.isUsable() ? CreateBuiltinUnaryOp(Loc, UO_Deref, Ptr.get()) : ExprError();
+    if (!Promise.isUsable())
+      return StmtError();
+    const bool HasValue = Value && !Value->getType()->isVoidType();
+    CXXScopeSpec SS;
+    DeclarationNameInfo Name(
+        &PP.getIdentifierTable().get(HasValue ? "return_value" : "return_void"), Loc);
+    ExprResult Member = BuildMemberReferenceExpr(
+        Promise.get(), Promise.get()->getType(), Loc, /*IsArrow=*/false, SS,
+        SourceLocation(), nullptr, Name, nullptr, nullptr);
+    SmallVector<Expr *, 1> Args;
+    if (HasValue)
+      Args.push_back(Value);
+    ExprResult Call = Member.isUsable()
+                          ? BuildCallExpr(nullptr, Member.get(), Loc, Args, Loc)
+                          : ExprError();
+    if (Call.isUsable())
+      Call = ActOnFinishFullExpr(Call.get(), Loc, /*DiscardedValue=*/true);
+    Stmt *Out = Leave(Kind);
+    if (!Call.isUsable() || !Out)
+      return StmtError();
+    // A void expression co_returned: evaluated first.
+    if (Value && !HasValue) {
+      ExprResult V = ActOnFinishFullExpr(Value, Loc, /*DiscardedValue=*/true);
+      if (V.isUsable()) {
+        ExprResult Both = BuildBinOp(nullptr, Loc, BO_Comma, V.get(), Call.get());
+        if (Both.isUsable())
+          Call = Both;
+      }
+    }
+    return new (C) CppshStagedExitStmt(Kind, Loc, Call.get(), nullptr, Out);
+  }
   if (Kind != CppshStagedExitStmt::Return)
     return new (C) CppshStagedExitStmt(
         Kind, Loc, nullptr, nullptr,
@@ -444,10 +498,12 @@ Sema::ActOnStartCppshStagedInstantiation(CppshStagedDecl *Old,
     Params.push_back(P);
   }
   SD->setParameters(Context, Params);
+  SD->setSuspends(Old->suspends());
   CppshStagedScope Info;
   Info.Decl = SD;
   Info.KeepsResult = KeepsResult;
   Info.Outer = CurContext;
+  Info.Suspends = Old->suspends();
   CppshStagedScopes.push_back(std::move(Info));
   CurContext = SD;
   return SD;
@@ -479,6 +535,11 @@ StmtResult Sema::ActOnFinishCppshStagedInstantiation(
   S->setGotoTargets(Context, Targets, Propagate);
   S->setEntries(Context, cppshEntriesOf(Body.get()));
   SD->setStagedStmt(S);
+  if (SD->suspends() || Info.Suspends) {
+    SD->setSuspends(true);
+    if (!BuildCppshStagedSuspend(S))
+      return StmtError();
+  }
   return S;
 }
 
@@ -601,6 +662,166 @@ StmtResult Sema::ActOnCppshStagedEntry(SourceLocation Loc, Stmt *SubStmt) {
         Run->EntryLabels[I] = L;
   }
   return LS;
+}
+
+// std::sh's declaration of that name.
+static NamedDecl *cppshShDecl(Sema &S, StringRef Name) {
+  NamespaceDecl *Std = S.getStdNamespace();
+  if (!Std)
+    return nullptr;
+  LookupResult ShR(S, &S.PP.getIdentifierTable().get("sh"), SourceLocation(),
+                   Sema::LookupNamespaceName);
+  S.LookupQualifiedName(ShR, Std);
+  auto *Sh = ShR.getAsSingle<NamespaceDecl>();
+  if (!Sh)
+    return nullptr;
+  LookupResult R(S, &S.PP.getIdentifierTable().get(Name), SourceLocation(),
+                 Sema::LookupOrdinaryName);
+  S.LookupQualifiedName(R, Sh);
+  for (NamedDecl *D : R)
+    return D->getUnderlyingDecl();
+  return nullptr;
+}
+
+// In a coroutine: the code's frame, its state and how it left, and the loop
+// awaiting its steps --
+//   void *__cppsh_frame[] = {(void *)&local..., nullptr};
+//   std::sh::__cppsh_staged_state __cppsh_state{node, __cppsh_frame, 0};
+//   int __cppsh_left = -1;
+//   while ((__cppsh_left = co_await std::sh::__cppsh_staged_step<P>{
+//             __cppsh_state, <the promise>}) < 0) ;
+bool Sema::BuildCppshStagedSuspend(CppshStagedStmt *SS) {
+  ASTContext &C = Context;
+  const SourceLocation Loc = SS->getBeginLoc();
+  sema::FunctionScopeInfo *FSI = getCurFunction();
+  if (!FSI)
+    return false;
+  if (!FSI->CoroutinePromise &&
+      !ActOnCoroutineBodyStart(getCurScope(), Loc, "co_await"))
+    return false;
+  VarDecl *Promise = FSI->CoroutinePromise;
+  auto *StateD = dyn_cast_or_null<TypeDecl>(cppshShDecl(*this, "__cppsh_staged_state"));
+  auto *StepT = dyn_cast_or_null<ClassTemplateDecl>(cppshShDecl(*this, "__cppsh_staged_step"));
+  if (!Promise || !StateD || !StepT)
+    return false;
+  auto MakeVar = [&](llvm::StringRef Name, QualType T) {
+    auto *V = VarDecl::Create(C, CurContext, Loc, Loc, &PP.getIdentifierTable().get(Name),
+                              T, C.getTrivialTypeSourceInfo(T, Loc), SC_None);
+    V->setImplicit();
+    return V;
+  };
+  auto Ref = [&](VarDecl *V) {
+    return BuildDeclRefExpr(V, V->getType().getNonReferenceType(), VK_LValue, Loc);
+  };
+  auto VoidPtr = [&](Expr *E) -> Expr * {
+    ExprResult R = BuildCStyleCastExpr(Loc, C.getTrivialTypeSourceInfo(C.VoidPtrTy, Loc),
+                                       Loc, E);
+    return R.isUsable() ? R.get() : nullptr;
+  };
+  SmallVector<Stmt *, 4> Stmts;
+  // The frame: each local's address; `this`; a staged call made, no address.
+  SmallVector<Expr *, 8> Entries;
+  for (Expr *E : SS->frame()) {
+    Expr *Entry = nullptr;
+    if (E->isGLValue()) {
+      ExprResult Addr = CreateBuiltinUnaryOp(Loc, UO_AddrOf, E);
+      Entry = Addr.isUsable() ? VoidPtr(Addr.get()) : nullptr;
+    } else if (E->getType()->isPointerType()) {
+      Entry = VoidPtr(E);
+    } else {
+      ExprResult Null = ActOnCXXNullPtrLiteral(Loc);
+      ExprResult Both = Null.isUsable()
+                            ? BuildBinOp(nullptr, Loc, BO_Comma, E, VoidPtr(Null.get()))
+                            : ExprError();
+      Entry = Both.isUsable() ? Both.get() : nullptr;
+    }
+    if (!Entry)
+      return false;
+    Entries.push_back(Entry);
+  }
+  ExprResult Null = ActOnCXXNullPtrLiteral(Loc);
+  if (!Null.isUsable())
+    return false;
+  Entries.push_back(VoidPtr(Null.get()));
+  const QualType FrameT = C.getConstantArrayType(
+      C.VoidPtrTy, llvm::APInt(32, Entries.size()), nullptr,
+      ArraySizeModifier::Normal, 0);
+  VarDecl *FrameV = MakeVar("__cppsh_frame", FrameT);
+  ExprResult FrameInit = ActOnInitList(Loc, Entries, Loc);
+  if (!FrameInit.isUsable())
+    return false;
+  AddInitializerToDecl(FrameV, FrameInit.get(), /*DirectInit=*/false);
+  // The state: the statement itself (in this process), the frame, entered
+  // at its start.
+  VarDecl *StateV = MakeVar("__cppsh_state", C.getTypeDeclType(StateD));
+  Expr *Node = IntegerLiteral::Create(
+      C, llvm::APInt(64, reinterpret_cast<uintptr_t>(SS)), C.UnsignedLongLongTy, Loc);
+  ExprResult NodePtr = BuildCStyleCastExpr(
+      Loc, C.getTrivialTypeSourceInfo(C.getPointerType(C.VoidTy.withConst()), Loc), Loc,
+      Node);
+  if (!NodePtr.isUsable())
+    return false;
+  Expr *StateArgs[] = {NodePtr.get(), Ref(FrameV),
+                       IntegerLiteral::Create(C, llvm::APInt(C.getIntWidth(C.IntTy), 0),
+                                              C.IntTy, Loc)};
+  ExprResult StateInit = ActOnInitList(Loc, StateArgs, Loc);
+  if (!StateInit.isUsable())
+    return false;
+  AddInitializerToDecl(StateV, StateInit.get(), /*DirectInit=*/false);
+  VarDecl *LeftV = MakeVar("__cppsh_left", C.IntTy);
+  AddInitializerToDecl(
+      LeftV,
+      IntegerLiteral::Create(C, llvm::APInt(C.getIntWidth(C.IntTy), -1, true), C.IntTy, Loc),
+      /*DirectInit=*/false);
+  for (VarDecl *V : {FrameV, StateV, LeftV}) {
+    if (V->isInvalidDecl())
+      return false;
+    StmtResult DS = ActOnDeclStmt(ConvertDeclToDeclGroup(V), Loc, Loc);
+    if (!DS.isUsable())
+      return false;
+    Stmts.push_back(DS.get());
+  }
+  // The step: std::sh::__cppsh_staged_step<P>{state, promise}, awaited.
+  TemplateArgumentListInfo Args(Loc, Loc);
+  const QualType PromiseT = Promise->getType();
+  Args.addArgument(TemplateArgumentLoc(TemplateArgument(PromiseT),
+                                       C.getTrivialTypeSourceInfo(PromiseT, Loc)));
+  const QualType Step = CheckTemplateIdType(ElaboratedTypeKeyword::None,
+                                            TemplateName(StepT), Loc, Args,
+                                            getCurScope(), false);
+  if (Step.isNull())
+    return false;
+  Expr *StepArgs[] = {Ref(StateV), Ref(Promise)};
+  ExprResult StepE = BuildCXXTypeConstructExpr(C.getTrivialTypeSourceInfo(Step, Loc),
+                                               Loc, StepArgs, Loc,
+                                               /*ListInitialization=*/true);
+  ExprResult Await =
+      StepE.isUsable() ? ActOnCoawaitExpr(getCurScope(), Loc, StepE.get()) : ExprError();
+  ExprResult Assign = Await.isUsable()
+                          ? BuildBinOp(getCurScope(), Loc, BO_Assign, Ref(LeftV), Await.get())
+                          : ExprError();
+  ExprResult Less =
+      Assign.isUsable()
+          ? BuildBinOp(getCurScope(), Loc, BO_LT, Assign.get(),
+                       IntegerLiteral::Create(C, llvm::APInt(C.getIntWidth(C.IntTy), 0),
+                                              C.IntTy, Loc))
+          : ExprError();
+  ConditionResult Cond = Less.isUsable()
+                             ? ActOnCondition(getCurScope(), Loc, Less.get(),
+                                              ConditionKind::Boolean)
+                             : ConditionError();
+  if (Cond.isInvalid())
+    return false;
+  StmtResult Loop = ActOnWhileStmt(Loc, Loc, Cond, Loc, new (C) NullStmt(Loc));
+  if (!Loop.isUsable())
+    return false;
+  Stmts.push_back(Loop.get());
+  ExprResult Left = DefaultLvalueConversion(Ref(LeftV));
+  if (!Left.isUsable())
+    return false;
+  SS->setSuspend(CompoundStmt::Create(C, Stmts, FPOptionsOverride(), Loc, Loc),
+                 Left.get());
+  return true;
 }
 
 Expr *Sema::CppshStagedThis(SourceLocation Loc) {

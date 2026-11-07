@@ -1546,6 +1546,10 @@ static FunctionDecl *cppshDefineFunction(
   {
     Sema::SynthesizedFunctionScope Scope(S, FD);
     Body = MakeBody(FD, Params);
+    // A coroutine (its body co_awaits, co_returns): its body completed as
+    // one -- the promise, the suspends around it.
+    if (Body && S.getCurFunction() && S.getCurFunction()->isCoroutine())
+      S.CheckCompletedCoroutineBody(FD, Body);
     // An `auto` function that returns nothing returns void.
     if (Body && FD->getReturnType()->isUndeducedType())
       if (AutoType *AT = FD->getReturnType()->getContainedAutoType())
@@ -1707,7 +1711,11 @@ unsigned CppshKeptResults = 0;
 // storage of its type made for it, named by a global, __cppsh_resK, kept for
 // the function's caller.
 static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
-                          void *Slot, int Entry) {
+                          void *Slot, int Entry, void *OuterPromise = nullptr,
+                          void **HandleOut = nullptr) {
+  // Code that suspends the coroutine it is in: compiled as a coroutine, its
+  // handle handed back (HandleOut), not run here.
+  const bool Coro = HandleOut != nullptr;
   if (!CppshActiveInterpreter || !Staged || !Staged->getStagedDecl())
     return 0;
   Interpreter &Interp = *CppshActiveInterpreter;
@@ -1872,12 +1880,49 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
           Keep ? QualType() : Outer ? Outer->getReturnType() : Ctx.VoidTy;
       Run.AccessContext = Around;
       Run.Staged = SS;
+      Run.Coroutine = Coro;
+      // A coroutine's: std::sh::__cppsh_staged_coro<P>, P the outer
+      // coroutine's promise, taking that promise.
+      QualType FnResult = Ctx.IntTy;
+      QualType SecondParam = Ctx.VoidPtrTy;
+      if (Coro) {
+        auto *CoroBody =
+            dyn_cast_or_null<CoroutineBodyStmt>(Outer ? Outer->getBody() : nullptr);
+        if (!CoroBody || !CoroBody->getPromiseDecl())
+          return Fail("the coroutine it is in has no promise");
+        const QualType PromiseT = CoroBody->getPromiseDecl()->getType();
+        NamespaceDecl *Std = S.getStdNamespace();
+        LookupResult ShR(S, &Idents.get("sh"), Loc, Sema::LookupNamespaceName);
+        if (Std)
+          S.LookupQualifiedName(ShR, Std);
+        auto *Sh = ShR.getAsSingle<NamespaceDecl>();
+        LookupResult CoroR(S, &Idents.get("__cppsh_staged_coro"), Loc,
+                           Sema::LookupOrdinaryName);
+        if (Sh)
+          S.LookupQualifiedName(CoroR, Sh);
+        ClassTemplateDecl *CoroT = nullptr;
+        for (NamedDecl *D : CoroR)
+          if (auto *CTD = dyn_cast<ClassTemplateDecl>(D->getUnderlyingDecl()))
+            CoroT = CTD;
+        if (!CoroT)
+          return Fail("std::sh::__cppsh_staged_coro is not found");
+        TemplateArgumentListInfo Args(Loc, Loc);
+        Args.addArgument(TemplateArgumentLoc(
+            TemplateArgument(PromiseT), Ctx.getTrivialTypeSourceInfo(PromiseT, Loc)));
+        FnResult = S.CheckTemplateIdType(ElaboratedTypeKeyword::None,
+                                         TemplateName(CoroT), Loc, Args, nullptr,
+                                         /*ForNestedNameSpecifier=*/false);
+        if (FnResult.isNull())
+          return Fail("std::sh::__cppsh_staged_coro is not usable");
+        SecondParam = Ctx.getPointerType(PromiseT);
+      }
       F = cppshDefineFunction(
-          S, "__cppsh_staged" + std::to_string(Count++), Ctx.IntTy,
-          {VoidPtrPtr, Ctx.VoidPtrTy, Ctx.IntTy},
+          S, "__cppsh_staged" + std::to_string(Count++), FnResult,
+          {VoidPtrPtr, SecondParam, Ctx.IntTy},
           [&](FunctionDecl *Fn, ArrayRef<ParmVarDecl *> Ps) -> Stmt * {
             Run.Function = Fn;
-            Run.Slot = Ps[1];
+            Run.Slot = Coro ? nullptr : Ps[1];
+            Run.OuterPromise = Coro ? Ps[1] : nullptr;
             Run.Entry = Ps[2];
             Run.PrintValue = PrintValue;
             // Known to code generation: staged code inside it leaves through
@@ -1952,11 +1997,16 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
             if (!Inst.isUsable() || Diags.getNumErrors() != ErrorsBefore)
               return nullptr;
             Stmts.push_back(Inst.get());
-            Stmts.push_back(ReturnStmt::Create(
-                Ctx, Loc,
-                IntegerLiteral::Create(
-                    Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), 0), Ctx.IntTy, Loc),
-                nullptr));
+            Expr *Zero = IntegerLiteral::Create(
+                Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), 0), Ctx.IntTy, Loc);
+            if (Coro) {
+              StmtResult Done = S.BuildCoreturnStmt(Loc, Zero, /*IsImplicit=*/true);
+              if (!Done.isUsable())
+                return nullptr;
+              Stmts.push_back(Done.get());
+            } else {
+              Stmts.push_back(ReturnStmt::Create(Ctx, Loc, Zero, nullptr));
+            }
             return CompoundStmt::Create(Ctx, Stmts, FPOptionsOverride(), Loc, Loc);
           });
       if (!Report) {
@@ -2065,6 +2115,16 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
   if (SD->usesThis())
     Entries.push_back(Frame[N]);
   Entries.push_back(nullptr);
+  // A coroutine's: run later -- the outer coroutine's frame array (its own
+  // object, living as long as it does), updated in place.
+  if (Coro) {
+    auto *OuterFrame = const_cast<void **>(Frame);
+    for (unsigned I = 0; I < Entries.size(); ++I)
+      OuterFrame[I] = Entries[I];
+    using CoroFn = void *(*)(void *const *, void *, int);
+    *HandleOut = reinterpret_cast<CoroFn>(Found->Address)(Frame, OuterPromise, Entry);
+    return 0;
+  }
   using StagedFn = int (*)(void **, void *, int);
   const unsigned KeptBefore = CppshKeptResults;
   const int Left =
@@ -2084,6 +2144,18 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     ++CppshKeptResults;
   }
   return Left;
+}
+
+// The coroutine of staged code that suspends the coroutine it is in
+// (std::sh::__cppsh_staged_step): its handle, not started.
+extern "C" void *__cppsh_staged_coro_start(const void *Node, void *const *Frame,
+                                           void *OuterPromise, int Entry) {
+  if (!CppshActiveInterpreter)
+    return nullptr;
+  void *Handle = nullptr;
+  cppshRunStaged(static_cast<const CppshStagedStmt *>(Node), Frame, nullptr,
+                 Entry, OuterPromise, &Handle);
+  return Handle;
 }
 
 extern "C" int __cppsh_staged_run(const void *Node, void *const *Frame,

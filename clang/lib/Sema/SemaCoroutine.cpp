@@ -582,12 +582,11 @@ static FunctionScopeInfo *checkCoroutineContext(Sema &S, SourceLocation Loc,
   if (!isValidCoroutineContext(S, Loc, Keyword))
     return nullptr;
 
-  // cppsh: staged code is compiled into a function of its own, which cannot
-  // suspend the coroutine it is in.
-  if (S.getCppshStagedJumpScope()) {
-    S.Diag(Loc, diag::err_cppsh_staged_coroutine) << Keyword;
-    return nullptr;
-  }
+  // cppsh: staged code suspending the coroutine it is in: compiled as a
+  // coroutine of its own, which the outer one awaits (CppshStagedDecl::
+  // suspends); the outer one a coroutine all the same.
+  if (Sema::CppshStagedScope *Staged = S.getCppshStagedJumpScope())
+    Staged->Suspends = true;
 
   assert(S.CurContext->getEnclosingFunction() && "not in a function scope");
 
@@ -1044,6 +1043,20 @@ ExprResult Sema::BuildCoyieldExpr(SourceLocation Loc, Expr *E) {
 StmtResult Sema::ActOnCoreturnStmt(Scope *S, SourceLocation Loc, Expr *E) {
   if (!ActOnCoroutineBodyStart(S, Loc, "co_return")) {
     return StmtError();
+  }
+  // cppsh: a co_return from staged code: its way out (the outer promise's
+  // return_value as it is compiled).
+  if (CppshStagedScope *Staged = getCppshStagedJumpScope()) {
+    Staged->Suspends = true;
+    Staged->Leaves |= CppshStagedStmt::LeavesByReturn;
+    if (E) {
+      ExprResult R = ActOnFinishFullExpr(E, Loc, /*DiscardedValue=*/false);
+      if (R.isInvalid())
+        return StmtError();
+      E = R.get();
+    }
+    return new (Context)
+        CppshStagedExitStmt(CppshStagedExitStmt::Return, Loc, E, nullptr, nullptr);
   }
   return BuildCoreturnStmt(Loc, E);
 }

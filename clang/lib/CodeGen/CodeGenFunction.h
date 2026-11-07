@@ -3840,6 +3840,8 @@ public:
   void
   EmitCXXExpansionStmtInstantiation(const CXXExpansionStmtInstantiation &S);
   void EmitCppshStagedStmt(const CppshStagedStmt &S);
+  /// cppsh: to the coroutine's final suspend, its promise told already.
+  void EmitCppshCoroutineFinalJump();
   void EmitCppshStagedExitStmt(const CppshStagedExitStmt &S);
 
   /// Controls insertion of cancellation exit blocks in worksharing constructs.

@@ -92,6 +92,7 @@ __int128 __cppsh_modti3(__int128, __int128);
 #endif
 // A staged region, instantiated and run as its function runs (Interpreter.cpp).
 extern "C" int __cppsh_staged_run(const void *, void *const *, void *, int);
+extern "C" void *__cppsh_staged_coro_start(const void *, void *const *, void *, int);
 
 #if CLANG_HAVE_EMUTLS_GET_ADDRESS
 extern "C" void *__emutls_get_address(void *);
@@ -492,6 +493,8 @@ OrcIncrementalExecutorBuilder::createExecutor(llvm::orc::ThreadSafeContext &TSC,
       if (void *EmuTLSGetAddress = getEmuTLSGetAddressPtr())
         Add("__emutls_get_address", EmuTLSGetAddress);
       Add("__cppsh_staged_run", reinterpret_cast<void *>(&__cppsh_staged_run));
+      Add("__cppsh_staged_coro_start",
+          reinterpret_cast<void *>(&__cppsh_staged_coro_start));
 #if defined(__SIZEOF_INT128__)
       Add("__udivmodti4", reinterpret_cast<void *>(&__cppsh_udivmodti4));
       Add("__udivti3", reinterpret_cast<void *>(&__cppsh_udivti3));

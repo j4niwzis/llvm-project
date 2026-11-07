@@ -15,6 +15,8 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <coroutine>
+#include <exception>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -1832,6 +1834,161 @@ void __cppsh_snapshot(const T &v) {
   __cppsh_snapshots()[static_cast<const void *>(std::addressof(v))] = std::move(s);
 }
 
+
+// ---- Staged code in a coroutine (cppsh) -----------------------------------
+//
+// Staged code that suspends (co_await, co_yield, co_return) is compiled as
+// a coroutine of its own (__cppsh_staged_coro), started by the coroutine it
+// is in: that one co_awaits a step (__cppsh_staged_step) until the staged
+// code is done. What the staged code awaits, yields or returns is the outer
+// coroutine's to do, by its own promise: the inner promise hands each to it
+// (__cppsh_delegate), suspending the outer coroutine with the outer one's
+// awaiter -- its handle, as if the outer coroutine had awaited it itself.
+// Resumed, the outer coroutine's next step resumes the staged code where it
+// suspended; done, the staged code resumes the outer coroutine with how it
+// left (0: off its end; 1, 2: break, continue; 3: co_return, handed to the
+// outer promise already; 4 + I: a goto to its I-th label outside it).
+
+} // namespace sh
+} // namespace std
+
+// The interpreter's: the coroutine of the staged code at `node`, compiled
+// for the values at `frame` and the outer coroutine's promise -- its handle,
+// not started; null where it cannot be compiled.
+extern "C" void *__cppsh_staged_coro_start(const void *node, void *const *frame,
+                                           void *outer_promise, int entry);
+
+namespace std {
+namespace sh {
+
+// What the outer coroutine keeps of the staged code it runs.
+struct __cppsh_staged_state {
+  const void *node;
+  void *const *frame;
+  int entry;
+  std::coroutine_handle<> inner{};
+  int left = -1;
+  std::exception_ptr error{};
+};
+
+// The awaiter an awaitable gives co_await: its own operator co_await's, a
+// free one's, or itself.
+template <class A>
+decltype(auto) __cppsh_awaiter_of(A &&a) {
+  if constexpr (requires { std::forward<A>(a).operator co_await(); })
+    return std::forward<A>(a).operator co_await();
+  else if constexpr (requires { operator co_await(std::forward<A>(a)); })
+    return operator co_await(std::forward<A>(a));
+  else
+    return std::forward<A>(a);
+}
+
+// An awaiter of the outer coroutine's, awaited by the staged code: the outer
+// coroutine suspended with it (its handle, as the awaiter takes it), the
+// staged code suspended as long.
+template <class Outer, class Aw>
+struct __cppsh_delegate {
+  Aw aw;
+  std::coroutine_handle<Outer> outer;
+  bool await_ready() { return aw.await_ready(); }
+  std::coroutine_handle<> await_suspend(std::coroutine_handle<> self) {
+    using R = decltype(aw.await_suspend(outer));
+    if constexpr (std::is_void_v<R>) {
+      aw.await_suspend(outer);
+      return std::noop_coroutine();
+    } else if constexpr (std::is_same_v<R, bool>) {
+      if (aw.await_suspend(outer))
+        return std::noop_coroutine();
+      return self;
+    } else {
+      return aw.await_suspend(outer);
+    }
+  }
+  decltype(auto) await_resume() { return aw.await_resume(); }
+};
+template <class Outer, class Aw>
+__cppsh_delegate(Aw &&, std::coroutine_handle<Outer>) -> __cppsh_delegate<Outer, Aw>;
+
+// The staged code's coroutine: its promise hands what it awaits, yields and
+// returns to the outer coroutine's.
+template <class Outer>
+struct __cppsh_staged_coro {
+  struct promise_type {
+    Outer *outer = nullptr;
+    std::coroutine_handle<Outer> outer_handle{};
+    __cppsh_staged_state *state = nullptr;
+    __cppsh_staged_coro get_return_object() {
+      return {std::coroutine_handle<promise_type>::from_promise(*this)};
+    }
+    std::suspend_always initial_suspend() noexcept { return {}; }
+    struct final_awaiter {
+      bool await_ready() noexcept { return false; }
+      std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
+        return h.promise().outer_handle;
+      }
+      void await_resume() noexcept {}
+    };
+    final_awaiter final_suspend() noexcept { return {}; }
+    // How it left (co_return K: the compiler's, at each way out).
+    void return_value(int left) { state->left = left; }
+    void unhandled_exception() {
+      state->error = std::current_exception();
+      state->left = 0;
+    }
+    template <class A>
+    auto await_transform(A &&a) {
+      if constexpr (requires { outer->await_transform(std::forward<A>(a)); })
+        return __cppsh_delegate<Outer, decltype(__cppsh_awaiter_of(
+                                           outer->await_transform(std::forward<A>(a))))>{
+            __cppsh_awaiter_of(outer->await_transform(std::forward<A>(a))), outer_handle};
+      else
+        return __cppsh_delegate<Outer, decltype(__cppsh_awaiter_of(std::forward<A>(a)))>{
+            __cppsh_awaiter_of(std::forward<A>(a)), outer_handle};
+    }
+    template <class V>
+    auto yield_value(V &&v) {
+      return __cppsh_delegate<Outer, decltype(outer->yield_value(std::forward<V>(v)))>{
+          outer->yield_value(std::forward<V>(v)), outer_handle};
+    }
+  };
+  std::coroutine_handle<promise_type> handle;
+};
+
+// A step of the staged code, as the outer coroutine awaits it: started the
+// first time, resumed after; how it left once it is done (-1 till then).
+template <class Outer>
+struct __cppsh_staged_step {
+  __cppsh_staged_state &state;
+  Outer &promise;
+  bool await_ready() noexcept { return false; }
+  std::coroutine_handle<> await_suspend(std::coroutine_handle<Outer> outer) {
+    using Inner = typename __cppsh_staged_coro<Outer>::promise_type;
+    if (!state.inner) {
+      void *address = ::__cppsh_staged_coro_start(state.node, state.frame,
+                                                  std::addressof(promise), state.entry);
+      if (!address) {
+        state.left = 0;
+        return outer;
+      }
+      auto inner = std::coroutine_handle<Inner>::from_address(address);
+      inner.promise().outer = std::addressof(promise);
+      inner.promise().outer_handle = outer;
+      inner.promise().state = &state;
+      state.inner = inner;
+    }
+    return state.inner;
+  }
+  int await_resume() {
+    if (state.left < 0)
+      return -1;
+    if (state.inner)
+      state.inner.destroy();
+    state.inner = {};
+    if (state.error)
+      std::rethrow_exception(state.error);
+    return state.left;
+  }
+};
 
 } // namespace sh
 

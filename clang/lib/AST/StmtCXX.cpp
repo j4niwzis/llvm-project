@@ -301,6 +301,8 @@ CppshStagedStmt::CppshStagedStmt(CppshStagedDecl *D, Stmt *Body,
   S[0] = Body;
   for (unsigned I = 0; I < NumFrame; ++I)
     S[1 + I] = Frame[I];
+  S[1 + NumFrame] = nullptr;
+  S[2 + NumFrame] = nullptr;
 }
 
 CppshStagedStmt *CppshStagedStmt::Create(const ASTContext &C,
@@ -309,7 +311,7 @@ CppshStagedStmt *CppshStagedStmt::Create(const ASTContext &C,
                                          unsigned Leaves, bool KeepsResult,
                                          SourceLocation BeginLoc,
                                          SourceLocation EndLoc) {
-  void *Mem = C.Allocate(totalSizeToAlloc<Stmt *>(1 + Frame.size()),
+  void *Mem = C.Allocate(totalSizeToAlloc<Stmt *>(3 + Frame.size()),
                          alignof(CppshStagedStmt));
   return new (Mem) CppshStagedStmt(D, Body, Frame, Leaves, KeepsResult,
                                    BeginLoc, EndLoc);
@@ -317,10 +319,10 @@ CppshStagedStmt *CppshStagedStmt::Create(const ASTContext &C,
 
 CppshStagedStmt *CppshStagedStmt::CreateEmpty(const ASTContext &C,
                                               unsigned NumFrame) {
-  void *Mem = C.Allocate(totalSizeToAlloc<Stmt *>(1 + NumFrame),
+  void *Mem = C.Allocate(totalSizeToAlloc<Stmt *>(3 + NumFrame),
                          alignof(CppshStagedStmt));
   auto *S = new (Mem) CppshStagedStmt(EmptyShell(), NumFrame);
-  for (unsigned I = 0; I <= NumFrame; ++I)
+  for (unsigned I = 0; I < 3 + NumFrame; ++I)
     S->getTrailingObjects()[I] = nullptr;
   return S;
 }
