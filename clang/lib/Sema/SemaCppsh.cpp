@@ -342,7 +342,7 @@ StmtResult Sema::InstantiateCppshStaged(CppshStagedStmt *S,
   CppshStagedRun *SavedRun = std::exchange(CurrentCppshStagedRun, &Run);
   SmallVector<CppshStagedScope, 2> SavedScopes = std::move(CppshStagedScopes);
   CppshStagedScopes.clear();
-  auto Restore = llvm::make_scope_exit([&] {
+  auto Restore = llvm::scope_exit([&] {
     CurrentCppshStagedRun = SavedRun;
     CppshStagedScopes = std::move(SavedScopes);
   });

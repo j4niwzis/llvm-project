@@ -1801,7 +1801,7 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
   auto *Outer = dyn_cast<FunctionDecl>(Around);
 
   const bool WasNeeded = std::exchange(CppshCutNeeded, false);
-  auto RestoreNeeded = llvm::make_scope_exit([&] { CppshCutNeeded = WasNeeded; });
+  auto RestoreNeeded = llvm::scope_exit([&] { CppshCutNeeded = WasNeeded; });
   if (!Found || Keep) {
     if (!cppshReport(Interp.cppshBeginBuild()))
       return Fail("no unit to compile it in");
