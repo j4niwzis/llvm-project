@@ -1488,20 +1488,21 @@ llvm::Error Interpreter::cppshSnapshot(ArrayRef<VarDecl *> Vars) {
     return Err;
   {
     for (VarDecl *G : Vars) {
-      TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(S.TUScope);
+      // Each in a top-level statement's own scope, as the parser makes one
+      // (cppshRunTokens).
+      Parser &P = cppshParser();
+      P.EnterScope(Scope::FnScope | Scope::DeclScope | Scope::CompoundStmtScope);
+      TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(P.getCurScope());
       Expr *Ref = S.BuildDeclRefExpr(G, G->getType().getNonReferenceType(),
                                      VK_LValue, Loc);
-      ExprResult Call = S.BuildCallExpr(S.TUScope, Snap.get(), Loc, Ref, Loc);
+      ExprResult Call = S.BuildCallExpr(P.getCurScope(), Snap.get(), Loc, Ref, Loc);
       ExprResult Full = Call.isUsable()
                             ? S.ActOnFinishFullExpr(Call.get(), /*DiscardedValue=*/true)
                             : ExprError();
       S.ActOnFinishTopLevelStmtDecl(
           Stmt, Full.isUsable() ? static_cast<clang::Stmt *>(Full.get())
                                 : new (Ctx) NullStmt(Loc));
-      // ActOnStartTopLevelStmtDecl made the statement the scope's entity
-      // (as the parser's own scope for it would be); the translation unit's
-      // scope names the translation unit again.
-      S.TUScope->setEntity(Ctx.getTranslationUnitDecl());
+      P.ExitScope();
       Interp.cppshAddBuilt(Stmt);
     }
   }
@@ -2187,8 +2188,14 @@ static VarDecl *cppshRunTokens(Interpreter &Interp, unsigned Begin, unsigned End
   VarDecl *Value = nullptr;
   ExprResult E;
   {
-    TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(S.TUScope);
-    E = Interp.cppshParser().CppshParseTokens(Begin, End);
+    // A top-level statement's own scope, as the parser makes one
+    // (Parser::ParseTopLevelStmtDecl): its declaration context the scope's,
+    // the translation unit's scope around it, where unqualified lookup ends
+    // (made the statement's own context, lookup would walk past it).
+    Parser &P = Interp.cppshParser();
+    P.EnterScope(Scope::FnScope | Scope::DeclScope | Scope::CompoundStmtScope);
+    TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(P.getCurScope());
+    E = P.CppshParseTokens(Begin, End);
     // A staged call in it is run here, as it is: no need of anything.
     CppshCutNeeded = false;
     CppshCutStagedCalls.clear();
@@ -2199,7 +2206,7 @@ static VarDecl *cppshRunTokens(Interpreter &Interp, unsigned Begin, unsigned End
     S.ActOnFinishTopLevelStmtDecl(
         Stmt, Full.isUsable() ? static_cast<clang::Stmt *>(Full.get())
                               : new (Ctx) NullStmt(Loc));
-    S.TUScope->setEntity(Ctx.getTranslationUnitDecl());
+    P.ExitScope();
     Interp.cppshAddBuilt(Stmt);
   }
   if (Keep && E.isUsable()) {
