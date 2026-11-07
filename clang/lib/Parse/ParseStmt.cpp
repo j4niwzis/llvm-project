@@ -1236,7 +1236,7 @@ SmallVector<VarDecl *, 8> Parser::CppshLiveLocals(SourceLocation Loc) {
     // A lambda's body: the enclosing function's locals too -- what the
     // lambda captures of them, which the frame names as the lambda does.
     if (Sc->getFlags() & Scope::FnScope) {
-      auto *DC = dyn_cast_or_null<DeclContext>(Sc->getEntity());
+      auto *DC = Sc->getEntity();
       if (!DC || !isLambdaCallOperator(DC))
         break;
     }
