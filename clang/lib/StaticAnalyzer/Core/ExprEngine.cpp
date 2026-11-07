@@ -1873,6 +1873,8 @@ void ExprEngine::Visit(const Stmt *S, ExplodedNode *Pred,
     case Stmt::CXXExpansionStmtPatternClass:
     case Stmt::CXXExpansionStmtInstantiationClass:
     case Stmt::CXXExpansionSelectExprClass:
+    case Stmt::CppshStagedStmtClass:
+    case Stmt::CppshStagedExitStmtClass:
     case Stmt::OMPCanonicalLoopClass:
     case Stmt::OMPParallelDirectiveClass:
     case Stmt::OMPSimdDirectiveClass:

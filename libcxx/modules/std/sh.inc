@@ -33,10 +33,6 @@ export namespace std {
     using std::sh::fs_entry;
     using std::sh::is_dir;
     using std::sh::__cppsh_snapshot;
-    using std::sh::staged;
-    using std::sh::__cppsh_region;
-    using std::sh::__cppsh_region_staged;
-    using std::sh::__cppsh_region_tag;
     using std::sh::__cppsh_ask;
     using std::sh::__cppsh_variant_get;
     using std::sh::__cppsh_background;

@@ -1485,6 +1485,9 @@ enum DeclCode {
   /// A C++ expansion statement.
   DECL_EXPANSION_STMT,
 
+  /// A CppshStagedDecl record.
+  DECL_CPPSH_STAGED,
+
   /// A record containing CXXBaseSpecifiers.
   DECL_CXX_BASE_SPECIFIERS,
 
@@ -1872,6 +1875,12 @@ enum StmtCode {
 
   /// A CXXExpansionInstantiationStmt.
   STMT_CXX_EXPANSION_INSTANTIATION,
+
+  /// A CppshStagedStmt record.
+  STMT_CPPSH_STAGED,
+
+  /// A CppshStagedExitStmt record.
+  STMT_CPPSH_STAGED_EXIT,
 
   /// A CXXOperatorCallExpr record.
   EXPR_CXX_OPERATOR_CALL,

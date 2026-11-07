@@ -380,6 +380,17 @@ void StmtProfiler::VisitCXXExpansionStmtInstantiation(
   ID.AddBoolean(S->shouldApplyLifetimeExtensionToPreamble());
 }
 
+void StmtProfiler::VisitCppshStagedStmt(const CppshStagedStmt *S) {
+  VisitStmt(S);
+  ID.AddInteger(S->getLeaves());
+  ID.AddBoolean(S->keepsResult());
+}
+
+void StmtProfiler::VisitCppshStagedExitStmt(const CppshStagedExitStmt *S) {
+  VisitStmt(S);
+  ID.AddInteger(S->getKind());
+}
+
 void StmtProfiler::VisitMSDependentExistsStmt(const MSDependentExistsStmt *S) {
   VisitStmt(S);
   ID.AddBoolean(S->isIfExists());

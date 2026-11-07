@@ -2448,6 +2448,19 @@ CFGBlock *CFGBuilder::Visit(Stmt * S, AddStmtChoice asc,
     case Stmt::CXXForRangeStmtClass:
       return VisitCXXForRangeStmt(cast<CXXForRangeStmt>(S));
 
+    case Stmt::CppshStagedStmtClass: {
+      // cppsh: its body is compiled as it runs; here, what it is handed --
+      // its frame -- evaluated in order.
+      auto *SS = cast<CppshStagedStmt>(S);
+      autoCreateBlock();
+      appendStmt(Block, SS);
+      CFGBlock *B = Block;
+      for (Expr *E : llvm::reverse(SS->frame()))
+        if (E)
+          B = Visit(E);
+      return B;
+    }
+
     case Stmt::DeclStmtClass:
       return VisitDeclStmt(cast<DeclStmt>(S));
 

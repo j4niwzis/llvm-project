@@ -477,6 +477,32 @@ void StmtPrinter::VisitCXXExpansionStmtInstantiation(
   llvm_unreachable("should never be printed");
 }
 
+// cppsh: a staged statement prints as the code it stages.
+void StmtPrinter::VisitCppshStagedStmt(CppshStagedStmt *Node) {
+  PrintStmt(Node->getBody());
+}
+
+void StmtPrinter::VisitCppshStagedExitStmt(CppshStagedExitStmt *Node) {
+  switch (Node->getKind()) {
+  case CppshStagedExitStmt::Break:
+    Indent() << "break;";
+    break;
+  case CppshStagedExitStmt::Continue:
+    Indent() << "continue;";
+    break;
+  case CppshStagedExitStmt::Return:
+    Indent() << "return";
+    if (Node->getValue()) {
+      OS << " ";
+      PrintExpr(Node->getValue());
+    }
+    OS << ";";
+    break;
+  }
+  if (Policy.IncludeNewlines)
+    OS << NL;
+}
+
 void StmtPrinter::VisitCXXExpansionSelectExpr(CXXExpansionSelectExpr *Node) {
   PrintExpr(Node->getRangeExpr());
 }

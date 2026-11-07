@@ -75,6 +75,17 @@ static CXXRecordDecl *FindDeclaringClass(NamedDecl *D) {
   return DeclaringClass;
 }
 
+// cppsh: code of a staged statement, compiled as its function runs (into a
+// function of its own), has the access of the function it is written in.
+static DeclContext *cppshAccessContext(Sema &S, DeclContext *DC) {
+  if (Sema::CppshStagedRun *Run = S.CurrentCppshStagedRun)
+    if (Run->Function && Run->AccessContext)
+      for (DeclContext *P = DC; P; P = P->getParent())
+        if (P == Run->Function)
+          return Run->AccessContext;
+  return DC;
+}
+
 namespace {
 struct EffectiveContext {
   EffectiveContext() : Inner(nullptr), Dependent(false) {}
@@ -2071,7 +2082,7 @@ static Sema::AccessResult CheckAccess(Sema &S, SourceLocation Loc,
     }
   }
 
-  EffectiveContext EC(S.CurContext);
+  EffectiveContext EC(cppshAccessContext(S, S.CurContext));
   switch (CheckEffectiveAccess(S, EC, Loc, Entity)) {
   case AR_accessible: return Sema::AR_accessible;
   case AR_inaccessible: return Sema::AR_inaccessible;
@@ -2426,7 +2437,7 @@ Sema::AccessResult Sema::CheckFriendAccess(NamedDecl *target) {
 
   // We need to bypass delayed-diagnostics because we might be called
   // while the ParsingDeclarator is active.
-  EffectiveContext EC(CurContext);
+  EffectiveContext EC(cppshAccessContext(*this, CurContext));
   switch (CheckEffectiveAccess(*this, EC, target->getLocation(), entity)) {
   case ::AR_accessible: return Sema::AR_accessible;
   case ::AR_inaccessible: return Sema::AR_inaccessible;
@@ -2522,7 +2533,7 @@ bool Sema::IsSimplyAccessible(NamedDecl *Target, CXXRecordDecl *NamingClass,
     // Decl->getAccess()) when calculating the access.
     AccessTarget Entity(Context, AccessedEntity::Member, NamingClass,
                         DeclAccessPair::make(Target, AS_none), BaseType);
-    EffectiveContext EC(CurContext);
+    EffectiveContext EC(cppshAccessContext(*this, CurContext));
     return ::IsAccessible(*this, EC, Entity, /*FailedTSC=*/nullptr) !=
            ::AR_inaccessible;
   }

@@ -771,8 +771,7 @@ Decl *Parser::ParseConciseForwarder(IdentifierInfo *Name, SourceLocation Loc,
     Forward.Template = Template;
     Forward.Name = Name;
     Forward.Loc = CutLoc;
-    std::vector<CppshCutLocal> Frame;
-    SmallVector<Expr *, 4> Values;
+    SmallVector<VarDecl *, 4> Locals;
     bool Ok = true;
     for (ConciseForwardArg &A : Args) {
       if (A.IsType) {
@@ -838,11 +837,9 @@ Decl *Parser::ParseConciseForwarder(IdentifierInfo *Name, SourceLocation Loc,
       TemplateArgs.addArgument(TemplateArgumentLoc(
           TemplateArgument(Ref, /*IsCanonical=*/false), Ref));
       Forward.Args.push_back({false, QualType(), A.II});
-      Frame.push_back({A.II, V->getType().getNonReferenceType(), false, /*ByRef=*/true});
-      Values.push_back(Actions.BuildDeclRefExpr(V, V->getType().getNonReferenceType(),
-                                                VK_LValue, A.Loc));
+      Locals.push_back(V);
     }
-    if (Ok && Frame.empty()) {
+    if (Ok && Locals.empty()) {
       // Types alone: nothing to wait for -- return Name<T...>();
       LookupResult R(Actions, DeclarationNameInfo(Name, Loc),
                      Sema::LookupOrdinaryName);
@@ -861,12 +858,10 @@ Decl *Parser::ParseConciseForwarder(IdentifierInfo *Name, SourceLocation Loc,
                            : StmtError();
       if (Ret.isUsable())
         Stmts.push_back(Ret.get());
-    } else if (Ok &&
-               !CppshReturnStagedRegion(
-                   Stmts, Loc,
-                   ParseCppshRegionLambda(Frame, {}, 0, 0, CppshRegionBody::Forward,
-                                          &Forward),
-                   Values)) {
+    } else if (Ok && !CppshStageRest(Stmts, CutLoc, CutLoc, Locals, {}, nullptr,
+                                     std::nullopt, [&](StmtVector &Body) {
+                                       CppshBuildForwardCall(Forward, Body);
+                                     })) {
       CppshRegionError(Loc);
     }
     Body = Actions.ActOnCompoundStmt(Loc, Loc, Stmts, /*isStmtExpr=*/false);

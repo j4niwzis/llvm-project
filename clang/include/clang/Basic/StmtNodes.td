@@ -65,6 +65,10 @@ def CXXExpansionStmtPattern : StmtNode<Stmt>;
 def CXXExpansionStmtInstantiation
     : StmtNode<Stmt>; // *Not* derived from CXXExpansionStmtPattern!
 
+// cppsh staged statements
+def CppshStagedStmt : StmtNode<Stmt>;
+def CppshStagedExitStmt : StmtNode<Stmt>;
+
 // Expressions
 def Expr : StmtNode<ValueStmt, 1>;
 def PredefinedExpr : StmtNode<Expr>;

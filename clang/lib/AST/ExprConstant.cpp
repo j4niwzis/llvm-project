@@ -86,11 +86,11 @@ namespace clang {
 // plain data (a std::string, a container): an expression that rebuilds the
 // value, evaluated where the parameter is read -- into a temporary of that
 // evaluation, so what it allocates is freed as the evaluation ends.
-llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
+llvm::DenseMap<const VarDecl *, const Expr *> CppshParamRebuild;
 // And those whose argument is a value: that value. Kept here rather than in
 // the parameter's Init, which holds its default argument -- uninstantiated,
 // on a specialization, until a call needs it.
-llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
+llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
 } // namespace clang
 using llvm::APFixedPoint;
 using llvm::APInt;
@@ -9827,7 +9827,9 @@ bool LValueExprEvaluator::VisitVarDecl(const Expr *E, const VarDecl *VD) {
   // taking its function's locals by reference): bound, as it is evaluated,
   // to an object holding the value it was specialized on -- or rebuilt from
   // the snapshot of what it refers to.
-  if (const auto *PVD = dyn_cast<ParmVarDecl>(VD); PVD && !Frame) {
+  // And a staged statement's local, compiled with the value it has as the
+  // statement runs (a reference to the function's object).
+  if (const VarDecl *PVD = VD; !Frame) {
     const QualType T = VD->getType().getNonReferenceType();
     if (auto Known = CppshParamValue.find(PVD); Known != CppshParamValue.end()) {
       APValue &Slot = Info.CurrentCall->createTemporary(

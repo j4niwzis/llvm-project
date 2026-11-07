@@ -1193,27 +1193,6 @@ static bool cppshCutsIn(Sema &S, Scope *Sc) {
   return Sc != nullptr;
 }
 
-// std::sh's function of that name, looked up from the parser.
-static ExprResult cppshShFunction(Sema &Actions, Preprocessor &PP, StringRef Name,
-                                  SourceLocation Loc) {
-  NamespaceDecl *Std = Actions.getStdNamespace();
-  if (!Std)
-    return ExprError();
-  LookupResult ShR(Actions, &PP.getIdentifierTable().get("sh"), Loc,
-                   Sema::LookupNamespaceName);
-  Actions.LookupQualifiedName(ShR, Std);
-  auto *Sh = ShR.getAsSingle<NamespaceDecl>();
-  if (!Sh)
-    return ExprError();
-  LookupResult R(Actions, &PP.getIdentifierTable().get(Name), Loc,
-                 Sema::LookupOrdinaryName);
-  Actions.LookupQualifiedName(R, Sh);
-  if (R.empty())
-    return ExprError();
-  CXXScopeSpec SS;
-  return Actions.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
-}
-
 // The tokens of W of code's own: not inside a loop (SkipLoops) or a switch
 // (SkipSwitch) the code holds itself -- its own `break`s, `continue`s,
 // `case` labels.
@@ -1340,27 +1319,23 @@ SmallVector<VarDecl *, 8> Parser::CppshLiveLocals(SourceLocation Loc) {
   return Live;
 }
 
-// cppsh: a staged region. A statement needs a value that exists only as its
-// function runs (a local's, as a template argument; a run-time template
-// argument's). The code from it on whose types may depend on that value --
-// the statement alone, or, where it declares what follows may use (`std::
-// array<int, n> a;`), the rest of its block (nothing after the block sees
-// what it declares) -- is parsed, once, as the body of an implicit generic
-// lambda: a dependent context, as a template's body is, sharing the frame.
-//   [&]<auto __cppsh_key>(auto &n, auto &a, ..., auto &&__cppsh_need0, ...)
-//       { <the code> }
-// Each local it names is a parameter of it, by reference (the frame's own
-// object), so that whatever reads one is dependent; a run-time template
-// argument written in the statement is supplied by a parameter of its own.
-// The function hands it to std::sh::__cppsh_region with those locals and
-// arguments; as it runs, the interpreter instantiates the call operator with
-// the values known (__cppsh_region_run) and calls it. Where it breaks out of
-// or continues a loop around it, a slot of the frame says so, and the
-// function breaks or continues itself:
-//   { int __cppsh_code = 0; __cppsh_region(...);
-//     if (__cppsh_code == 1) break; if (__cppsh_code == 2) continue; }
-// False where it cannot be (it returns or jumps out; a staged function's
-// result, not a value's need): the caller cuts instead, or says so.
+// cppsh: a staged statement. A statement needs a value that exists only as
+// its function runs (a local's, as a template argument; a run-time template
+// argument's; a staged function's result). The code from it on whose types
+// may depend on that value -- the statement alone, or, where it declares what
+// follows may use (`std::array<int, n> a;`), the rest of its block (nothing
+// after the block sees what it declares) -- is parsed again, once, as a
+// staged statement's body (Sema::ActOnStartCppshStaged): a dependent context,
+// as a template's body is, in which each live local is a staged parameter,
+// its value unknown. As the function runs, the interpreter instantiates the
+// body with the locals' values and runs it, in the function's frame; a break
+// or continue of a loop around it, a return of the function, leaves the
+// statement and the function does so after it. A run-time template argument
+// written in the statement is evaluated before it, into a local of its own
+// (__cppsh_needN), its staged parameter what the argument becomes; a staged
+// function's call is made before it, its result the staged result.
+// False where it cannot be (it jumps out of its function's body; it returns
+// from a staged statement already): the caller says so.
 bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
                              SourceLocation Begin, bool AtBody) {
   // What it needs: a local's value, a run-time template argument's, or a
@@ -1372,8 +1347,8 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   // statement, not a declaration, then.
   const bool Declares = R.isUsable() && isa<DeclStmt>(R.get());
   std::optional<unsigned> B = cppshTokenIndex(Begin);
-  // A region's first statement needing a value again: what it needs is no
-  // local nor argument of it -- another region of it would be the same.
+  // A staged statement's first statement needing a value again: what it
+  // needs is no local of it -- another staged statement would be the same.
   if (!B || (CppshRegionBegin && *CppshRegionBegin == *B))
     return false;
   if (Declares)
@@ -1387,437 +1362,204 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   ArrayRef<Token> Toks = ArrayRef<Token>(CppshInputTokens).slice(*B, *E - *B);
   if (cppshLeavesFunction(Toks))
     return false;
-  // A return of the function: told back too, its value through a slot --
-  // where the function's type is known without it (declared, or deduced
-  // from a return before), and the region is not in another.
+  // In a staged statement's body already: returning from both is not
+  // something one function compiled for the inner one could do.
+  const bool Nested = !Actions.CppshStagedScopes.empty();
   const bool Returns = cppshReturns(Toks);
   FunctionDecl *Function = Actions.getCurFunctionDecl(/*AllowLambda=*/true);
   // The rest of the body, returning what gives the function its type: its
-  // type is the region's result's, known only once it runs. The function
-  // returns std::sh::staged, the region its own returns -- the result kept
-  // for whoever waits for it (__cppsh_region_staged), as a staged
-  // function's is.
-  // In a block of the body: where the region always returns; the rest of the
-  // body after the statement holding it then made one too (CppshStagedPending).
-  const bool Staged = Returns && Function && !cppshIsRegion(Function) &&
+  // type is the result's, known only once it runs -- the result kept for
+  // whoever waits for it (a staged function), the function returning
+  // nothing itself. In a block of the body: where it always returns; the
+  // rest of the body after the statement holding it then made one too
+  // (CppshStagedPending).
+  const bool Staged = Returns && Function && !Nested &&
                       Function->getReturnType()->isUndeducedType() &&
                       !cppshLeavesLoop(Toks) &&
                       ((AtBody && Declares) || cppshAlwaysReturns(Toks));
   if (Returns && !Staged &&
-      (!Function || cppshIsRegion(Function) ||
-       Function->getReturnType()->isUndeducedType()))
+      (!Function || Nested || Function->getReturnType()->isUndeducedType()))
     return false;
-  const QualType ReturnType =
-      Returns && !Staged ? Function->getReturnType() : QualType();
-  const bool Code = (Returns && !Staged) || cppshLeavesLoop(Toks);
-  llvm::SmallPtrSet<const IdentifierInfo *, 16> Named;
-  for (const Token &T : Toks)
-    if (T.is(tok::identifier))
-      Named.insert(T.getIdentifierInfo());
-  ASTContext &Ctx = Actions.getASTContext();
-  std::vector<CppshCutLocal> Frame;
-  SmallVector<Expr *, 8> Args;
-  for (VarDecl *VD : CppshLiveLocals(Begin)) {
-    if (!Named.count(VD->getIdentifier()))
-      continue;
-    const QualType T = VD->getType().getNonReferenceType();
-    Frame.push_back({VD->getIdentifier(), T, false, /*ByRef=*/true});
-    Args.push_back(Actions.BuildDeclRefExpr(VD, T, VK_LValue, Begin));
-  }
-  // The slot saying how it left: a local of a block of its own.
-  ParseScope CodeScope(this, Scope::DeclScope);
-  Sema::CompoundScopeRAII CodeCompound(Actions);
-  IdentifierInfo *CodeName = &PP.getIdentifierTable().get("__cppsh_code");
-  VarDecl *CodeVar = nullptr;
-  StmtResult CodeDecl;
-  if (Code) {
-    CodeVar = VarDecl::Create(Ctx, Actions.CurContext, Begin, Begin, CodeName,
-                              Ctx.IntTy, Ctx.getTrivialTypeSourceInfo(Ctx.IntTy, Begin),
-                              SC_None);
-    Actions.AddInitializerToDecl(
-        CodeVar,
-        IntegerLiteral::Create(Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), 0),
-                               Ctx.IntTy, Begin),
-        /*DirectInit=*/false);
-    Actions.PushOnScopeChains(CodeVar, getCurScope());
-    CodeDecl = Actions.ActOnDeclStmt(Actions.ConvertDeclToDeclGroup(CodeVar),
-                                     Begin, Begin);
-    if (!CodeDecl.isUsable())
-      return false;
-    Frame.push_back({CodeName, Ctx.IntTy, false, /*ByRef=*/true});
-    Args.push_back(Actions.BuildDeclRefExpr(CodeVar, Ctx.IntTy, VK_LValue, Begin));
-  }
-  // The slot of the value it returns: a std::optional of the function's type.
-  IdentifierInfo *RetName = &PP.getIdentifierTable().get("__cppsh_ret");
-  VarDecl *RetVar = nullptr;
-  StmtResult RetDecl;
-  if (Returns && !Staged && !ReturnType->isVoidType()) {
-    NamespaceDecl *Std = Actions.getStdNamespace();
-    LookupResult OptR(Actions, &PP.getIdentifierTable().get("optional"), Begin,
-                      Sema::LookupOrdinaryName);
-    if (!Std || !Actions.LookupQualifiedName(OptR, Std))
-      return false;
-    // Through a using-declaration too (the std module exports it by one).
-    ClassTemplateDecl *Optional = nullptr;
-    for (NamedDecl *D : OptR)
-      if (auto *CTD = dyn_cast<ClassTemplateDecl>(D->getUnderlyingDecl()))
-        Optional = CTD;
-    if (!Optional)
-      return false;
-    TemplateArgumentListInfo OptArgs(Begin, Begin);
-    OptArgs.addArgument(TemplateArgumentLoc(
-        TemplateArgument(ReturnType), Ctx.getTrivialTypeSourceInfo(ReturnType, Begin)));
-    const QualType SlotType = Actions.CheckTemplateIdType(
-        ElaboratedTypeKeyword::None, TemplateName(Optional), Begin, OptArgs,
-        getCurScope(), /*ForNestedNameSpecifier=*/false);
-    if (SlotType.isNull())
-      return false;
-    RetVar = VarDecl::Create(Ctx, Actions.CurContext, Begin, Begin, RetName,
-                             SlotType, Ctx.getTrivialTypeSourceInfo(SlotType, Begin),
-                             SC_None);
-    Actions.ActOnUninitializedDecl(RetVar);
-    Actions.PushOnScopeChains(RetVar, getCurScope());
-    RetDecl = Actions.ActOnDeclStmt(Actions.ConvertDeclToDeclGroup(RetVar), Begin,
-                                    Begin);
-    if (!RetDecl.isUsable())
-      return false;
-    Frame.push_back({RetName, SlotType, false, /*ByRef=*/true});
-    Args.push_back(Actions.BuildDeclRefExpr(RetVar, SlotType, VK_LValue, Begin));
-  }
-  // The run-time template arguments the statement met: evaluated here, each
-  // handed over as a parameter of its own.
-  // And the call of a staged function it made: made here, before it, its
-  // value the result it leaves (the interpreter hands that over).
-  SmallVector<SourceLocation, 2> NeedLocs;
+  // Its frame: the live locals (those its body does not name dropped by
+  // Sema); a run-time template argument's value, a local made for it here.
+  SmallVector<VarDecl *, 8> Locals = CppshLiveLocals(Begin);
+  SmallVector<std::pair<SourceLocation, VarDecl *>, 2> Needs;
+  SmallVector<Stmt *, 2> Before;
   for (Expr *NE : CppshCutNeedExprs) {
-    NeedLocs.push_back(NE->getBeginLoc());
-    Args.push_back(NE);
+    VarDecl *V = CppshNeedVar(NE, Needs.size(), Before);
+    if (!V)
+      return false;
+    Locals.push_back(V);
+    Needs.push_back({NE->getBeginLoc(), V});
   }
-  for (Expr *Call : CppshCutStagedCalls) {
-    NeedLocs.push_back(Call->getBeginLoc());
-    Args.push_back(Call);
-  }
+  Expr *StagedCall =
+      CppshCutStagedCalls.empty() ? nullptr : CppshCutStagedCalls.front();
   CppshCutNeedExprs.clear();
   CppshCutStagedCalls.clear();
-  const bool SavedReturns = std::exchange(CppshRegionReturns, Returns && !Staged);
-  IdentifierInfo *const SavedSlot =
-      std::exchange(CppshRegionReturnSlot, RetVar ? RetName : nullptr);
-  ExprResult Lambda = ParseCppshRegionLambda(Frame, NeedLocs, *B, *E);
-  CppshRegionReturns = SavedReturns;
-  CppshRegionReturnSlot = SavedSlot;
-  ExprResult RegionFn = cppshShFunction(
-      Actions, PP, Staged ? "__cppsh_region_staged" : "__cppsh_region", Begin);
-  if (!Lambda.isUsable() || !RegionFn.isUsable())
+  const unsigned From = *B, To = *E;
+  StmtResult S = CppshParseStaged(
+      Begin, CppshInputTokens[To - 1].getEndLoc(), Locals, Needs, StagedCall,
+      Staged, From,
+      [&](StmtVector &Body) { ParseCppshRegionStatements(Body, From, To); });
+  if (!S.isUsable())
     return false;
-  Args.insert(Args.begin(), Lambda.get());
-  ExprResult Call =
-      Actions.ActOnCallExpr(getCurScope(), RegionFn.get(), Begin, Args, Begin);
+  Stmts.append(Before.begin(), Before.end());
+  Stmts.push_back(S.get());
   if (Staged) {
-    // return std::sh::__cppsh_region_staged(...); -- a staged function.
-    StmtResult Ret = Call.isUsable()
-                         ? Actions.ActOnReturnStmt(Begin, Call.get(), getCurScope())
-                         : StmtError();
-    if (!Ret.isUsable())
-      return false;
+    // A staged function: nothing returned of its own -- after the result is
+    // kept, it returns.
     CppshCutFunctions.insert(Function->getCanonicalDecl());
-    Stmts.push_back(Ret.get());
+    StmtResult Ret = Actions.ActOnReturnStmt(Begin, nullptr, getCurScope());
+    if (Ret.isUsable())
+      Stmts.push_back(Ret.get());
     if (!AtBody)
       CppshStagedPending = true;
-    return true;
   }
-  StmtResult Run = Call.isUsable()
-                       ? Actions.ActOnExprStmt(Call, /*DiscardedValue=*/true)
-                       : StmtError();
-  if (!Run.isUsable())
-    return false;
-  if (!Code) {
-    Stmts.push_back(Run.get());
-    return true;
-  }
-  // if (__cppsh_code == K) break/continue/return;
-  SmallVector<Stmt *, 4> Block{CodeDecl.get()};
-  if (RetVar)
-    Block.push_back(RetDecl.get());
-  Block.push_back(Run.get());
-  // Only the jumps it makes: a continue is no statement outside a loop.
-  const bool Breaks = !cppshOwnTokens(Toks, tok::kw_break, true, true).empty();
-  const bool Continues = !cppshOwnTokens(Toks, tok::kw_continue, true, false).empty();
-  for (unsigned K : {1u, 2u, 3u}) {
-    if ((K == 1 && !Breaks) || (K == 2 && !Continues) || (K == 3 && !Returns))
-      continue;
-    Expr *Ref = Actions.BuildDeclRefExpr(CodeVar, Ctx.IntTy, VK_LValue, Begin);
-    Expr *Lit = IntegerLiteral::Create(
-        Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), K), Ctx.IntTy, Begin);
-    ExprResult Cond = Actions.BuildBinOp(getCurScope(), Begin, BO_EQ, Ref, Lit);
-    Sema::ConditionResult C =
-        Cond.isUsable() ? Actions.ActOnCondition(getCurScope(), Begin, Cond.get(),
-                                                 Sema::ConditionKind::Boolean)
-                        : Sema::ConditionError();
-    StmtResult Jump;
-    if (K == 3) {
-      // return *std::move(__cppsh_ret); -- or return; where it returns nothing.
-      ExprResult Value;
-      if (RetVar) {
-        Expr *Slot = ImplicitCastExpr::Create(
-            Ctx, RetVar->getType(), CK_NoOp,
-            Actions.BuildDeclRefExpr(RetVar, RetVar->getType(), VK_LValue, Begin),
-            nullptr, VK_XValue, FPOptionsOverride());
-        Value = Actions.BuildUnaryOp(getCurScope(), Begin, UO_Deref, Slot);
-        if (!Value.isUsable())
-          return false;
-      }
-      Jump = Actions.ActOnReturnStmt(Begin, Value.isUsable() ? Value.get() : nullptr,
-                                     getCurScope());
-    } else {
-      Jump = K == 1 ? Actions.ActOnBreakStmt(Begin, getCurScope(), nullptr,
-                                             SourceLocation())
-                    : Actions.ActOnContinueStmt(Begin, getCurScope(), nullptr,
-                                                SourceLocation());
-    }
-    if (C.isInvalid() || !Jump.isUsable())
-      return false;
-    StmtResult If =
-        Actions.ActOnIfStmt(Begin, IfStatementKind::Ordinary, Begin, nullptr, C,
-                            Begin, Jump.get(), SourceLocation(), nullptr);
-    if (!If.isUsable())
-      return false;
-    Block.push_back(If.get());
-  }
-  StmtResult Compound =
-      Actions.ActOnCompoundStmt(Begin, Begin, Block, /*isStmtExpr=*/false);
-  if (!Compound.isUsable())
-    return false;
-  Stmts.push_back(Compound.get());
   return true;
 }
 
-// The region's lambda, built with Sema's lambda actions as the parser builds
-// any: an explicit template head (`<auto __cppsh_key>`: the interpreter's,
-// one for each set of values it is instantiated with), a parameter for each
-// local (`auto &`) and run-time argument (`auto &&`), and the code, parsed
-// from its recorded tokens [Begin, End).
-ExprResult Parser::ParseCppshRegionLambda(ArrayRef<CppshCutLocal> Frame,
-                                          ArrayRef<SourceLocation> NeedLocs,
-                                          unsigned Begin, unsigned End,
-                                          CppshRegionBody Kind,
-                                          const CppshForward *Forward) {
+// cppsh: a run-time template argument's value, evaluated before the staged
+// statement that needs it: `auto __cppsh_needI = <the argument>;`.
+VarDecl *Parser::CppshNeedVar(Expr *NE, unsigned I,
+                              SmallVectorImpl<Stmt *> &Stmts) {
   ASTContext &Ctx = Actions.getASTContext();
-  const PrintingPolicy &Policy = Ctx.getPrintingPolicy();
-  IdentifierTable &Idents = PP.getIdentifierTable();
-  if (Kind == CppshRegionBody::Forward ? !Forward
-                                        : Begin >= End || End > CppshInputTokens.size())
-    return ExprError();
-  const SourceLocation Loc = Forward ? Forward->Loc : CppshInputTokens[Begin].getLocation();
+  const SourceLocation Loc = NE->getBeginLoc();
+  const QualType Auto = Ctx.getAutoDeductType();
+  auto *VD = VarDecl::Create(
+      Ctx, Actions.CurContext, Loc, Loc,
+      &PP.getIdentifierTable().get("__cppsh_need" + std::to_string(I)), Auto,
+      Ctx.getTrivialTypeSourceInfo(Auto, Loc), SC_None);
+  VD->setImplicit();
+  Actions.AddInitializerToDecl(VD, NE, /*DirectInit=*/false);
+  if (VD->isInvalidDecl())
+    return nullptr;
+  Actions.FinalizeDeclaration(VD);
+  Actions.PushOnScopeChains(VD, getCurScope());
+  StmtResult DS =
+      Actions.ActOnDeclStmt(Actions.ConvertDeclToDeclGroup(VD), Loc, Loc);
+  if (!DS.isUsable())
+    return nullptr;
+  Stmts.push_back(DS.get());
+  return VD;
+}
 
-  LambdaIntroducer Intro;
-  Intro.Range = SourceRange(Loc, Loc);
-  Intro.Default = LCD_ByRef;
-  Intro.DefaultLoc = Loc;
-  DeclSpec DS(AttrFactory);
-  Declarator D(DS, ParsedAttributesView::none(), DeclaratorContext::LambdaExpr);
-  TemplateParameterDepthRAII CurTemplateDepthTracker(TemplateParameterDepth);
-  ParseScope LambdaScope(this, Scope::LambdaScope | Scope::DeclScope |
-                                   Scope::FunctionDeclarationScope |
-                                   Scope::FunctionPrototypeScope);
-  Actions.PushLambdaScope();
-  Actions.ActOnLambdaExpressionAfterIntroducer(Intro, getCurScope());
-
-  MultiParseScope TemplateParamScope(*this);
-  TemplateParamScope.Enter(Scope::TemplateParamScope);
-  DeclSpec KeyDS(AttrFactory);
-  SetConciseAuto(KeyDS, Loc);
-  KeyDS.Finish(Actions, Policy);
-  Declarator KeyD(KeyDS, ParsedAttributesView::none(),
-                  DeclaratorContext::TemplateParam);
-  KeyD.SetIdentifier(&Idents.get("__cppsh_key"), Loc);
-  NamedDecl *Key = Actions.ActOnNonTypeTemplateParameter(
-      getCurScope(), KeyD, CurTemplateDepthTracker.getDepth(), 0,
-      SourceLocation(), nullptr);
-  if (!Key) {
-    Actions.ActOnLambdaError(Loc, getCurScope());
-    return ExprError();
-  }
-  ++CurTemplateDepthTracker;
-  NamedDecl *TemplateParams[1] = {Key};
-  Actions.ActOnLambdaExplicitTemplateParameterList(Intro, Loc, TemplateParams,
-                                                   Loc, ExprResult());
-
-  ParseScope Prototype(this, Scope::FunctionPrototypeScope |
-                                 Scope::FunctionDeclarationScope |
-                                 Scope::DeclScope);
-  Actions.RecordParsingTemplateParameterDepth(
-      CurTemplateDepthTracker.getOriginalDepth());
-  SmallVector<DeclaratorChunk::ParamInfo, 8> ParamInfo;
-  auto addParam = [&](const IdentifierInfo *Name, bool LValue) {
-    DeclSpec PDS(AttrFactory);
-    SetConciseAuto(PDS, Loc);
-    PDS.Finish(Actions, Policy);
-    Declarator PD(PDS, ParsedAttributesView::none(),
-                  DeclaratorContext::LambdaExprParameter);
-    PD.SetIdentifier(Name, Loc);
-    PD.AddTypeInfo(DeclaratorChunk::getReference(0, Loc, LValue), Loc);
-    Decl *P = Actions.ActOnParamDeclarator(getCurScope(), PD);
-    ParamInfo.push_back(DeclaratorChunk::ParamInfo(Name, Loc, P));
-    return dyn_cast_or_null<ParmVarDecl>(P);
-  };
-  for (const CppshCutLocal &L : Frame)
-    addParam(L.Name, /*LValue=*/true);
-  SmallVector<ParmVarDecl *, 2> NeedParams;
-  for (size_t I = 0; I < NeedLocs.size(); ++I)
-    NeedParams.push_back(
-        addParam(&Idents.get("__cppsh_need" + std::to_string(I)), /*LValue=*/false));
-  if (Actions.getCurGenericLambda())
-    CurTemplateDepthTracker.setAddedDepth(1);
-  Actions.ActOnLambdaClosureParameters(getCurScope(), ParamInfo);
-  Actions.ActOnLambdaClosureQualifiers(Intro, SourceLocation());
-  D.AddTypeInfo(DeclaratorChunk::getFunction(
-                    /*HasProto=*/true, /*IsAmbiguous=*/false, Loc,
-                    ParamInfo.data(), ParamInfo.size(), SourceLocation(), Loc,
-                    /*RefQualifierIsLvalueRef=*/true, SourceLocation(),
-                    SourceLocation(), EST_None, SourceRange(), nullptr, nullptr,
-                    0, nullptr, nullptr, {}, Loc, Loc, D, TypeResult(),
-                    SourceLocation(), &DS),
-                ParsedAttributes(AttrFactory), Loc);
-  Prototype.Exit();
-
-  ParseScope BodyScope(this, Scope::BlockScope | Scope::FnScope |
-                                 Scope::DeclScope | Scope::CompoundStmtScope);
-  Actions.ActOnStartOfLambdaDefinition(Intro, D, DS);
-  // Known for one: Sema lets a need be met in it (cppshIsRegion).
-  if (auto *Call = dyn_cast_or_null<CXXMethodDecl>(
-          Actions.getCurFunctionDecl(/*AllowLambda=*/true)))
-    Call->addAttr(AnnotateAttr::CreateImplicit(Ctx, "cppsh.region", nullptr, 0,
-                                               SourceRange(Loc)));
-
-  // Its code: the arguments of the statement's run-time template arguments
-  // its parameters; a need met in it a region of its own.
+// cppsh: a staged statement parsed: its context begun (Sema), each run-time
+// template argument written in it (at a location of Needs) supplied by its
+// local's staged parameter, a staged call by the staged result; its body
+// parsed by ParseBody; the statement made.
+StmtResult Parser::CppshParseStaged(
+    SourceLocation Begin, SourceLocation End, ArrayRef<VarDecl *> Locals,
+    ArrayRef<std::pair<SourceLocation, VarDecl *>> Needs, Expr *StagedCall,
+    bool Keeps, std::optional<unsigned> RegionBegin,
+    llvm::function_ref<void(StmtVector &)> ParseBody) {
+  ParseScope StagedScope(this, Scope::DeclScope | Scope::CompoundStmtScope);
+  // The staged result's type: a type parameter of it, one level deeper than
+  // the templates around it.
+  TemplateParameterDepthRAII Depth(TemplateParameterDepth);
+  const unsigned ResultDepth = Depth.getDepth();
+  if (StagedCall)
+    ++Depth;
+  CppshStagedDecl *SD = Actions.ActOnStartCppshStaged(
+      getCurScope(), Begin, Locals, StagedCall, ResultDepth, Keeps);
+  ArrayRef<ImplicitParamDecl *> Params = SD->parameters();
   auto SavedArgs = std::exchange(CppshSuppliedExprs, {});
-  for (size_t I = 0; I < NeedLocs.size(); ++I)
-    if (ParmVarDecl *Param = NeedParams[I])
-      CppshSuppliedExprs[NeedLocs[I].getRawEncoding()] = Actions.BuildDeclRefExpr(
-          Param, Param->getType().getNonReferenceType(), VK_LValue, NeedLocs[I]);
-  const std::optional<unsigned> SavedRegionBegin = std::exchange(
-      CppshRegionBegin, Forward ? std::nullopt : std::optional<unsigned>(Begin));
-  const SourceLocation SavedOpen = std::exchange(CppshBodyOpen, Loc);
+  for (const auto &[Loc, VD] : Needs) {
+    const auto *It = llvm::find(Locals, VD);
+    if (It == Locals.end() || size_t(It - Locals.begin()) >= Params.size())
+      continue;
+    ImplicitParamDecl *P = Params[It - Locals.begin()];
+    CppshSuppliedExprs[Loc.getRawEncoding()] = Actions.BuildDeclRefExpr(
+        P, P->getType().getNonReferenceType(), VK_LValue, Loc);
+  }
+  if (StagedCall && Params.size() > Locals.size()) {
+    ImplicitParamDecl *P = Params.back();
+    const SourceLocation Loc = StagedCall->getBeginLoc();
+    CppshSuppliedExprs[Loc.getRawEncoding()] = Actions.BuildDeclRefExpr(
+        P, P->getType().getNonReferenceType(), VK_LValue, Loc);
+  }
+  const std::optional<unsigned> SavedRegionBegin =
+      std::exchange(CppshRegionBegin, RegionBegin);
+  const SourceLocation SavedOpen = std::exchange(CppshBodyOpen, Begin);
   const size_t SavedRangeBase = std::exchange(CppshRangeBase, CppshRangeFors.size());
-  IdentifierInfo *const SavedCode = std::exchange(
-      CppshRegionCode,
-      llvm::any_of(Frame, [](const CppshCutLocal &L) {
-        return L.Name && L.Name->isStr("__cppsh_code");
-      })
-          ? &Idents.get("__cppsh_code")
-          : nullptr);
   StmtResult Body;
   {
     Sema::CompoundScopeRAII CompoundScope(Actions);
     StmtVector Stmts;
-    switch (Kind) {
-    case CppshRegionBody::Statements:
-      ParseCppshRegionStatements(Stmts, Begin, End);
-      break;
-    case CppshRegionBody::Expression: {
-      ExprResult E = CppshParseTokens(Begin, End);
-      StmtResult R = E.isUsable() ? Actions.ActOnReturnStmt(Loc, E.get(), getCurScope())
-                                  : StmtError();
-      if (R.isUsable())
-        Stmts.push_back(R.get());
-      break;
-    }
-    case CppshRegionBody::Forward: {
-      // return Name<Args...>(); -- each value its parameter's.
-      TemplateArgumentListInfo TemplateArgs(Loc, Loc);
-      bool Ok = true;
-      for (const CppshForward::Arg &A : Forward->Args) {
-        if (A.IsType) {
-          TemplateArgs.addArgument(TemplateArgumentLoc(
-              TemplateArgument(A.Type), Ctx.getTrivialTypeSourceInfo(A.Type, Loc)));
-          continue;
-        }
-        LookupResult R(Actions, A.II, Loc, Sema::LookupOrdinaryName);
-        Actions.LookupName(R, getCurScope());
-        auto *P = R.getAsSingle<VarDecl>();
-        if (!P) {
-          Ok = false;
-          break;
-        }
-        Expr *Ref =
-            Actions.BuildDeclRefExpr(P, P->getType().getNonReferenceType(), VK_LValue, Loc);
-        TemplateArgs.addArgument(
-            TemplateArgumentLoc(TemplateArgument(Ref, /*IsCanonical=*/false), Ref));
-      }
-      if (!Ok)
-        break;
-      LookupResult R(Actions, DeclarationNameInfo(Forward->Name, Loc),
-                     Sema::LookupOrdinaryName);
-      R.addDecl(cast<NamedDecl>(Forward->Template));
-      R.resolveKind();
-      CXXScopeSpec SS;
-      ExprResult Callee = Actions.BuildTemplateIdExpr(
-          SS, SourceLocation(), R, /*RequiresADL=*/false, &TemplateArgs);
-      ExprResult Call = Callee.isUsable()
-                            ? Actions.ActOnCallExpr(getCurScope(), Callee.get(), Loc,
-                                                    MultiExprArg(), Loc)
-                            : ExprError();
-      StmtResult Ret = Call.isUsable()
-                           ? Actions.ActOnReturnStmt(Loc, Call.get(), getCurScope())
-                           : StmtError();
-      if (Ret.isUsable())
-        Stmts.push_back(Ret.get());
-      break;
-    }
-    }
-    Body = Actions.ActOnCompoundStmt(
-        Loc, Forward ? Loc : CppshInputTokens[End - 1].getEndLoc(), Stmts,
-        /*isStmtExpr=*/false);
+    ParseBody(Stmts);
+    Body = Actions.ActOnCompoundStmt(Begin, End, Stmts, /*isStmtExpr=*/false);
   }
   CppshSuppliedExprs = std::move(SavedArgs);
   CppshRegionBegin = SavedRegionBegin;
   CppshBodyOpen = SavedOpen;
   CppshRangeBase = SavedRangeBase;
-  CppshRegionCode = SavedCode;
-  BodyScope.Exit();
-  TemplateParamScope.Exit();
-  LambdaScope.Exit();
-  if (Body.isInvalid() || D.isInvalidType()) {
-    Actions.ActOnLambdaError(Loc, getCurScope());
-    return ExprError();
+  if (!Body.isUsable()) {
+    Actions.ActOnCppshStagedError(SD);
+    return StmtError();
   }
-  return Actions.ActOnLambdaExpr(Loc, Body.get());
+  return Actions.ActOnFinishCppshStaged(SD, Body.get(), End);
 }
 
-void Parser::CppshRegionFrame(ArrayRef<Token> Toks, SourceLocation Loc,
-                             std::vector<CppshCutLocal> &Frame,
-                             SmallVectorImpl<Expr *> &Args) {
-  llvm::SmallPtrSet<const IdentifierInfo *, 16> Named;
-  for (const Token &T : Toks)
-    if (T.is(tok::identifier))
-      Named.insert(T.getIdentifierInfo());
-  for (VarDecl *VD : CppshLiveLocals(Loc)) {
-    if (!Named.count(VD->getIdentifier()))
+// cppsh: a forwarder's call -- `return Name<Args...>();`, each value the
+// staged parameter of its name.
+void Parser::CppshBuildForwardCall(const CppshForward &Forward,
+                                   StmtVector &Stmts) {
+  ASTContext &Ctx = Actions.getASTContext();
+  const SourceLocation Loc = Forward.Loc;
+  TemplateArgumentListInfo TemplateArgs(Loc, Loc);
+  for (const CppshForward::Arg &A : Forward.Args) {
+    if (A.IsType) {
+      TemplateArgs.addArgument(TemplateArgumentLoc(
+          TemplateArgument(A.Type), Ctx.getTrivialTypeSourceInfo(A.Type, Loc)));
       continue;
-    const QualType T = VD->getType().getNonReferenceType();
-    Frame.push_back({VD->getIdentifier(), T, false, /*ByRef=*/true});
-    Args.push_back(Actions.BuildDeclRefExpr(VD, T, VK_LValue, Loc));
+    }
+    LookupResult R(Actions, A.II, Loc, Sema::LookupOrdinaryName);
+    Actions.LookupName(R, getCurScope());
+    auto *P = R.getAsSingle<VarDecl>();
+    if (!P)
+      return;
+    Expr *Ref =
+        Actions.BuildDeclRefExpr(P, P->getType().getNonReferenceType(), VK_LValue, Loc);
+    TemplateArgs.addArgument(
+        TemplateArgumentLoc(TemplateArgument(Ref, /*IsCanonical=*/false), Ref));
   }
-}
-
-bool Parser::CppshReturnStagedRegion(SmallVectorImpl<Stmt *> &Stmts,
-                                     SourceLocation Loc, ExprResult Lambda,
-                                     ArrayRef<Expr *> Args) {
-  FunctionDecl *Function = Actions.getCurFunctionDecl(/*AllowLambda=*/true);
-  ExprResult Fn = cppshShFunction(Actions, PP, "__cppsh_region_staged", Loc);
-  if (!Function || cppshIsRegion(Function) || !Lambda.isUsable() || !Fn.isUsable())
-    return false;
-  SmallVector<Expr *, 8> All{Lambda.get()};
-  All.append(Args.begin(), Args.end());
-  ExprResult Call = Actions.ActOnCallExpr(getCurScope(), Fn.get(), Loc, All, Loc);
+  LookupResult R(Actions, DeclarationNameInfo(Forward.Name, Loc),
+                 Sema::LookupOrdinaryName);
+  R.addDecl(cast<NamedDecl>(Forward.Template));
+  R.resolveKind();
+  CXXScopeSpec SS;
+  ExprResult Callee = Actions.BuildTemplateIdExpr(
+      SS, SourceLocation(), R, /*RequiresADL=*/false, &TemplateArgs);
+  ExprResult Call = Callee.isUsable()
+                        ? Actions.ActOnCallExpr(getCurScope(), Callee.get(), Loc,
+                                                MultiExprArg(), Loc)
+                        : ExprError();
   StmtResult Ret = Call.isUsable()
                        ? Actions.ActOnReturnStmt(Loc, Call.get(), getCurScope())
                        : StmtError();
-  if (!Ret.isUsable())
+  if (Ret.isUsable())
+    Stmts.push_back(Ret.get());
+}
+
+// cppsh: the rest of a staged function's body made a staged statement whose
+// result is kept, ParseBody its body; the function returning after it.
+bool Parser::CppshStageRest(SmallVectorImpl<Stmt *> &Stmts,
+                            SourceLocation Begin, SourceLocation End,
+                            ArrayRef<VarDecl *> Locals,
+                            ArrayRef<std::pair<SourceLocation, VarDecl *>> Needs,
+                            Expr *StagedCall, std::optional<unsigned> RegionBegin,
+                            llvm::function_ref<void(StmtVector &)> ParseBody) {
+  FunctionDecl *Function = Actions.getCurFunctionDecl(/*AllowLambda=*/true);
+  if (!Function || !Actions.CppshStagedScopes.empty())
     return false;
+  StmtResult S = CppshParseStaged(Begin, End, Locals, Needs, StagedCall,
+                                  /*Keeps=*/true, RegionBegin, ParseBody);
+  if (!S.isUsable())
+    return false;
+  Stmts.push_back(S.get());
+  StmtResult Ret = Actions.ActOnReturnStmt(Begin, nullptr, getCurScope());
+  if (Ret.isUsable())
+    Stmts.push_back(Ret.get());
   CppshCutFunctions.insert(Function->getCanonicalDecl());
-  Stmts.push_back(Ret.get());
   return true;
 }
 
@@ -2094,14 +1836,11 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
       std::optional<unsigned> E = cppshTokenIndex(Tok.getLocation());
       bool Made = false;
       if (B && E && *B < *E) {
-        std::vector<CppshCutLocal> Frame;
-        SmallVector<Expr *, 8> Args;
-        CppshRegionFrame(ArrayRef<Token>(CppshInputTokens).slice(*B, *E - *B),
-                         RestBegin, Frame, Args);
-        const bool SavedReturns = std::exchange(CppshRegionReturns, false);
-        ExprResult Lambda = ParseCppshRegionLambda(Frame, {}, *B, *E);
-        CppshRegionReturns = SavedReturns;
-        Made = CppshReturnStagedRegion(Stmts, RestBegin, Lambda, Args);
+        const unsigned From = *B, To = *E;
+        Made = CppshStageRest(
+            Stmts, RestBegin, CppshInputTokens[To - 1].getEndLoc(),
+            CppshLiveLocals(RestBegin), {}, nullptr, From,
+            [&](StmtVector &Body) { ParseCppshRegionStatements(Body, From, To); });
       }
       if (!Made)
         CppshRegionError(RestBegin);
@@ -3365,81 +3104,9 @@ StmtResult Parser::ParseBreakOrContinueStatement(bool IsContinue) {
     }
   }
 
-  // cppsh: in a staged region, a break or continue of a loop around it: the
-  // region left, saying which.
-  if (CppshRegionCode && !Target &&
-      !(IsContinue ? getCurScope()->getContinueParent()
-                   : getCurScope()->getBreakParent()))
-    return CppshLeaveRegion(KwLoc, IsContinue ? 2 : 1);
-
   if (IsContinue)
     return Actions.ActOnContinueStmt(KwLoc, getCurScope(), Target, LabelLoc);
   return Actions.ActOnBreakStmt(KwLoc, getCurScope(), Target, LabelLoc);
-}
-
-StmtResult Parser::CppshLeaveRegion(SourceLocation Loc, unsigned Code,
-                                    Stmt *Before) {
-  LookupResult R(Actions, CppshRegionCode, Loc, Sema::LookupOrdinaryName);
-  Actions.LookupName(R, getCurScope());
-  auto *Slot = R.getAsSingle<VarDecl>();
-  if (!Slot)
-    return StmtError();
-  ASTContext &Ctx = Actions.getASTContext();
-  Expr *Ref = Actions.BuildDeclRefExpr(
-      Slot, Slot->getType().getNonReferenceType(), VK_LValue, Loc);
-  Expr *Value = IntegerLiteral::Create(
-      Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), Code), Ctx.IntTy, Loc);
-  ExprResult Set = Actions.BuildBinOp(getCurScope(), Loc, BO_Assign, Ref, Value);
-  StmtResult SetStmt = Set.isUsable()
-                           ? Actions.ActOnExprStmt(Set, /*DiscardedValue=*/true)
-                           : StmtError();
-  StmtResult Ret = Actions.ActOnReturnStmt(Loc, nullptr, getCurScope());
-  if (!SetStmt.isUsable() || !Ret.isUsable())
-    return StmtError();
-  Sema::CompoundScopeRAII CompoundScope(Actions);
-  SmallVector<Stmt *, 3> All;
-  if (Before)
-    All.push_back(Before);
-  All.push_back(SetStmt.get());
-  All.push_back(Ret.get());
-  return Actions.ActOnCompoundStmt(Loc, Loc, All, /*isStmtExpr=*/false);
-}
-
-// return e; in a region: the value put in its slot (__cppsh_ret.emplace(e)),
-// or e run where the function returns nothing -- then the region left
-// saying so (3).
-StmtResult Parser::CppshReturnFromRegion(SourceLocation Loc, ExprResult Value) {
-  if (Value.isInvalid())
-    return StmtError();
-  Stmt *Before = nullptr;
-  if (Value.isUsable()) {
-    ExprResult Done = Value;
-    if (CppshRegionReturnSlot) {
-      LookupResult R(Actions, CppshRegionReturnSlot, Loc, Sema::LookupOrdinaryName);
-      Actions.LookupName(R, getCurScope());
-      auto *Slot = R.getAsSingle<VarDecl>();
-      if (!Slot)
-        return StmtError();
-      Expr *Base = Actions.BuildDeclRefExpr(
-          Slot, Slot->getType().getNonReferenceType(), VK_LValue, Loc);
-      CXXScopeSpec SS;
-      ExprResult Emplace = Actions.BuildMemberReferenceExpr(
-          Base, Base->getType(), Loc, /*IsArrow=*/false, SS, SourceLocation(),
-          nullptr, DeclarationNameInfo(&PP.getIdentifierTable().get("emplace"), Loc),
-          nullptr, getCurScope());
-      Expr *Arg = Value.get();
-      Done = Emplace.isUsable()
-                 ? Actions.BuildCallExpr(getCurScope(), Emplace.get(), Loc, Arg, Loc)
-                 : ExprError();
-    }
-    StmtResult Put = Done.isUsable()
-                         ? Actions.ActOnExprStmt(Done, /*DiscardedValue=*/true)
-                         : StmtError();
-    if (!Put.isUsable())
-      return StmtError();
-    Before = Put.get();
-  }
-  return CppshLeaveRegion(Loc, 3, Before);
 }
 
 StmtResult Parser::ParseContinueStatement() {
@@ -3483,11 +3150,6 @@ StmtResult Parser::ParseReturnStatement() {
   }
   if (IsCoreturn)
     return Actions.ActOnCoreturnStmt(getCurScope(), ReturnLoc, R.get());
-  // cppsh: a return of the function a region is in, from the region itself
-  // (not from a lambda in it).
-  if (CppshRegionReturns && CppshRegionCode &&
-      cppshIsRegion(Actions.getCurFunctionDecl(/*AllowLambda=*/true)))
-    return CppshReturnFromRegion(ReturnLoc, R);
   return Actions.ActOnReturnStmt(ReturnLoc, R.get(), getCurScope());
 }
 
@@ -3654,27 +3316,37 @@ void Parser::CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
     // function a staged one.
     CppshCutNeeded = false;
     bool Made = false;
-    if (Begin < End && FD->getReturnType()->isUndeducedType()) {
-      std::vector<CppshCutLocal> Frame;
-      SmallVector<Expr *, 8> Args;
-      CppshRegionFrame(ArrayRef<Token>(CppshInputTokens).slice(Begin, End - Begin),
-                       Loc, Frame, Args);
-      SmallVector<SourceLocation, 2> NeedLocs;
+    if (Begin < End && FD->getReturnType()->isUndeducedType() &&
+        CppshCutStagedCalls.size() <= 1) {
+      // The expression a staged statement's, its value the kept result --
+      // the function a staged one.
+      SmallVector<VarDecl *, 8> Locals = CppshLiveLocals(Loc);
+      SmallVector<std::pair<SourceLocation, VarDecl *>, 2> Needs;
+      bool Ok = true;
       for (Expr *NE : CppshCutNeedExprs) {
-        NeedLocs.push_back(NE->getBeginLoc());
-        Args.push_back(NE);
+        VarDecl *V = CppshNeedVar(NE, Needs.size(), Stmts);
+        if (!V) {
+          Ok = false;
+          break;
+        }
+        Locals.push_back(V);
+        Needs.push_back({NE->getBeginLoc(), V});
       }
-      for (Expr *Call : CppshCutStagedCalls) {
-        NeedLocs.push_back(Call->getBeginLoc());
-        Args.push_back(Call);
-      }
+      Expr *StagedCall =
+          CppshCutStagedCalls.empty() ? nullptr : CppshCutStagedCalls.front();
       CppshCutNeedExprs.clear();
       CppshCutStagedCalls.clear();
-      Made = CppshReturnStagedRegion(
-          Stmts, Loc,
-          ParseCppshRegionLambda(Frame, NeedLocs, Begin, End,
-                                 CppshRegionBody::Expression),
-          Args);
+      Made = Ok && CppshStageRest(
+                       Stmts, Loc, CppshInputTokens[End - 1].getEndLoc(), Locals,
+                       Needs, StagedCall, Begin, [&](StmtVector &Body) {
+                         ExprResult V = CppshParseTokens(Begin, End);
+                         StmtResult R = V.isUsable()
+                                            ? Actions.ActOnReturnStmt(
+                                                  Loc, V.get(), getCurScope())
+                                            : StmtError();
+                         if (R.isUsable())
+                           Body.push_back(R.get());
+                       });
     }
     if (!Made)
       CppshRegionError(Loc);

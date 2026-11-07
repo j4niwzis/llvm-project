@@ -587,6 +587,13 @@ ExprDependence clang::computeDependence(DeclRefExpr *E, const ASTContext &Ctx) {
         Deps |= ExprDependence::ValueInstantiation;
     }
 
+    // cppsh: - it names a staged parameter (in a staged statement, the
+    //   stand-in of a local of the function around it): its value is the
+    //   local's as that function runs.
+    if (const auto *IPD = dyn_cast<ImplicitParamDecl>(Var);
+        IPD && IPD->getParameterKind() == ImplicitParamKind::CppshStaged)
+      Deps |= ExprDependence::ValueInstantiation;
+
     // - it names a static data member that is a dependent member of the
     //   current instantiation and is not initialized in a member-declarator,
     if (Var->isStaticDataMember() &&

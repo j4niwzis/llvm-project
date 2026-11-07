@@ -2180,6 +2180,7 @@ public:
     case Decl::ObjCMethod:
     case Decl::TopLevelStmt:
     case Decl::CXXExpansionStmt:
+    case Decl::CppshStaged:
       return true;
     default:
       return getDeclKind() >= Decl::firstFunction &&
@@ -2226,6 +2227,9 @@ public:
   bool isRequiresExprBody() const {
     return getDeclKind() == Decl::RequiresExprBody;
   }
+
+  /// cppsh: whether this is a staged statement's context.
+  bool isCppshStaged() const { return getDeclKind() == Decl::CppshStaged; }
 
   bool isExpansionStmt() const {
     return getDeclKind() == Decl::CXXExpansionStmt;

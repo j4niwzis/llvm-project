@@ -3495,6 +3495,11 @@ StmtResult Sema::ActOnContinueStmt(SourceLocation ContinueLoc, Scope *CurScope,
   CheckJumpOutOfSEHFinallyOrDefer(*this, ContinueLoc, *S,
                                   diag::DeferJumpKind::Continue);
 
+  // cppsh: continuing a loop around the staged statement it is in.
+  if (StmtResult Exit = ActOnCppshStagedLeave(ContinueLoc, S, /*IsContinue=*/true);
+      Exit.isUsable())
+    return Exit;
+
   return new (Context) ContinueStmt(ContinueLoc, LabelLoc, Target);
 }
 
@@ -3536,6 +3541,11 @@ StmtResult Sema::ActOnBreakStmt(SourceLocation BreakLoc, Scope *CurScope,
 
   CheckJumpOutOfSEHFinallyOrDefer(*this, BreakLoc, *S,
                                   diag::DeferJumpKind::Break);
+
+  // cppsh: breaking out of a loop around the staged statement it is in.
+  if (StmtResult Exit = ActOnCppshStagedLeave(BreakLoc, S, /*IsContinue=*/false);
+      Exit.isUsable())
+    return Exit;
 
   return new (Context) BreakStmt(BreakLoc, LabelLoc, Target);
 }
@@ -4065,6 +4075,10 @@ Sema::ActOnReturnStmt(SourceLocation ReturnLoc, Expr *RetValExp,
   ExprResult RetVal = RetValExp;
   if (RetVal.isInvalid())
     return StmtError();
+
+  // cppsh: a return of the function, from the staged statement it is in.
+  if (CppshStagedScope *Staged = getCppshStagedJumpScope())
+    return ActOnCppshStagedReturn(*Staged, ReturnLoc, RetVal.get(), CurScope);
 
   if (getCurScope()->isInOpenACCComputeConstructScope())
     return StmtError(

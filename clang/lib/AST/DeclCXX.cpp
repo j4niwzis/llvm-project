@@ -2412,6 +2412,23 @@ RequiresExprBodyDecl::CreateDeserialized(ASTContext &C, GlobalDeclID ID) {
   return new (C, ID) RequiresExprBodyDecl(C, nullptr, SourceLocation());
 }
 
+CppshStagedDecl *CppshStagedDecl::Create(ASTContext &C, DeclContext *DC,
+                                         SourceLocation Loc) {
+  return new (C, DC) CppshStagedDecl(DC, Loc);
+}
+
+CppshStagedDecl *CppshStagedDecl::CreateDeserialized(ASTContext &C,
+                                                     GlobalDeclID ID) {
+  return new (C, ID) CppshStagedDecl(nullptr, SourceLocation());
+}
+
+void CppshStagedDecl::setParameters(ASTContext &C,
+                                    ArrayRef<ImplicitParamDecl *> Ps) {
+  NumParams = Ps.size();
+  Params = NumParams ? new (C) ImplicitParamDecl *[NumParams] : nullptr;
+  llvm::copy(Ps, Params);
+}
+
 void CXXMethodDecl::anchor() {}
 
 bool CXXMethodDecl::isStatic() const {

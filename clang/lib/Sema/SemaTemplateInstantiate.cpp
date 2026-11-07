@@ -572,6 +572,7 @@ bool Sema::CodeSynthesisContext::isInstantiationRecord() const {
   case ConstraintsCheck:
   case NestedRequirementConstraintsCheck:
   case ExpansionStmtInstantiation:
+  case CppshStagedInstantiation:
     return true;
 
   case RequirementInstantiation:
@@ -765,6 +766,14 @@ Sema::InstantiatingTemplate::InstantiatingTemplate(
           SemaRef, CodeSynthesisContext::ExpansionStmtInstantiation,
           PointOfInstantiation, InstantiationRange, /*Entity=*/nullptr,
           /*Template=*/nullptr, /*TemplateArgs=*/TArgs) {}
+
+Sema::InstantiatingTemplate::InstantiatingTemplate(
+    Sema &SemaRef, SourceLocation PointOfInstantiation,
+    CppshStagedStmt *Staged, SourceRange InstantiationRange)
+    : InstantiatingTemplate(
+          SemaRef, CodeSynthesisContext::CppshStagedInstantiation,
+          PointOfInstantiation, InstantiationRange, /*Entity=*/nullptr,
+          /*Template=*/nullptr, /*TemplateArgs=*/{}) {}
 
 Sema::InstantiatingTemplate::InstantiatingTemplate(
     Sema &SemaRef, SourceLocation PointOfInstantiation,
@@ -1301,6 +1310,10 @@ void Sema::PrintInstantiationStack(InstantiationContextDiagFuncRef DiagFunc) {
     case CodeSynthesisContext::ExpansionStmtInstantiation:
       Diags.Report(Active->PointOfInstantiation,
                    diag::note_expansion_stmt_instantiation_here);
+      break;
+    case CodeSynthesisContext::CppshStagedInstantiation:
+      Diags.Report(Active->PointOfInstantiation,
+                   diag::note_cppsh_staged_instantiation_here);
     }
   }
 }
@@ -1994,7 +2007,7 @@ Decl *TemplateInstantiator::TransformDecl(SourceLocation Loc, Decl *D) {
   if (instantiateMissingDeclsToScopeForConcepts(D))
     return nullptr;
 
-  if (isa<CXXExpansionStmtDecl>(D)) {
+  if (isa<CXXExpansionStmtDecl, CppshStagedDecl>(D)) {
     assert(SemaRef.CurrentInstantiationScope);
     return cast<Decl *>(
         *SemaRef.CurrentInstantiationScope->findInstantiationOf(D));

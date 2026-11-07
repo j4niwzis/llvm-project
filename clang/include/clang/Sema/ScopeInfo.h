@@ -144,6 +144,10 @@ public:
   /// unavailable.
   bool HasPotentialAvailabilityViolations : 1;
 
+  /// cppsh: whether the function has a staged statement -- code compiled
+  /// only as it runs, so that how control flows through it is not known now.
+  bool HasCppshStaged : 1;
+
   /// A flag that is set when parsing a method that must call super's
   /// implementation, such as \c -dealloc, \c -finalize, or any method marked
   /// with \c __attribute__((objc_requires_super)).
@@ -395,7 +399,8 @@ public:
         HasBranchIntoScope(false), HasIndirectGoto(false), HasMustTail(false),
         HasDroppedStmt(false), HasOMPDeclareReductionCombiner(false),
         HasFallthroughStmt(false), UsesFPIntrin(false),
-        HasPotentialAvailabilityViolations(false), ObjCShouldCallSuper(false),
+        HasPotentialAvailabilityViolations(false), HasCppshStaged(false),
+        ObjCShouldCallSuper(false),
         ObjCIsDesignatedInit(false), ObjCWarnForNoDesignatedInitChain(false),
         ObjCIsSecondaryInit(false), ObjCWarnForNoInitDelegation(false),
         NeedsCoroutineSuspends(true), FoundImmediateEscalatingExpression(false),

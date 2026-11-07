@@ -7565,7 +7565,7 @@ static bool shouldConsiderLinkage(const VarDecl *VD) {
   if (DC->getDeclKind() == Decl::HLSLBuffer)
     return false;
 
-  if (isa<RequiresExprBodyDecl, CXXExpansionStmtDecl>(DC))
+  if (isa<RequiresExprBodyDecl, CXXExpansionStmtDecl, CppshStagedDecl>(DC))
     return false;
   llvm_unreachable("Unexpected context");
 }
@@ -7575,7 +7575,7 @@ static bool shouldConsiderLinkage(const FunctionDecl *FD) {
   if (DC->isFileContext() || DC->isFunctionOrMethod() ||
       isa<OMPDeclareReductionDecl>(DC) || isa<OMPDeclareMapperDecl>(DC))
     return true;
-  if (DC->isRecord() || isa<CXXExpansionStmtDecl>(DC))
+  if (DC->isRecord() || isa<CXXExpansionStmtDecl, CppshStagedDecl>(DC))
     return false;
   llvm_unreachable("Unexpected context");
 }

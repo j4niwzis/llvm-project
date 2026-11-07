@@ -30,6 +30,7 @@ void FunctionScopeInfo::Clear() {
   HasFallthroughStmt = false;
   UsesFPIntrin = false;
   HasPotentialAvailabilityViolations = false;
+  HasCppshStaged = false;
   ObjCShouldCallSuper = false;
   ObjCIsDesignatedInit = false;
   ObjCWarnForNoDesignatedInitChain = false;

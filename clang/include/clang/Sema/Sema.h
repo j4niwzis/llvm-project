@@ -114,6 +114,8 @@ struct InlineAsmIdentifierInfo;
 
 namespace clang {
 class ADLResult;
+class CppshStagedDecl;
+class CppshStagedStmt;
 class APValue;
 class ASTConstraintSatisfaction;
 class ASTConsumer;
@@ -13468,6 +13470,10 @@ public:
 
       /// We are instantiating an expansion statement.
       ExpansionStmtInstantiation,
+
+      /// cppsh: we are instantiating a staged statement for the values its
+      /// function runs with.
+      CppshStagedInstantiation,
     } Kind;
 
     /// Whether we're substituting into constraints.
@@ -13661,6 +13667,11 @@ public:
     InstantiatingTemplate(Sema &SemaRef, SourceLocation PointOfInstantiation,
                           CXXExpansionStmtPattern *ExpansionStmt,
                           ArrayRef<TemplateArgument> TArgs,
+                          SourceRange InstantiationRange);
+
+    /// \brief Note that we are instantiating a staged statement (cppsh).
+    InstantiatingTemplate(Sema &SemaRef, SourceLocation PointOfInstantiation,
+                          CppshStagedStmt *Staged,
                           SourceRange InstantiationRange);
 
     /// \brief Note that we are checking the satisfaction of the constraint
@@ -16058,6 +16069,88 @@ public:
 
   std::optional<uint64_t>
   ComputeExpansionSize(CXXExpansionStmtPattern *Expansion);
+  ///@}
+
+  //===--------------------------------------------------------------------===//
+  // cppsh staged statements
+  //
+
+  /// \name cppsh Staged Statements
+  /// Implementations are in SemaCppsh.cpp
+  ///@{
+public:
+  /// A staged statement being parsed (or instantiated with the template
+  /// around it): its context, the parser's scope of its body, whether it is
+  /// the rest of a staged function's body (its result kept), how its body
+  /// leaves it, and what its frame is made of.
+  struct CppshStagedScope {
+    CppshStagedDecl *Decl = nullptr;
+    Scope *BodyScope = nullptr;
+    bool KeepsResult = false;
+    unsigned Leaves = 0;
+    SmallVector<VarDecl *, 8> Locals;
+    Expr *StagedCall = nullptr;
+    DeclContext *Outer = nullptr;
+  };
+  SmallVector<CppshStagedScope, 2> CppshStagedScopes;
+
+  /// A staged statement instantiated as its function runs, into a function
+  /// of its own (Function): where its returns go -- the type of the function
+  /// around it and the parameter pointing to where it returns its value, or
+  /// its own function's return, where it keeps a staged function's result --
+  /// whose access it has, and the variable holding `this`.
+  struct CppshStagedRun {
+    QualType ReturnType;
+    ParmVarDecl *Slot = nullptr;
+    bool KeepsResult = false;
+    FunctionDecl *Function = nullptr;
+    DeclContext *AccessContext = nullptr;
+    VarDecl *This = nullptr;
+  };
+  CppshStagedRun *CurrentCppshStagedRun = nullptr;
+
+  /// Begin a staged statement at Loc, its body to be parsed in BodyScope: its
+  /// context entered, a staged parameter declared there for each of Locals
+  /// (and for the result of StagedCall, a staged function's, whose type is a
+  /// type parameter at TemplateDepth).
+  CppshStagedDecl *ActOnStartCppshStaged(Scope *BodyScope, SourceLocation Loc,
+                                         ArrayRef<VarDecl *> Locals,
+                                         Expr *StagedCall,
+                                         unsigned TemplateDepth,
+                                         bool KeepsResult);
+  StmtResult ActOnFinishCppshStaged(CppshStagedDecl *D, Stmt *Body,
+                                    SourceLocation EndLoc);
+  void ActOnCppshStagedError(CppshStagedDecl *D);
+
+  /// The staged statement a jump here leaves, if it is in one's body.
+  CppshStagedScope *getCppshStagedJumpScope();
+  /// A break or continue whose target, Target, is outside the staged
+  /// statement it is in: the exit from it. Nothing otherwise.
+  StmtResult ActOnCppshStagedLeave(SourceLocation Loc, Scope *Target,
+                                   bool IsContinue);
+  StmtResult ActOnCppshStagedReturn(CppshStagedScope &Info, SourceLocation Loc,
+                                    Expr *Value, Scope *CurScope);
+  /// An exit from a staged statement's body (CppshStagedExitStmt::ExitKind
+  /// K), as its body is instantiated.
+  StmtResult BuildCppshStagedExit(unsigned K, SourceLocation Loc, Expr *Value);
+
+  CppshStagedDecl *ActOnStartCppshStagedInstantiation(CppshStagedDecl *Old,
+                                                      ArrayRef<QualType> Types,
+                                                      bool KeepsResult);
+  StmtResult ActOnFinishCppshStagedInstantiation(CppshStagedDecl *D,
+                                                 StmtResult Body,
+                                                 ArrayRef<Expr *> Frame,
+                                                 CppshStagedStmt *Old);
+
+  /// A staged statement's body instantiated, as it runs, into the function
+  /// being defined (CurContext): each staged parameter the corresponding one
+  /// of Locals, the staged result of type ResultType.
+  StmtResult InstantiateCppshStaged(CppshStagedStmt *S,
+                                    ArrayRef<VarDecl *> Locals,
+                                    QualType ResultType, CppshStagedRun &Run);
+
+  /// `this`, in a staged statement's body compiled as it runs.
+  Expr *CppshStagedThis(SourceLocation Loc);
   ///@}
 };
 

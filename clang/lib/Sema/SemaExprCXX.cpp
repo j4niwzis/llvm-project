@@ -1218,6 +1218,12 @@ static QualType adjustCVQualifiersForCXXThisWithinLambda(
 }
 
 QualType Sema::getCurrentThisType() {
+  // cppsh: a staged statement compiled as its function runs: that
+  // function's `this`, held by a variable of the function compiled.
+  if (CurrentCppshStagedRun && CurrentCppshStagedRun->This &&
+      getFunctionLevelDeclContext() == CurrentCppshStagedRun->Function)
+    return CurrentCppshStagedRun->This->getType();
+
   DeclContext *DC = getFunctionLevelDeclContext();
   QualType ThisTy = CXXThisTypeOverride;
 
@@ -1447,6 +1453,8 @@ bool Sema::CheckCXXThisType(SourceLocation Loc, QualType Type) {
 
 Expr *Sema::BuildCXXThisExpr(SourceLocation Loc, QualType Type,
                              bool IsImplicit) {
+  if (Expr *Staged = CppshStagedThis(Loc))
+    return Staged;
   auto *This = CXXThisExpr::Create(Context, Loc, Type, IsImplicit);
   MarkThisReferenced(This);
   return This;

@@ -408,6 +408,7 @@ public:
   void VisitStaticAssertDecl(StaticAssertDecl *D);
   void VisitExplicitInstantiationDecl(ExplicitInstantiationDecl *D);
   void VisitCXXExpansionStmtDecl(CXXExpansionStmtDecl *D);
+  void VisitCppshStagedDecl(CppshStagedDecl *D);
   void VisitBlockDecl(BlockDecl *BD);
   void VisitOutlinedFunctionDecl(OutlinedFunctionDecl *D);
   void VisitCapturedDecl(CapturedDecl *CD);
@@ -2870,6 +2871,18 @@ void ASTDeclReader::VisitExplicitInstantiationDecl(
     Reader.getContext().addExplicitInstantiationDecl(Spec, D);
 }
 
+void ASTDeclReader::VisitCppshStagedDecl(CppshStagedDecl *D) {
+  VisitDecl(D);
+  unsigned N = Record.readInt();
+  SmallVector<ImplicitParamDecl *, 8> Params;
+  for (unsigned I = 0; I < N; ++I)
+    Params.push_back(cast_or_null<ImplicitParamDecl>(Record.readDeclRef()));
+  D->setParameters(Reader.getContext(), Params);
+  D->ResultType = cast_or_null<TemplateTypeParmDecl>(Record.readDeclRef());
+  D->UsesThis = Record.readInt();
+  D->Statement = cast_or_null<CppshStagedStmt>(Record.readStmt());
+}
+
 void ASTDeclReader::VisitCXXExpansionStmtDecl(CXXExpansionStmtDecl *D) {
   VisitDecl(D);
   D->Pattern = cast<CXXExpansionStmtPattern>(Record.readStmt());
@@ -4222,6 +4235,9 @@ Decl *ASTReader::ReadDeclRecord(GlobalDeclID ID) {
     break;
   case DECL_EXPANSION_STMT:
     D = CXXExpansionStmtDecl::CreateDeserialized(Context, ID);
+    break;
+  case DECL_CPPSH_STAGED:
+    D = CppshStagedDecl::CreateDeserialized(Context, ID);
     break;
   case DECL_OBJC_METHOD:
     D = ObjCMethodDecl::CreateDeserialized(Context, ID);

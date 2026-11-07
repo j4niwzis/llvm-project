@@ -328,6 +328,10 @@ unsigned Decl::getTemplateDepth() const {
   if (auto *ESD = dyn_cast<CXXExpansionStmtDecl>(this))
     return ESD->getIndexTemplateParm()->getDepth() + 1;
 
+  if (auto *SD = dyn_cast<CppshStagedDecl>(this);
+      SD && SD->getResultTypeParm())
+    return SD->getResultTypeParm()->getDepth() + 1;
+
   // If this is a dependent lambda, there might be an enclosing variable
   // template. In this case, the next step is not the parent DeclContext (or
   // even a DeclContext at all).
@@ -1031,6 +1035,7 @@ unsigned Decl::getIdentifierNamespaceForKind(Kind DeclKind) {
     case OpenACCRoutine:
     case ExplicitInstantiation:
     case CXXExpansionStmt:
+    case CppshStaged:
       // Never looked up by name.
       return 0;
   }
@@ -1394,7 +1399,8 @@ bool DeclContext::isDependentContext() const {
   if (isFileContext())
     return false;
 
-  if (isa<ClassTemplatePartialSpecializationDecl, CXXExpansionStmtDecl>(this))
+  if (isa<ClassTemplatePartialSpecializationDecl, CXXExpansionStmtDecl,
+          CppshStagedDecl>(this))
     return true;
 
   if (const auto *Record = dyn_cast<CXXRecordDecl>(this)) {
@@ -1504,6 +1510,7 @@ DeclContext *DeclContext::getPrimaryContext() {
   case Decl::OMPDeclareMapper:
   case Decl::RequiresExprBody:
   case Decl::CXXExpansionStmt:
+  case Decl::CppshStaged:
     // There is only one DeclContext for these entities.
     return this;
 
@@ -2095,7 +2102,8 @@ RecordDecl *DeclContext::getOuterLexicalRecordContext() {
 
 DeclContext *DeclContext::getEnclosingNonExpansionStatementContext() {
   DeclContext *DC = this;
-  while (isa<CXXExpansionStmtDecl>(DC))
+  // A staged statement's context too: code of the function around it.
+  while (isa<CXXExpansionStmtDecl, CppshStagedDecl>(DC))
     DC = DC->getParent();
   return DC;
 }

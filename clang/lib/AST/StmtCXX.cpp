@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/AST/StmtCXX.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/AST/ExprCXX.h"
 
 #include "clang/AST/ASTContext.h"
@@ -287,4 +288,45 @@ SourceLocation CXXExpansionStmtInstantiation::getBeginLoc() const {
 
 SourceLocation CXXExpansionStmtInstantiation::getEndLoc() const {
   return Parent->getExpansionPattern()->getEndLoc();
+}
+
+CppshStagedStmt::CppshStagedStmt(CppshStagedDecl *D, Stmt *Body,
+                                 ArrayRef<Expr *> Frame, unsigned Leaves,
+                                 bool KeepsResult, SourceLocation BeginLoc,
+                                 SourceLocation EndLoc)
+    : Stmt(CppshStagedStmtClass), StagedDecl(D), BeginLoc(BeginLoc),
+      EndLoc(EndLoc), NumFrame(Frame.size()), Leaves(Leaves),
+      KeepsResult(KeepsResult) {
+  Stmt **S = getTrailingObjects();
+  S[0] = Body;
+  for (unsigned I = 0; I < NumFrame; ++I)
+    S[1 + I] = Frame[I];
+}
+
+CppshStagedStmt *CppshStagedStmt::Create(const ASTContext &C,
+                                         CppshStagedDecl *D, Stmt *Body,
+                                         ArrayRef<Expr *> Frame,
+                                         unsigned Leaves, bool KeepsResult,
+                                         SourceLocation BeginLoc,
+                                         SourceLocation EndLoc) {
+  void *Mem = C.Allocate(totalSizeToAlloc<Stmt *>(1 + Frame.size()),
+                         alignof(CppshStagedStmt));
+  return new (Mem) CppshStagedStmt(D, Body, Frame, Leaves, KeepsResult,
+                                   BeginLoc, EndLoc);
+}
+
+CppshStagedStmt *CppshStagedStmt::CreateEmpty(const ASTContext &C,
+                                              unsigned NumFrame) {
+  void *Mem = C.Allocate(totalSizeToAlloc<Stmt *>(1 + NumFrame),
+                         alignof(CppshStagedStmt));
+  auto *S = new (Mem) CppshStagedStmt(EmptyShell(), NumFrame);
+  for (unsigned I = 0; I <= NumFrame; ++I)
+    S->getTrailingObjects()[I] = nullptr;
+  return S;
+}
+
+SourceLocation CppshStagedExitStmt::getEndLoc() const {
+  if (const Expr *V = getValue())
+    return V->getEndLoc();
+  return ExitLoc;
 }

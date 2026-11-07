@@ -297,6 +297,8 @@ CXCursor cxcursor::MakeCXCursor(const Stmt *S, const Decl *Parent,
   case Stmt::CoreturnStmtClass:
   case Stmt::CXXExpansionStmtPatternClass:
   case Stmt::CXXExpansionStmtInstantiationClass:
+  case Stmt::CppshStagedStmtClass:
+  case Stmt::CppshStagedExitStmtClass:
     K = CXCursor_UnexposedStmt;
     break;
 

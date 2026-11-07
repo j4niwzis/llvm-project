@@ -209,6 +209,12 @@ void CodeGenFunction::EmitStmt(const Stmt *S, ArrayRef<const Attr *> Attrs) {
   case Stmt::CXXExpansionStmtInstantiationClass:
     EmitCXXExpansionStmtInstantiation(cast<CXXExpansionStmtInstantiation>(*S));
     break;
+  case Stmt::CppshStagedStmtClass:
+    EmitCppshStagedStmt(cast<CppshStagedStmt>(*S));
+    break;
+  case Stmt::CppshStagedExitStmtClass:
+    EmitCppshStagedExitStmt(cast<CppshStagedExitStmt>(*S));
+    break;
   case Stmt::SEHTryStmtClass:
     EmitSEHTryStmt(cast<SEHTryStmt>(*S));
     break;
@@ -1497,6 +1503,88 @@ CodeGenFunction::EmitCXXForRangeStmt(const CXXForRangeStmt &S,
     // behaviour.
     addInstToNewSourceAtom(FinalBodyBB->getTerminator(), nullptr);
   }
+}
+
+// cppsh: a staged statement -- run by the interpreter as the function
+// reaches it (__cppsh_staged_run), handed the statement, its frame (each
+// local's address; `this`) and where the function's return value goes. What
+// that returns says how the statement's body left: 0 off its end, 1 by a
+// break, 2 by a continue (of the loop around the statement), 3 by a return
+// of the function (its value constructed already).
+void CodeGenFunction::EmitCppshStagedStmt(const CppshStagedStmt &S) {
+  ArrayRef<Expr *> Frame = S.frame();
+  llvm::PointerType *PtrTy = Builder.getPtrTy();
+  llvm::ArrayType *FrameTy = llvm::ArrayType::get(PtrTy, Frame.size() + 1);
+  Address FrameAddr = CreateTempAlloca(FrameTy, getPointerAlign(), "cppsh.frame");
+  for (unsigned I = 0; I < Frame.size(); ++I) {
+    const Expr *E = Frame[I];
+    llvm::Value *P;
+    if (E->isGLValue()) {
+      P = EmitLValue(E).getPointer(*this);
+    } else if (E->getType()->isPointerType()) {
+      // `this`: the object's address itself.
+      P = EmitScalarExpr(E);
+    } else {
+      // A staged function's call: made here, its result kept by the
+      // interpreter (which hands that over instead).
+      EmitIgnoredExpr(E);
+      P = llvm::ConstantPointerNull::get(PtrTy);
+    }
+    Builder.CreateStore(P, Builder.CreateConstArrayGEP(FrameAddr, I));
+  }
+  Builder.CreateStore(llvm::ConstantPointerNull::get(PtrTy),
+                      Builder.CreateConstArrayGEP(FrameAddr, Frame.size()));
+  llvm::Value *Slot = llvm::ConstantPointerNull::get(PtrTy);
+  if (S.leaves(CppshStagedStmt::LeavesByReturn) && ReturnValue.isValid())
+    Slot = ReturnValue.emitRawPointer(*this);
+  // The statement itself, which the interpreter compiles: in this process.
+  llvm::Value *Node = Builder.CreateIntToPtr(
+      llvm::ConstantInt::get(IntPtrTy, reinterpret_cast<uintptr_t>(&S)), PtrTy);
+  llvm::FunctionType *FnTy =
+      llvm::FunctionType::get(Int32Ty, {PtrTy, PtrTy, PtrTy}, /*isVarArg=*/false);
+  llvm::FunctionCallee Run = CGM.CreateRuntimeFunction(FnTy, "__cppsh_staged_run");
+  llvm::Value *Code = EmitRuntimeCallOrInvoke(
+      Run, {Node, FrameAddr.emitRawPointer(*this), Slot}, "cppsh.left");
+  auto Leave = [&](unsigned K, JumpDest Dest) {
+    llvm::BasicBlock *Taken = createBasicBlock("cppsh.leave");
+    llvm::BasicBlock *Next = createBasicBlock("cppsh.next");
+    Builder.CreateCondBr(Builder.CreateICmpEQ(Code, Builder.getInt32(K)),
+                         Taken, Next);
+    EmitBlock(Taken);
+    EmitBranchThroughCleanup(Dest);
+    EmitBlock(Next);
+  };
+  if (S.leaves(CppshStagedStmt::LeavesByBreak) && !BreakContinueStack.empty())
+    Leave(1, BreakContinueStack.back().BreakBlock);
+  if (S.leaves(CppshStagedStmt::LeavesByContinue) && !BreakContinueStack.empty())
+    Leave(2, BreakContinueStack.back().ContinueBlock);
+  if (S.leaves(CppshStagedStmt::LeavesByReturn))
+    Leave(3, ReturnBlock);
+}
+
+// cppsh: an exit from a staged statement's body, compiled as it runs: the
+// value returned constructed where the function around the statement
+// returns it, then the return saying how the body left.
+void CodeGenFunction::EmitCppshStagedExitStmt(const CppshStagedExitStmt &S) {
+  if (const Expr *V = S.getValue()) {
+    if (const Expr *SlotE = S.getSlot()) {
+      llvm::Value *P = EmitScalarExpr(SlotE);
+      if (V->isGLValue()) {
+        // A reference returned: what it refers to.
+        LValue LV = EmitLValue(V);
+        Builder.CreateStore(LV.getPointer(*this),
+                            Address(P, Builder.getPtrTy(), getPointerAlign()));
+      } else {
+        QualType T = V->getType();
+        Address A(P, ConvertTypeForMem(T), getContext().getTypeAlignInChars(T));
+        EmitAnyExprToMem(V, A, T.getQualifiers(), /*IsInitializer=*/true);
+      }
+    } else {
+      EmitIgnoredExpr(V);
+    }
+  }
+  if (const Stmt *L = S.getLeave())
+    EmitStmt(L);
 }
 
 void CodeGenFunction::EmitCXXExpansionStmtInstantiation(

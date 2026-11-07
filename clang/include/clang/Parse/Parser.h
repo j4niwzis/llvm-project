@@ -8702,21 +8702,17 @@ private:
   /// cppsh: the locals live at Loc in the function being parsed.
   SmallVector<VarDecl *, 8> CppshLiveLocals(SourceLocation Loc);
   /// cppsh: the code from a statement that needs a value only running its
-  /// function gives made a staged region -- an implicit generic lambda,
-  /// instantiated with the values as the function runs, in its frame
-  /// (std::sh::__cppsh_region); false where it cannot be.
+  /// function gives made a staged statement (Sema::ActOnStartCppshStaged),
+  /// compiled with the values as the function runs, in its frame; false
+  /// where it cannot be.
   bool CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
                        SourceLocation Begin, bool AtBody = false);
-  /// cppsh: what a region's body is: statements of recorded tokens; an
-  /// expression of them, returned (a concise function's `= e`); or the call
-  /// a forwarder makes (CppshForward), built.
-  enum class CppshRegionBody { Statements, Expression, Forward };
+  /// cppsh: the call a forwarder makes: Name<Args...>(), each value a staged
+  /// parameter of that name.
   struct CppshForward {
     Decl *Template = nullptr;
     IdentifierInfo *Name = nullptr;
     SourceLocation Loc;
-    /// Each template argument: a type, or the value of the region's
-    /// parameter of that name.
     struct Arg {
       bool IsType = false;
       QualType Type;
@@ -8724,25 +8720,29 @@ private:
     };
     SmallVector<Arg, 4> Args;
   };
-  ExprResult ParseCppshRegionLambda(ArrayRef<CppshCutLocal> Frame,
-                                    ArrayRef<SourceLocation> NeedLocs,
-                                    unsigned Begin, unsigned End,
-                                    CppshRegionBody Kind = CppshRegionBody::Statements,
-                                    const CppshForward *Forward = nullptr);
-  /// cppsh: a staged region returned the function's result from inside a
+  void CppshBuildForwardCall(const CppshForward &Forward, StmtVector &Stmts);
+  /// cppsh: a run-time template argument's value, in a local of its own
+  /// declared before the staged statement that needs it.
+  VarDecl *CppshNeedVar(Expr *NE, unsigned I, SmallVectorImpl<Stmt *> &Stmts);
+  /// cppsh: a staged statement parsed, ParseBody its body.
+  StmtResult
+  CppshParseStaged(SourceLocation Begin, SourceLocation End,
+                   ArrayRef<VarDecl *> Locals,
+                   ArrayRef<std::pair<SourceLocation, VarDecl *>> Needs,
+                   Expr *StagedCall, bool Keeps,
+                   std::optional<unsigned> RegionBegin,
+                   llvm::function_ref<void(StmtVector &)> ParseBody);
+  /// cppsh: the rest of a staged function's body a staged statement whose
+  /// result is kept; the function returning after it.
+  bool CppshStageRest(SmallVectorImpl<Stmt *> &Stmts, SourceLocation Begin,
+                      SourceLocation End, ArrayRef<VarDecl *> Locals,
+                      ArrayRef<std::pair<SourceLocation, VarDecl *>> Needs,
+                      Expr *StagedCall, std::optional<unsigned> RegionBegin,
+                      llvm::function_ref<void(StmtVector &)> ParseBody);
+  /// cppsh: a staged statement returned the function's result from inside a
   /// block of its body: the rest of the body after the statement holding
   /// it is made one too -- every way out of a staged function staged alike.
   bool CppshStagedPending = false;
-  /// cppsh: the locals named in Toks, live at Loc: a region's frame, and
-  /// the arguments that hand them to it.
-  void CppshRegionFrame(ArrayRef<Token> Toks, SourceLocation Loc,
-                        std::vector<CppshCutLocal> &Frame,
-                        SmallVectorImpl<Expr *> &Args);
-  /// cppsh: the function returns what a staged region gives (a staged
-  /// function's result), the region handed Args.
-  bool CppshReturnStagedRegion(SmallVectorImpl<Stmt *> &Stmts,
-                               SourceLocation Loc, ExprResult Lambda,
-                               ArrayRef<Expr *> Args);
   void ParseCppshRegionStatements(StmtVector &Stmts, unsigned Begin,
                                   unsigned End);
   void CppshRegionError(SourceLocation Loc);
@@ -8772,22 +8772,8 @@ private:
   static SourceLocation &CppshTopBodyOpen();
   /// cppsh: where the region being parsed begins in the recorded tokens.
   std::optional<unsigned> CppshRegionBegin;
-  /// cppsh: in a region being parsed, the slot a break or continue of a loop
-  /// around it sets (1, 2) before it returns; none where it has none.
-  IdentifierInfo *CppshRegionCode = nullptr;
   /// cppsh: where the recorded tokens being parsed again end (a step's).
   std::optional<unsigned> CppshReplayEnd;
-  /// cppsh: the region being left with Code, its call operator returning
-  /// (Before first, where there is one).
-  StmtResult CppshLeaveRegion(SourceLocation Loc, unsigned Code,
-                              Stmt *Before = nullptr);
-  /// cppsh: in a region being parsed that returns from its function, the
-  /// slot the value returned is put in (none where the function returns
-  /// nothing); whether it does.
-  IdentifierInfo *CppshRegionReturnSlot = nullptr;
-  bool CppshRegionReturns = false;
-  /// cppsh: a return of the function a region is in, from inside it.
-  StmtResult CppshReturnFromRegion(SourceLocation Loc, ExprResult Value);
   CppshBuiltBody CppshBeginBuiltReturn(SourceLocation Open);
   void CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
                               SmallVectorImpl<Stmt *> &Stmts, ExprResult E,

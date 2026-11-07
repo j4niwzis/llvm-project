@@ -3839,6 +3839,8 @@ public:
 
   void
   EmitCXXExpansionStmtInstantiation(const CXXExpansionStmtInstantiation &S);
+  void EmitCppshStagedStmt(const CppshStagedStmt &S);
+  void EmitCppshStagedExitStmt(const CppshStagedExitStmt &S);
 
   /// Controls insertion of cancellation exit blocks in worksharing constructs.
   class OMPCancelStackRAII {

@@ -1563,6 +1563,13 @@ CanThrowResult Sema::canThrow(const Stmt *S) {
   case Stmt::CXXExpansionStmtInstantiationClass:
     return canSubStmtsThrow(*this, S);
 
+  case Stmt::CppshStagedExitStmtClass:
+    return canSubStmtsThrow(*this, S);
+
+  // cppsh: compiled as it runs -- for all that is known now, it may throw.
+  case Stmt::CppshStagedStmtClass:
+    return CT_Can;
+
   case Stmt::CXXExpansionStmtPatternClass:
     if (auto *Pattern = cast<CXXExpansionStmtPattern>(S);
         Pattern->isDependent())

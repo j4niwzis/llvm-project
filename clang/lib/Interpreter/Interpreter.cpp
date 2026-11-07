@@ -16,6 +16,7 @@
 #include "IncrementalParser.h"
 #include "InterpreterUtils.h"
 
+#include "clang/AST/StmtCXX.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Mangle.h"
@@ -49,6 +50,7 @@
 #include "clang/Parse/Parser.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/bit.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ModuleCache.h"
@@ -1422,8 +1424,8 @@ unsigned CppshProbes = 0;
 unsigned long long CppshParseNs = 0, CppshExecuteNs = 0;
 
 extern std::set<const FunctionDecl *> CppshCutFunctions;
-extern llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
-extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
+extern llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
+extern llvm::DenseMap<const VarDecl *, const Expr *> CppshParamRebuild;
 bool cppshMutates(const Stmt *S, const VarDecl *VD);
 extern bool CppshTopNeed;
 extern bool CppshCutNeeded;
@@ -1483,64 +1485,11 @@ static VarDecl *cppshFrameGlobal(Sema &S, IdentifierInfo *Name, QualType T,
   return VD;
 }
 
-using CppshGlobals = SmallVector<std::pair<const CppshCutLocal *, VarDecl *>, 8>;
-
 static bool cppshReport(llvm::Error Err) {
   if (!Err)
     return true;
   llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(), "error: ");
   return false;
-}
-
-// A frame (a cut's, a step's) laid out for what is compiled with it: the
-// run-time template arguments' values, for its compile to take in order;
-// each live local a global naming it -- built and run first, so that the
-// value specialization reads their values, and what is not plain data
-// snapshotted (rebuilt from that).
-static bool cppshFrameGlobals(Interpreter &Interp, Sema &S,
-                              const std::string &Tag,
-                              ArrayRef<CppshCutLocal> Locals,
-                              void *const *Frame, std::vector<APValue> &Needs,
-                              CppshGlobals &Globals) {
-  IdentifierTable &Idents = S.getPreprocessor().getIdentifierTable();
-  const bool AnyLocal = llvm::any_of(
-      Locals, [](const CppshCutLocal &L) { return L.Name != nullptr; });
-  const bool Building = AnyLocal && cppshReport(Interp.cppshBeginBuild());
-  bool Ok = !AnyLocal || Building;
-  for (unsigned I = 0; I < Locals.size(); ++I) {
-    const CppshCutLocal &L = Locals[I];
-    if (!L.Name) {
-      const long long V = *static_cast<const long long *>(Frame[I]);
-      Needs.push_back(APValue(llvm::APSInt(
-          llvm::APInt(64, static_cast<uint64_t>(V), /*isSigned=*/true),
-          /*isUnsigned=*/false)));
-      continue;
-    }
-    if (!Building)
-      continue;
-    VarDecl *G = cppshFrameGlobal(
-        S, &Idents.get("__cppsh_f" + Tag + "_" + L.Name->getName().str()),
-        L.Type, Frame[I]);
-    if (!G) {
-      Ok = false;
-      continue;
-    }
-    Interp.cppshAddBuilt(G);
-    Globals.emplace_back(&L, G);
-  }
-  if (!Building)
-    return Ok;
-  if (!cppshReport(Interp.cppshEndBuildAndExecute()))
-    return false;
-  // The snapshots, in a unit of their own: a type that cannot be
-  // snapshotted only loses its rebuilt value.
-  SmallVector<VarDecl *, 4> ToSnap;
-  for (const auto &Global : Globals)
-    if (!Global.first->Type->isDependentType() &&
-        !Global.first->Type.isTriviallyCopyableType(S.Context))
-      ToSnap.push_back(Global.second);
-  llvm::consumeError(Interp.cppshSnapshot(ToSnap));
-  return Ok;
 }
 
 // The snapshots of variables (std::sh::__cppsh_snapshot), taken now -- a unit
@@ -1584,268 +1533,426 @@ struct CppshFrameState {
 };
 } // namespace
 
-// std::sh::__cppsh_region_tag, the variable template whose specializations
-// name a region's closure type and its arguments' types (each one's address
-// what __cppsh_region hands over).
-static VarTemplateDecl *cppshRegionTagTemplate(Sema &S) {
-  NamespaceDecl *Std = S.getStdNamespace();
-  if (!Std)
-    return nullptr;
+// ---- Staged statements (cppsh) --------------------------------------------
+
+// A function defined from the AST, at the translation unit: Name(ParamTypes)
+// returning Ret, its body what MakeBody makes in its scope.
+static FunctionDecl *cppshDefineFunction(
+    Sema &S, llvm::StringRef Name, QualType Ret, ArrayRef<QualType> ParamTypes,
+    llvm::function_ref<Stmt *(FunctionDecl *, ArrayRef<ParmVarDecl *>)> MakeBody) {
+  ASTContext &Ctx = S.Context;
   IdentifierTable &Idents = S.getPreprocessor().getIdentifierTable();
-  LookupResult ShR(S, &Idents.get("sh"), SourceLocation(),
-                   Sema::LookupNamespaceName);
-  S.LookupQualifiedName(ShR, Std);
-  auto *Sh = ShR.getAsSingle<NamespaceDecl>();
-  if (!Sh)
+  const SourceLocation Loc;
+  QualType FnTy =
+      Ctx.getFunctionType(Ret, ParamTypes, FunctionProtoType::ExtProtoInfo());
+  auto *FD = FunctionDecl::Create(Ctx, Ctx.getTranslationUnitDecl(), Loc, Loc,
+                                  DeclarationName(&Idents.get(Name)), FnTy,
+                                  Ctx.getTrivialTypeSourceInfo(FnTy, Loc),
+                                  SC_None);
+  SmallVector<ParmVarDecl *, 4> Params;
+  for (unsigned I = 0; I < ParamTypes.size(); ++I) {
+    auto *P = ParmVarDecl::Create(
+        Ctx, FD, Loc, Loc, &Idents.get("__cppsh_p" + std::to_string(I)),
+        ParamTypes[I], Ctx.getTrivialTypeSourceInfo(ParamTypes[I], Loc), SC_None,
+        /*DefArg=*/nullptr);
+    P->setScopeInfo(0, I);
+    Params.push_back(P);
+  }
+  FD->setParams(Params);
+  Stmt *Body = nullptr;
+  {
+    Sema::SynthesizedFunctionScope Scope(S, FD);
+    Body = MakeBody(FD, Params);
+    // An `auto` function that returns nothing returns void.
+    if (Body && FD->getReturnType()->isUndeducedType())
+      if (AutoType *AT = FD->getReturnType()->getContainedAutoType())
+        S.DeduceFunctionTypeFromReturnExpr(FD, Loc, /*RetExpr=*/nullptr, AT);
+    if (Body)
+      FD->setBody(Body);
+  }
+  if (!Body || FD->getReturnType()->isUndeducedType())
     return nullptr;
-  LookupResult R(S, &Idents.get("__cppsh_region_tag"), SourceLocation(),
-                 Sema::LookupOrdinaryName);
-  S.LookupQualifiedName(R, Sh);
-  // Through a using-declaration too (the std.sh module exports it by one).
-  for (NamedDecl *D : R)
-    if (auto *Tag = dyn_cast<VarTemplateDecl>(D->getUnderlyingDecl()))
-      return Tag;
-  return nullptr;
+  Ctx.getTranslationUnitDecl()->addDecl(FD);
+  return FD;
 }
 
-// A staged region run (Parser::CppshEmitRegion), as the function it is in
-// runs: its call operator instantiated with the values of the locals and
-// arguments it is handed -- read from the frame (or rebuilt from their
-// snapshots), each a value it is compiled with unless it changes it -- and
-// called with them, in their frame. One instantiation for each set of values
-// (its __cppsh_key), found again for the same values.
-static void cppshRunRegion(const void *Tag, void *Closure, void *const *Frame,
-                           unsigned N, bool Keep) {
-  if (!CppshActiveInterpreter)
-    return;
+// `*(T *)E[I]`, E a `void **`: the object a frame entry points to.
+static Expr *cppshFrameEntry(Sema &S, ParmVarDecl *Frame, unsigned I,
+                             QualType PtrTy) {
+  ASTContext &Ctx = S.Context;
+  const SourceLocation Loc;
+  ExprResult Base = S.DefaultLvalueConversion(
+      S.BuildDeclRefExpr(Frame, Frame->getType(), VK_LValue, Loc));
+  if (!Base.isUsable())
+    return nullptr;
+  Expr *Index = IntegerLiteral::Create(
+      Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), I), Ctx.IntTy, Loc);
+  ExprResult Entry = S.CreateBuiltinArraySubscriptExpr(Base.get(), Loc, Index, Loc);
+  if (!Entry.isUsable())
+    return nullptr;
+  ExprResult Ptr = S.BuildCStyleCastExpr(
+      Loc, Ctx.getTrivialTypeSourceInfo(PtrTy, Loc), Loc, Entry.get());
+  return Ptr.isUsable() ? Ptr.get() : nullptr;
+}
+
+// The snapshot of the object of type T at P (std::sh::__cppsh_snapshot),
+// taken now -- through a function compiled once for each type.
+static bool cppshSnapshotAt(Interpreter &Interp, Sema &S, QualType T,
+                            const void *P) {
+  using SnapFn = void (*)(void **);
+  static llvm::DenseMap<const Type *, SnapFn> Snappers;
+  static unsigned Count = 0;
+  ASTContext &Ctx = S.Context;
+  T = Ctx.getCanonicalType(T).getUnqualifiedType();
+  SnapFn Fn = Snappers.lookup(T.getTypePtr());
+  if (!Fn) {
+    ExprResult Snap = cppshShCallee(S, "__cppsh_snapshot");
+    if (!Snap.isUsable() || !cppshReport(Interp.cppshBeginBuild()))
+      return false;
+    const QualType VoidPtrPtr = Ctx.getPointerType(Ctx.VoidPtrTy);
+    FunctionDecl *FD = cppshDefineFunction(
+        S, "__cppsh_snap" + std::to_string(Count++), Ctx.VoidTy, {VoidPtrPtr},
+        [&](FunctionDecl *, ArrayRef<ParmVarDecl *> Ps) -> Stmt * {
+          const SourceLocation Loc;
+          Expr *Ptr = cppshFrameEntry(S, Ps[0], 0, Ctx.getPointerType(T));
+          ExprResult Obj = Ptr ? S.CreateBuiltinUnaryOp(Loc, UO_Deref, Ptr)
+                               : ExprError();
+          Expr *Arg = Obj.isUsable() ? Obj.get() : nullptr;
+          ExprResult Call = Arg ? S.BuildCallExpr(S.TUScope, Snap.get(), Loc,
+                                                  Arg, Loc)
+                                : ExprError();
+          ExprResult Full =
+              Call.isUsable()
+                  ? S.ActOnFinishFullExpr(Call.get(), /*DiscardedValue=*/true)
+                  : ExprError();
+          if (!Full.isUsable())
+            return nullptr;
+          Stmt *Stmts[1] = {Full.get()};
+          return CompoundStmt::Create(Ctx, Stmts, FPOptionsOverride(), Loc, Loc);
+        });
+    if (FD)
+      Interp.cppshAddBuilt(FD);
+    if (!cppshReport(Interp.cppshEndBuildAndExecute()) || !FD)
+      return false;
+    llvm::Expected<llvm::orc::ExecutorAddr> Addr =
+        Interp.getSymbolAddress(GlobalDecl(FD));
+    if (!Addr) {
+      llvm::consumeError(Addr.takeError());
+      return false;
+    }
+    Fn = Addr->toPtr<SnapFn>();
+    Snappers[T.getTypePtr()] = Fn;
+  }
+  void *Entries[1] = {const_cast<void *>(P)};
+  Fn(Entries);
+  return true;
+}
+
+// The expression rebuilding the value of the object of type T at Object:
+// a C string's literal; else rebuilt from the object's snapshot.
+static Expr *cppshRebuildAt(Sema &S, QualType T, const void *Object,
+                            SourceLocation Loc) {
+  if (!CppshActiveInterpreter || !Object)
+    return nullptr;
+  ASTContext &Ctx = S.Context;
+  if (const auto *PT = T->getAs<PointerType>();
+      PT && PT->getPointeeType()->isCharType()) {
+    const char *Str = *static_cast<const char *const *>(Object);
+    if (!Str)
+      return nullptr;
+    llvm::StringRef Text(Str, ::strnlen(Str, 1 << 16));
+    QualType Char = Ctx.CharTy.withConst();
+    Expr *Lit = StringLiteral::Create(
+        Ctx, Text, StringLiteralKind::Ordinary, /*Pascal=*/false,
+        Ctx.getStringLiteralArrayType(Ctx.CharTy, Text.size()), Loc);
+    return S.ImpCastExprToType(Lit, Ctx.getPointerType(Char), CK_ArrayToPointerDecay)
+        .get();
+  }
+  llvm::Expected<llvm::orc::ExecutorAddr> Reader =
+      CppshActiveInterpreter->getSymbolAddressFromLinkerName("__cppsh_snapshot_of");
+  if (!Reader) {
+    llvm::consumeError(Reader.takeError());
+    return nullptr;
+  }
+  using ReaderFn = const char *(*)(const void *, unsigned long long *);
+  unsigned long long Size = 0;
+  const char *Data = Reader->toPtr<ReaderFn>()(Object, &Size);
+  if (!Data)
+    return nullptr;
+  CppshSnapshot R{reinterpret_cast<const unsigned char *>(Data),
+                  reinterpret_cast<const unsigned char *>(Data) + Size};
+  return cppshRebuild(S, T, R, Loc);
+}
+
+namespace {
+// A staged statement's instantiation for one set of values: its function.
+struct CppshStagedCompiled {
+  llvm::FoldingSetNodeID Values;
+  FunctionDecl *Function = nullptr;
+  void *Address = nullptr;
+};
+} // namespace
+
+// A staged statement, reached as its function runs (CodeGen's
+// EmitCppshStagedStmt): its body instantiated for the values its frame
+// holds now -- each local's that the body does not change, read from memory
+// (or rebuilt from its snapshot), a constant of what is compiled -- into a
+// function of its own, taking the frame and where the function around the
+// statement returns its value, and run. One instantiation for each set of
+// values, found again for the same values. What it returns: how the body
+// left (0: off its end; 1, 2: by a break, a continue; 3: by a return, its
+// value constructed). The rest of a staged function's body (keepsResult):
+// its function's result kept in a global, __cppsh_resK, for the caller.
+static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
+                          void *Slot) {
+  if (!CppshActiveInterpreter || !Staged || !Staged->getStagedDecl())
+    return 0;
   Interpreter &Interp = *CppshActiveInterpreter;
   Sema &S = Interp.getCompilerInstance()->getSema();
   ASTContext &Ctx = S.Context;
-  const SourceLocation Loc;
-
-  // Which region: the specialization of __cppsh_region_tag at Tag.
-  static llvm::DenseMap<const void *, VarTemplateSpecializationDecl *> Tags;
-  VarTemplateSpecializationDecl *Spec = Tags.lookup(Tag);
-  // What the search met, said where it finds nothing.
-  bool HaveTemplate = false;
-  unsigned Candidates = 0, Unresolved = 0;
-  std::string FirstError;
-  if (!Spec)
-    if (VarTemplateDecl *VTD = cppshRegionTagTemplate(S)) {
-      HaveTemplate = true;
-      for (VarTemplateSpecializationDecl *Candidate : VTD->specializations()) {
-        ++Candidates;
-        llvm::Expected<llvm::orc::ExecutorAddr> Addr =
-            Interp.getSymbolAddress(GlobalDecl(Candidate));
-        if (!Addr) {
-          ++Unresolved;
-          std::string Why = llvm::toString(Addr.takeError());
-          if (FirstError.empty())
-            FirstError = std::move(Why);
-          continue;
-        }
-        if (Addr->toPtr<const void *>() == Tag) {
-          Tags[Tag] = Spec = Candidate;
-          break;
-        }
-      }
-    }
-  auto Fail = [](llvm::StringRef Why) {
-    llvm::errs() << "error: cppsh: a staged region cannot run: " << Why << "\n";
-  };
-  if (!Spec) {
-    Fail(!HaveTemplate
-             ? std::string("std::sh::__cppsh_region_tag is not found")
-             : "its closure type is not known: of " + std::to_string(Candidates) +
-                   " __cppsh_region_tag specializations, " +
-                   std::to_string(Unresolved) + " have no address" +
-                   (FirstError.empty() ? std::string() : " (" + FirstError + ")") +
-                   ", none is at it");
-    return;
-  }
-  if (Spec->getTemplateArgs().size() != 2) {
-    Fail("its tag names no closure and arguments");
-    return;
-  }
-  const QualType ClosureType = Spec->getTemplateArgs()[0].getAsType();
-  ArrayRef<TemplateArgument> ArgTypes =
-      Spec->getTemplateArgs()[1].getPackAsArray();
-  auto *RD = ClosureType->getAsCXXRecordDecl();
-  FunctionTemplateDecl *CallTemplate =
-      RD ? RD->getDependentLambdaCallOperator() : nullptr;
-  FunctionDecl *Pattern = CallTemplate ? CallTemplate->getTemplatedDecl() : nullptr;
-  if (!Pattern) {
-    Fail("its closure has no call operator template");
-    return;
-  }
-  if (Pattern->getNumParams() != N || ArgTypes.size() != N) {
-    Fail("its call operator does not take what it is handed");
-    return;
-  }
-
-  const std::string Unit = std::to_string(CppshContinuations++);
-  CppshFrameState State;
-  // Its frame: the arguments, then the closure itself.
-  std::vector<CppshCutLocal> Locals;
-  SmallVector<void *, 8> Addresses(Frame, Frame + N);
   IdentifierTable &Idents = S.getPreprocessor().getIdentifierTable();
-  for (unsigned I = 0; I < N; ++I)
-    Locals.push_back({&Idents.get("a" + std::to_string(I)),
-                      ArgTypes[I].getAsType().getNonReferenceType(), false,
-                      /*ByRef=*/true});
-  Locals.push_back({&Idents.get("closure"), ClosureType, false, /*ByRef=*/true});
-  Addresses.push_back(Closure);
-  std::vector<APValue> Needs;
-  CppshGlobals Globals;
-  if (!cppshFrameGlobals(Interp, S, Unit, Locals, Addresses.data(), Needs, Globals) ||
-      Globals.size() != N + 1) {
-    Fail("its frame could not be laid out");
-    return;
-  }
-  // A staged function's call it was handed (a std::sh::staged): the result
-  // that call left, its value, in its place.
+  const SourceLocation Loc;
+  auto Fail = [](llvm::StringRef Why) {
+    llvm::errs() << "error: cppsh: a staged statement cannot run: " << Why << "\n";
+    return 0;
+  };
+  auto *SS = const_cast<CppshStagedStmt *>(Staged);
+  CppshStagedDecl *SD = SS->getStagedDecl();
+  ArrayRef<ImplicitParamDecl *> Params = SD->parameters();
+  const unsigned N = Params.size();
+  if (SS->getNumFrame() != N + (SD->usesThis() ? 1 : 0))
+    return Fail("its frame does not match it");
+  const bool Keep = SS->keepsResult();
+  CppshFrameState State;
+
+  // Each entry's type and object; the staged result's, the last result kept.
+  SmallVector<QualType, 8> Types;
+  SmallVector<void *, 8> Objects(Frame, Frame + N);
+  QualType ResultType;
   for (unsigned I = 0; I < N; ++I) {
-    auto *Arg = Locals[I].Type->getAsCXXRecordDecl();
-    if (!Arg || !Arg->getIdentifier() || Arg->getName() != "staged")
-      continue;
-    LookupResult R(S, &Idents.get(CppshLastResult), Loc, Sema::LookupOrdinaryName);
-    auto *Result = !CppshLastResult.empty() &&
-                           S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl())
-                       ? R.getAsSingle<VarDecl>()
-                       : nullptr;
-    if (!Result) {
-      Fail("the staged call it was handed left no result");
-      return;
+    QualType T = Params[I]->getType().getNonReferenceType();
+    if (SD->getResultTypeParm() && I + 1 == N && T->isDependentType()) {
+      LookupResult R(S, &Idents.get(CppshLastResult), Loc, Sema::LookupOrdinaryName);
+      auto *Result = !CppshLastResult.empty() &&
+                             S.LookupQualifiedName(R, Ctx.getTranslationUnitDecl())
+                         ? R.getAsSingle<VarDecl>()
+                         : nullptr;
+      if (!Result)
+        return Fail("the staged call it uses left no result");
+      llvm::Expected<llvm::orc::ExecutorAddr> Addr =
+          Interp.getSymbolAddress(GlobalDecl(Result));
+      if (!Addr) {
+        llvm::consumeError(Addr.takeError());
+        return Fail("the staged call's result is not found");
+      }
+      ResultType = Result->getType().getNonReferenceType();
+      T = ResultType;
+      Objects[I] = Addr->toPtr<void *>();
     }
-    Locals[I].Type = Result->getType().getNonReferenceType();
-    Globals[I].second = Result;
+    if (T->isDependentType())
+      return Fail("a type of its frame is not known");
+    Types.push_back(T);
   }
 
-  // The values it is compiled with: each parameter it does not change.
-  Stmt *Body = Pattern->getBody();
+  // The values it is compiled with: each local's it does not change.
+  Stmt *Body = SS->getBody();
   llvm::FoldingSetNodeID Values;
-  SmallVector<std::pair<ParmVarDecl *, std::optional<APValue>>, 8> SavedValues;
-  SmallVector<std::pair<ParmVarDecl *, const Expr *>, 8> SavedRebuilds;
+  SmallVector<std::optional<APValue>, 8> Known(N);
+  SmallVector<Expr *, 8> Rebuilt(N, nullptr);
+  if (!ResultType.isNull())
+    Values.AddPointer(Ctx.getCanonicalType(ResultType).getAsOpaquePtr());
   for (unsigned I = 0; I < N; ++I) {
-    ParmVarDecl *P = Pattern->getParamDecl(I);
-    VarDecl *G = Globals[I].second;
-    if (!Body || cppshMutates(Body, P)) {
+    const QualType T = Types[I];
+    if (!Objects[I] || cppshMutates(Body, Params[I]) || T->isIncompleteType()) {
       Values.AddInteger(0u);
       continue;
     }
-    if (std::optional<APValue> V = cppshRuntimeValueOf(G)) {
+    if (T.isTriviallyCopyableType(Ctx))
+      Known[I] = cppshValueAt(Ctx, T, static_cast<const unsigned char *>(Objects[I]));
+    if (Known[I]) {
       Values.AddInteger(1u);
-      V->Profile(Values);
-      auto Known = CppshParamValue.find(P);
-      SavedValues.push_back({P, Known == CppshParamValue.end()
-                                    ? std::nullopt
-                                    : std::optional<APValue>(Known->second)});
-      CppshParamValue[P] = std::move(*V);
-    } else if (Expr *Rebuild = cppshRuntimeRebuildOf(S, G)) {
+      Known[I]->Profile(Values);
+      continue;
+    }
+    // Not plain data: rebuilt from the snapshot taken of it now.
+    if (!T->getAs<PointerType>())
+      cppshSnapshotAt(Interp, S, T, Objects[I]);
+    Rebuilt[I] = cppshRebuildAt(S, T, Objects[I], Params[I]->getLocation());
+    if (Rebuilt[I]) {
       Values.AddInteger(2u);
-      Rebuild->Profile(Values, Ctx, /*Canonical=*/true);
-      SavedRebuilds.push_back({P, CppshParamRebuild.lookup(P)});
-      CppshParamRebuild[P] = Rebuild;
+      Rebuilt[I]->Profile(Values, Ctx, /*Canonical=*/true);
     } else {
       Values.AddInteger(0u);
     }
   }
-  // Its key: one for each set of values, in the order first met.
-  static std::map<const FunctionTemplateDecl *, std::vector<llvm::FoldingSetNodeID>>
-      Keys;
-  std::vector<llvm::FoldingSetNodeID> &Known = Keys[CallTemplate];
-  unsigned Key = llvm::find(Known, Values) - Known.begin();
-  if (Key == Known.size())
-    Known.push_back(Values);
 
-  // closure.operator()<Key>(a0, a1, ...), a top-level statement.
+  static std::map<const CppshStagedStmt *, std::vector<CppshStagedCompiled>> Compiled;
+  static unsigned Count = 0;
+  std::vector<CppshStagedCompiled> &Known2 = Compiled[Staged];
+  CppshStagedCompiled *Found = nullptr;
+  for (CppshStagedCompiled &C : Known2)
+    if (C.Values == Values)
+      Found = &C;
+
+  // The function around the statement: where its returns go, whose access
+  // and `this` it has.
+  DeclContext *Around =
+      SD->getDeclContext()->getEnclosingNonExpansionStatementContext();
+  auto *Outer = dyn_cast<FunctionDecl>(Around);
+
   const bool WasNeeded = std::exchange(CppshCutNeeded, false);
-  if (cppshReport(Interp.cppshBeginBuild())) {
-    TopLevelStmtDecl *Stmt = S.ActOnStartTopLevelStmtDecl(S.TUScope);
-    Expr *Base = S.BuildDeclRefExpr(Globals[N].second, ClosureType, VK_LValue, Loc);
-    Expr *KeyLit = IntegerLiteral::Create(
-        Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.UnsignedIntTy), Key),
-        Ctx.UnsignedIntTy, Loc);
-    TemplateArgumentListInfo TemplateArgs(Loc, Loc);
-    TemplateArgs.addArgument(
-        TemplateArgumentLoc(TemplateArgument(KeyLit, /*IsCanonical=*/false), KeyLit));
-    CXXScopeSpec SS;
-    DeclarationNameInfo Name(Ctx.DeclarationNames.getCXXOperatorName(OO_Call), Loc);
-    ExprResult Member = S.BuildMemberReferenceExpr(
-        Base, ClosureType, Loc, /*IsArrow=*/false, SS, SourceLocation(), nullptr,
-        Name, &TemplateArgs, S.TUScope);
-    SmallVector<Expr *, 8> Args;
-    for (unsigned I = 0; I < N; ++I)
-      Args.push_back(S.BuildDeclRefExpr(Globals[I].second,
-                                        Globals[I].first->Type, VK_LValue, Loc));
-    ExprResult Call = Member.isUsable()
-                          ? S.BuildCallExpr(S.TUScope, Member.get(), Loc, Args, Loc)
-                          : ExprError();
-    // A need met as it was instantiated: a value it changes (no constant).
-    cppshEndNeedDiagnostics(S);
-    if (CppshCutNeeded) {
-      S.Diag(Pattern->getLocation(),
-             S.getDiagnostics().getCustomDiagID(
-                 DiagnosticsEngine::Error,
-                 "this needs the value of a variable it changes itself: not staged"));
-      Call = ExprError();
+  auto RestoreNeeded = llvm::make_scope_exit([&] { CppshCutNeeded = WasNeeded; });
+  if (!Found || Keep) {
+    if (!cppshReport(Interp.cppshBeginBuild()))
+      return Fail("no unit to compile it in");
+    FunctionDecl *F = Found ? Found->Function : nullptr;
+    if (!F) {
+      const QualType VoidPtrPtr = Ctx.getPointerType(Ctx.VoidPtrTy);
+      SmallVector<QualType, 2> FnParams{VoidPtrPtr};
+      if (!Keep)
+        FnParams.push_back(Ctx.VoidPtrTy);
+      Sema::CppshStagedRun Run;
+      Run.KeepsResult = Keep;
+      Run.ReturnType = Outer ? Outer->getReturnType() : Ctx.VoidTy;
+      Run.AccessContext = Around;
+      F = cppshDefineFunction(
+          S, "__cppsh_staged" + std::to_string(Count++),
+          Keep ? Ctx.getAutoDeductType() : Ctx.IntTy, FnParams,
+          [&](FunctionDecl *Fn, ArrayRef<ParmVarDecl *> Ps) -> Stmt * {
+            Run.Function = Fn;
+            Run.Slot = Keep ? nullptr : Ps[1];
+            SmallVector<Stmt *, 16> Stmts;
+            SmallVector<VarDecl *, 8> Locals;
+            // Each local: `T &name = *(T *)frame[I];`, its value bound.
+            for (unsigned I = 0; I < N; ++I) {
+              const QualType RefT = Ctx.getLValueReferenceType(Types[I]);
+              auto *L = VarDecl::Create(Ctx, Fn, Loc, Params[I]->getLocation(),
+                                        Params[I]->getIdentifier(), RefT,
+                                        Ctx.getTrivialTypeSourceInfo(RefT, Loc),
+                                        SC_None);
+              Expr *Ptr = cppshFrameEntry(S, Ps[0], I, Ctx.getPointerType(Types[I]));
+              ExprResult Obj =
+                  Ptr ? S.CreateBuiltinUnaryOp(Loc, UO_Deref, Ptr) : ExprError();
+              if (!Obj.isUsable())
+                return nullptr;
+              S.AddInitializerToDecl(L, Obj.get(), /*DirectInit=*/false);
+              if (L->isInvalidDecl())
+                return nullptr;
+              if (Known[I])
+                CppshParamValue[L] = *Known[I];
+              else if (Rebuilt[I])
+                CppshParamRebuild[L] = Rebuilt[I];
+              StmtResult DS =
+                  S.ActOnDeclStmt(S.ConvertDeclToDeclGroup(L), Loc, Loc);
+              if (!DS.isUsable())
+                return nullptr;
+              Stmts.push_back(DS.get());
+              Locals.push_back(L);
+            }
+            // `this`: `C *__cppsh_this = (C *)frame[N];`.
+            if (SD->usesThis()) {
+              const QualType ThisTy = SS->frame().back()->getType();
+              auto *This = VarDecl::Create(
+                  Ctx, Fn, Loc, Loc, &Idents.get("__cppsh_this"), ThisTy,
+                  Ctx.getTrivialTypeSourceInfo(ThisTy, Loc), SC_None);
+              Expr *Ptr = cppshFrameEntry(S, Ps[0], N, ThisTy);
+              if (!Ptr)
+                return nullptr;
+              S.AddInitializerToDecl(This, Ptr, /*DirectInit=*/false);
+              StmtResult DS =
+                  S.ActOnDeclStmt(S.ConvertDeclToDeclGroup(This), Loc, Loc);
+              if (!DS.isUsable())
+                return nullptr;
+              Stmts.push_back(DS.get());
+              Run.This = This;
+            }
+            StmtResult Inst = S.InstantiateCppshStaged(SS, Locals, ResultType, Run);
+            cppshEndNeedDiagnostics(S);
+            if (!Inst.isUsable())
+              return nullptr;
+            Stmts.push_back(Inst.get());
+            if (!Keep)
+              Stmts.push_back(ReturnStmt::Create(
+                  Ctx, Loc,
+                  IntegerLiteral::Create(
+                      Ctx, llvm::APInt(Ctx.getIntWidth(Ctx.IntTy), 0), Ctx.IntTy, Loc),
+                  nullptr));
+            return CompoundStmt::Create(Ctx, Stmts, FPOptionsOverride(), Loc, Loc);
+          });
+      if (F)
+        Interp.cppshAddBuilt(F);
     }
-    // Its result kept (a staged function's: __cppsh_region_staged), where it
-    // gives one: a global, __cppsh_resK, for whoever waits for it.
-    const bool Result = Keep && Call.isUsable() &&
-                        !Call.get()->getType()->isVoidType();
-    ExprResult Full = Call.isUsable() && !Result
-                          ? S.ActOnFinishFullExpr(Call.get(), /*DiscardedValue=*/true)
-                          : ExprError();
-    S.ActOnFinishTopLevelStmtDecl(
-        Stmt, Full.isUsable() ? static_cast<clang::Stmt *>(Full.get())
-                              : new (Ctx) NullStmt(Loc));
-    Interp.cppshAddBuilt(Stmt);
-    bool Value = false;
-    std::string ResultName = "__cppsh_res" + Unit;
-    if (Result) {
-      const QualType T =
-          Call.get()->getType().getNonReferenceType().getUnqualifiedType();
-      auto *Res = VarDecl::Create(Ctx, Ctx.getTranslationUnitDecl(), Loc, Loc,
-                                  &Idents.get(ResultName), T,
-                                  Ctx.getTrivialTypeSourceInfo(T, Loc), SC_None);
-      S.AddInitializerToDecl(Res, Call.get(), /*DirectInit=*/false);
-      S.FinalizeDeclaration(Res);
-      S.PushOnScopeChains(Res, S.TUScope);
-      Interp.cppshAddBuilt(Res);
-      auto *RecordType = T->getAsCXXRecordDecl();
-      Value = !(RecordType && RecordType->getIdentifier() &&
-                RecordType->getName() == "staged");
+    // The result kept: `auto __cppsh_resK = F((void **)frame);`.
+    std::string ResultName;
+    if (F && Keep) {
+      const QualType VoidPtrPtr = Ctx.getPointerType(Ctx.VoidPtrTy);
+      Expr *Int = IntegerLiteral::Create(
+          Ctx, llvm::APInt(64, llvm::bit_cast<uintptr_t>(Frame)),
+          Ctx.UnsignedLongLongTy, Loc);
+      ExprResult FrameArg = S.BuildCStyleCastExpr(
+          Loc, Ctx.getTrivialTypeSourceInfo(VoidPtrPtr, Loc), Loc, Int);
+      ExprResult Callee = S.BuildDeclRefExpr(F, F->getType(), VK_LValue, Loc);
+      Expr *Arg = FrameArg.isUsable() ? FrameArg.get() : nullptr;
+      ExprResult Call =
+          Arg && Callee.isUsable()
+              ? S.BuildCallExpr(S.TUScope, Callee.get(), Loc, Arg, Loc)
+              : ExprError();
+      if (Call.isUsable() && !Call.get()->getType()->isVoidType()) {
+        ResultName = "__cppsh_res" + std::to_string(CppshContinuations++);
+        const QualType Auto = Ctx.getAutoDeductType();
+        auto *Res = VarDecl::Create(Ctx, Ctx.getTranslationUnitDecl(), Loc, Loc,
+                                    &Idents.get(ResultName), Auto,
+                                    Ctx.getTrivialTypeSourceInfo(Auto, Loc), SC_None);
+        S.AddInitializerToDecl(Res, Call.get(), /*DirectInit=*/false);
+        S.FinalizeDeclaration(Res);
+        S.PushOnScopeChains(Res, S.TUScope);
+        Interp.cppshAddBuilt(Res);
+      } else if (Call.isUsable()) {
+        TopLevelStmtDecl *Top = S.ActOnStartTopLevelStmtDecl(S.TUScope);
+        ExprResult Full = S.ActOnFinishFullExpr(Call.get(), /*DiscardedValue=*/true);
+        S.ActOnFinishTopLevelStmtDecl(
+            Top, Full.isUsable() ? static_cast<Stmt *>(Full.get())
+                                 : new (Ctx) NullStmt(Loc));
+        Interp.cppshAddBuilt(Top);
+      }
     }
-    if (cppshReport(Interp.cppshEndBuildAndExecute()) && Value)
-      CppshLastResult = ResultName;
+    if (!cppshReport(Interp.cppshEndBuildAndExecute()) || !F)
+      return Fail("it did not compile for the values it runs with");
+    if (Keep) {
+      // Run as its unit ran: what it returned kept.
+      if (!ResultName.empty())
+        CppshLastResult = ResultName;
+      if (!Found)
+        Known2.push_back({Values, F, nullptr});
+      return 0;
+    }
+    llvm::Expected<llvm::orc::ExecutorAddr> Addr =
+        Interp.getSymbolAddress(GlobalDecl(F));
+    if (!Addr) {
+      llvm::consumeError(Addr.takeError());
+      return Fail("its compiled function is not found");
+    }
+    Known2.push_back({Values, F, Addr->toPtr<void *>()});
+    Found = &Known2.back();
   }
-  CppshCutNeeded = WasNeeded;
-  for (auto &[P, Was] : llvm::reverse(SavedRebuilds)) {
-    if (Was)
-      CppshParamRebuild[P] = Was;
-    else
-      CppshParamRebuild.erase(P);
-  }
-  for (auto &[P, Was] : llvm::reverse(SavedValues)) {
-    if (Was)
-      CppshParamValue[P] = std::move(*Was);
-    else
-      CppshParamValue.erase(P);
-  }
+  if (!Found->Address)
+    return Fail("its compiled function is not found");
+  // The frame, with the staged result's object in its place.
+  SmallVector<void *, 8> Entries(Objects.begin(), Objects.end());
+  if (SD->usesThis())
+    Entries.push_back(Frame[N]);
+  Entries.push_back(nullptr);
+  using StagedFn = int (*)(void **, void *);
+  return reinterpret_cast<StagedFn>(Found->Address)(Entries.data(), Slot);
 }
 
-extern "C" void __cppsh_region_run(const void *Tag, void *Closure,
-                                   void *const *Frame, unsigned N) {
-  if (!CppshActiveInterpreter)
-    llvm::errs() << "error: cppsh: a staged region cannot run: no interpreter\n";
-  cppshRunRegion(Tag, Closure, Frame, N, /*Keep=*/false);
-}
-
-// The rest of a staged function's body made a region: its result kept.
-extern "C" void __cppsh_region_run_staged(const void *Tag, void *Closure,
-                                          void *const *Frame, unsigned N) {
-  cppshRunRegion(Tag, Closure, Frame, N, /*Keep=*/true);
+extern "C" int __cppsh_staged_run(const void *Node, void *const *Frame,
+                                  void *Slot) {
+  if (!CppshActiveInterpreter) {
+    llvm::errs() << "error: cppsh: a staged statement cannot run: no interpreter\n";
+    return 0;
+  }
+  return cppshRunStaged(static_cast<const CppshStagedStmt *>(Node), Frame, Slot);
 }
 
 // An expression parsed from the recorded tokens [Begin, End), compiled and

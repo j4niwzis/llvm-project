@@ -1103,6 +1103,149 @@ public:
   }
 };
 
+class CppshStagedDecl;
+
+/// cppsh: a staged statement -- code of a function that needs a value only
+/// running the function gives (a local's, as a template argument or an array
+/// bound; the result of a staged function), compiled when it is reached, for
+/// the values the function has then, and run.
+///
+/// Its body, in its context (CppshStagedDecl), is dependent on the values of
+/// the staged parameters standing for the locals it names; its frame holds,
+/// for each staged parameter in order, the expression naming the local in
+/// the function around it. As the function runs, the statement hands its
+/// frame (the locals' addresses) to the interpreter, which instantiates the
+/// body with each local's value -- one instantiation for each set of values
+/// -- compiles it, and runs it. Where the body leaves the statement (a break
+/// or continue of a loop around it, a return of the function: Leaves), the
+/// function does so after it; a value it returns is constructed where the
+/// function returns it. Where it is the rest of a staged function's body
+/// (KeepsResult), what it returns is kept by the interpreter for the
+/// function's caller instead -- of a type known only then.
+class CppshStagedStmt final
+    : public Stmt,
+      private llvm::TrailingObjects<CppshStagedStmt, Stmt *> {
+  friend class ASTStmtReader;
+  friend class ASTStmtWriter;
+  friend TrailingObjects;
+
+  CppshStagedDecl *StagedDecl = nullptr;
+  SourceLocation BeginLoc, EndLoc;
+  unsigned NumFrame = 0;
+  unsigned Leaves = 0;
+  bool KeepsResult = false;
+
+  // Trailing: the body, then the frame.
+  CppshStagedStmt(EmptyShell Empty, unsigned NumFrame)
+      : Stmt(CppshStagedStmtClass, Empty), NumFrame(NumFrame) {}
+  CppshStagedStmt(CppshStagedDecl *D, Stmt *Body, ArrayRef<Expr *> Frame,
+                  unsigned Leaves, bool KeepsResult, SourceLocation BeginLoc,
+                  SourceLocation EndLoc);
+
+public:
+  /// How the body leaves the statement, besides falling off its end.
+  enum : unsigned {
+    LeavesByBreak = 1,
+    LeavesByContinue = 2,
+    LeavesByReturn = 4,
+  };
+
+  static CppshStagedStmt *Create(const ASTContext &C, CppshStagedDecl *D,
+                                 Stmt *Body, ArrayRef<Expr *> Frame,
+                                 unsigned Leaves, bool KeepsResult,
+                                 SourceLocation BeginLoc,
+                                 SourceLocation EndLoc);
+  static CppshStagedStmt *CreateEmpty(const ASTContext &C, unsigned NumFrame);
+
+  CppshStagedDecl *getStagedDecl() const { return StagedDecl; }
+
+  Stmt *getBody() const { return getTrailingObjects()[0]; }
+  void setBody(Stmt *S) { getTrailingObjects()[0] = S; }
+
+  unsigned getNumFrame() const { return NumFrame; }
+  ArrayRef<Expr *> frame() const {
+    return {reinterpret_cast<Expr *const *>(getTrailingObjects() + 1),
+            NumFrame};
+  }
+  void setFrame(unsigned I, Expr *E) { getTrailingObjects()[1 + I] = E; }
+
+  unsigned getLeaves() const { return Leaves; }
+  bool leaves(unsigned How) const { return Leaves & How; }
+  bool keepsResult() const { return KeepsResult; }
+
+  SourceLocation getBeginLoc() const { return BeginLoc; }
+  SourceLocation getEndLoc() const { return EndLoc; }
+
+  child_range children() {
+    Stmt **S = getTrailingObjects();
+    return child_range(S, S + 1 + NumFrame);
+  }
+  const_child_range children() const {
+    Stmt *const *S = getTrailingObjects();
+    return const_child_range(S, S + 1 + NumFrame);
+  }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CppshStagedStmtClass;
+  }
+};
+
+/// cppsh: a jump out of a staged statement's body -- a break or continue of
+/// a loop around the statement, or a return of the function it is in.
+///
+/// In the body as written it holds the value returned (converted to the
+/// function's return type where that is known). Where the body is compiled
+/// as the function runs -- a function of its own, taking the frame and where
+/// the value returned goes -- it also holds that place (Slot: a pointer the
+/// value is constructed at) and the return of that function saying how the
+/// body left (Leave: `return K;`, K the ExitKind).
+class CppshStagedExitStmt final : public Stmt {
+public:
+  enum ExitKind : unsigned { Break = 1, Continue = 2, Return = 3 };
+
+private:
+  enum { VALUE, SLOT, LEAVE, END };
+  Stmt *SubStmts[END] = {};
+  SourceLocation ExitLoc;
+  ExitKind Kind = Break;
+
+public:
+  CppshStagedExitStmt(ExitKind K, SourceLocation Loc, Expr *Value,
+                      Expr *Slot, Stmt *Leave)
+      : Stmt(CppshStagedExitStmtClass), ExitLoc(Loc), Kind(K) {
+    SubStmts[VALUE] = Value;
+    SubStmts[SLOT] = Slot;
+    SubStmts[LEAVE] = Leave;
+  }
+  explicit CppshStagedExitStmt(EmptyShell Empty)
+      : Stmt(CppshStagedExitStmtClass, Empty) {}
+
+  ExitKind getKind() const { return Kind; }
+  void setKind(ExitKind K) { Kind = K; }
+
+  Expr *getValue() const { return cast_or_null<Expr>(SubStmts[VALUE]); }
+  void setValue(Expr *E) { SubStmts[VALUE] = E; }
+  Expr *getSlot() const { return cast_or_null<Expr>(SubStmts[SLOT]); }
+  void setSlot(Expr *E) { SubStmts[SLOT] = E; }
+  Stmt *getLeave() const { return SubStmts[LEAVE]; }
+  void setLeave(Stmt *S) { SubStmts[LEAVE] = S; }
+
+  SourceLocation getExitLoc() const { return ExitLoc; }
+  void setExitLoc(SourceLocation L) { ExitLoc = L; }
+
+  SourceLocation getBeginLoc() const { return ExitLoc; }
+  SourceLocation getEndLoc() const;
+
+  child_range children() { return child_range(SubStmts, SubStmts + END); }
+  const_child_range children() const {
+    return const_child_range(SubStmts, SubStmts + END);
+  }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CppshStagedExitStmtClass;
+  }
+};
+
 }  // end namespace clang
 
 #endif

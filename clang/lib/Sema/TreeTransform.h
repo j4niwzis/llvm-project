@@ -9617,6 +9617,52 @@ TreeTransform<Derived>::TransformCXXForRangeStmt(CXXForRangeStmt *S) {
   return FinishCXXForRangeStmt(NewStmt.get(), Body.get());
 }
 
+// cppsh: a staged statement, in code being transformed (a template's
+// instantiation; a staged statement's around it, instantiated as it runs):
+// still staged, its frame and its staged parameters' types transformed, its
+// body transformed in a context of its own.
+template <typename Derived>
+StmtResult TreeTransform<Derived>::TransformCppshStagedStmt(CppshStagedStmt *S) {
+  CppshStagedDecl *Old = S->getStagedDecl();
+  if (!Old)
+    return StmtError();
+  SmallVector<Expr *, 8> Frame;
+  for (Expr *E : S->frame()) {
+    ExprResult R = getDerived().TransformExpr(E);
+    if (R.isInvalid())
+      return StmtError();
+    Frame.push_back(R.get());
+  }
+  SmallVector<QualType, 8> Types;
+  for (ImplicitParamDecl *P : Old->parameters()) {
+    QualType T = getDerived().TransformType(P->getType());
+    if (T.isNull())
+      return StmtError();
+    Types.push_back(T);
+  }
+  CppshStagedDecl *New = getSema().ActOnStartCppshStagedInstantiation(
+      Old, Types, S->keepsResult());
+  getDerived().transformedLocalDecl(Old, {New});
+  for (unsigned I = 0; I < New->parameters().size(); ++I)
+    getDerived().transformedLocalDecl(Old->parameters()[I],
+                                      {New->parameters()[I]});
+  StmtResult Body = getDerived().TransformStmt(S->getBody());
+  return getSema().ActOnFinishCppshStagedInstantiation(New, Body, Frame, S);
+}
+
+template <typename Derived>
+StmtResult
+TreeTransform<Derived>::TransformCppshStagedExitStmt(CppshStagedExitStmt *S) {
+  ExprResult Value;
+  if (Expr *V = S->getValue()) {
+    Value = getDerived().TransformInitializer(V, /*NotCopyInit=*/false);
+    if (Value.isInvalid())
+      return StmtError();
+  }
+  return getSema().BuildCppshStagedExit(S->getKind(), S->getExitLoc(),
+                                        Value.get());
+}
+
 template <typename Derived>
 StmtResult TreeTransform<Derived>::TransformCXXExpansionStmtPattern(
     CXXExpansionStmtPattern *S) {
@@ -15295,6 +15341,10 @@ TreeTransform<Derived>::TransformCXXNullPtrLiteralExpr(
 template<typename Derived>
 ExprResult
 TreeTransform<Derived>::TransformCXXThisExpr(CXXThisExpr *E) {
+  // cppsh: in a staged statement compiled as its function runs, the variable
+  // holding that function's `this`.
+  if (Expr *Staged = getSema().CppshStagedThis(E->getBeginLoc()))
+    return Staged;
 
   // In lambdas, the qualifiers of the type depends of where in
   // the call operator `this` appear, and we do not have a good way to
@@ -16452,7 +16502,8 @@ TreeTransform<Derived>::TransformLambdaExpr(LambdaExpr *E) {
   // will be deemed as dependent even if there are no dependent template
   // arguments.
   // (A ClassTemplateSpecializationDecl is always a dependent context.)
-  while (DC->isRequiresExprBody() || isa<CXXExpansionStmtDecl>(DC))
+  while (DC->isRequiresExprBody() ||
+         isa<CXXExpansionStmtDecl, CppshStagedDecl>(DC))
     DC = DC->getParent();
   if ((getSema().isUnevaluatedContext() ||
        getSema().isConstantEvaluatedContext()) &&

@@ -40,8 +40,6 @@
 using namespace clang;
 
 namespace clang {
-extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
-extern llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
 } // namespace clang
 
 static bool isDeclWithinFunction(const Decl *D) {
@@ -3705,18 +3703,6 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
   for (unsigned P = 0; P < Params.size(); ++P)
     Params[P]->setOwningFunction(Method);
   Method->setParams(Params);
-  // cppsh: the values a call specialized the parameters on (a staged
-  // region's call operator: __cppsh_region_run), its instantiation's too.
-  for (unsigned P = 0; P < Params.size() && P < D->getNumParams(); ++P) {
-    const ParmVarDecl *OrigP = D->getParamDecl(P);
-    if (const Expr *Rebuild = CppshParamRebuild.lookup(OrigP))
-      CppshParamRebuild[Params[P]] = Rebuild;
-    if (auto Known = CppshParamValue.find(OrigP); Known != CppshParamValue.end()) {
-      APValue Value = Known->second;
-      CppshParamValue[Params[P]] = std::move(Value);
-    }
-  }
-
   if (InitMethodInstantiation(Method, D))
     Method->setInvalidDecl();
 
@@ -5163,6 +5149,12 @@ Decl *TemplateDeclInstantiator::VisitConceptDecl(ConceptDecl *D) {
 Decl *TemplateDeclInstantiator::VisitImplicitConceptSpecializationDecl(
     ImplicitConceptSpecializationDecl *D) {
   llvm_unreachable("Concept specializations cannot reside inside a template");
+}
+
+// cppsh: a staged statement's context is instantiated with its statement
+// (TreeTransform::TransformCppshStagedStmt), never on its own.
+Decl *TemplateDeclInstantiator::VisitCppshStagedDecl(CppshStagedDecl *D) {
+  llvm_unreachable("a staged statement's context is instantiated with it");
 }
 
 Decl *

@@ -1783,6 +1783,11 @@ enum class ImplicitParamKind {
   /// Parameter for Thread private variable
   ThreadPrivateVar,
 
+  /// cppsh: a staged parameter -- in a staged statement (CppshStagedDecl),
+  /// the stand-in for a local of the function around it, whose value is
+  /// known only as that function runs.
+  CppshStaged,
+
   /// Other implicit parameter
   Other,
 };

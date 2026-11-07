@@ -146,6 +146,7 @@ namespace clang {
     void VisitStaticAssertDecl(StaticAssertDecl *D);
     void VisitExplicitInstantiationDecl(ExplicitInstantiationDecl *D);
     void VisitCXXExpansionStmtDecl(CXXExpansionStmtDecl *D);
+    void VisitCppshStagedDecl(CppshStagedDecl *D);
     void VisitBlockDecl(BlockDecl *D);
     void VisitOutlinedFunctionDecl(OutlinedFunctionDecl *D);
     void VisitCapturedDecl(CapturedDecl *D);
@@ -2248,6 +2249,17 @@ void ASTDeclWriter::VisitCXXExpansionStmtDecl(CXXExpansionStmtDecl *D) {
   Record.AddStmt(D->getInstantiations());
   Record.AddDeclRef(D->getIndexTemplateParm());
   Code = serialization::DECL_EXPANSION_STMT;
+}
+
+void ASTDeclWriter::VisitCppshStagedDecl(CppshStagedDecl *D) {
+  VisitDecl(D);
+  Record.push_back(D->parameters().size());
+  for (ImplicitParamDecl *P : D->parameters())
+    Record.AddDeclRef(P);
+  Record.AddDeclRef(D->getResultTypeParm());
+  Record.push_back(D->usesThis());
+  Record.AddStmt(D->getStagedStmt());
+  Code = serialization::DECL_CPPSH_STAGED;
 }
 
 /// Emit the DeclContext part of a declaration context decl.

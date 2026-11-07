@@ -92,8 +92,8 @@ std::optional<APValue> (*CppshRuntimeValueOf)(const VarDecl *) = nullptr;
 // expression that rebuilds its value now, from the snapshot cppsh took
 // before compiling this statement; none where it cannot be rebuilt.
 Expr *(*CppshRuntimeRebuildOf)(Sema &, const VarDecl *) = nullptr;
-extern llvm::DenseMap<const ParmVarDecl *, const Expr *> CppshParamRebuild;
-extern llvm::DenseMap<const ParmVarDecl *, APValue> CppshParamValue;
+extern llvm::DenseMap<const VarDecl *, const Expr *> CppshParamRebuild;
+extern llvm::DenseMap<const VarDecl *, APValue> CppshParamValue;
 // The first place the value specialization needed the value of a variable
 // this same input defines, not run yet: where the interpreter stages it --
 // running what comes before the top-level declaration holding this, then
@@ -21706,7 +21706,8 @@ bool Sema::tryCaptureVariable(
   DeclContext *DC = CurContext;
 
   // Skip past RequiresExprBodys because they don't constitute function scopes.
-  while (DC->isRequiresExprBody() || DC->isExpansionStmt())
+  while (DC->isRequiresExprBody() || DC->isExpansionStmt() ||
+         DC->isCppshStaged())
     DC = DC->getParent();
 
   // tryCaptureVariable is called every time a DeclRef is formed,

@@ -1833,61 +1833,6 @@ void __cppsh_snapshot(const T &v) {
 }
 
 
-// ---- Staged functions (cppsh) ----------------------------------------------
-//
-// A function whose type comes from a value only running it gives -- a local
-// read from std::cin, made an array's size and returned -- returns its result
-// through a staged region (__cppsh_region_staged): the interpreter keeps it
-// (__cppsh_resK) for the caller, which is compiled once it is there. What a
-// staged function returns as it is compiled: staged.
-struct staged {
-  friend constexpr bool operator==(staged, staged) noexcept { return true; }
-};
-
-} // namespace sh
-} // namespace std
-
-// The interpreter's: the staged region whose closure and arguments' types
-// `tag` names, instantiated with the values at `frame` and run on them.
-extern "C" void __cppsh_region_run(const void *tag, void *closure,
-                                   void *const *frame, unsigned n);
-// And one that is the rest of a staged function's body: its result kept.
-extern "C" void __cppsh_region_run_staged(const void *tag, void *closure,
-                                          void *const *frame, unsigned n);
-
-namespace std {
-namespace sh {
-
-// What names a region's closure type and its arguments' types to the
-// interpreter: the address of its specialization.
-template <class C, class... A>
-inline const char __cppsh_region_tag = 0;
-
-// A staged region (the code from a statement that needs a value only running
-// its function gives, made an implicit generic lambda by the compiler):
-// instantiated with the values of the locals and arguments it is handed, as
-// they are now, and run on them -- in their frame.
-template <class C, class... A>
-void __cppsh_region(C &&closure, A &&...args) {
-  void *frame[] = {const_cast<void *>(static_cast<const void *>(std::addressof(args)))...,
-                   nullptr};
-  ::__cppsh_region_run(&__cppsh_region_tag<std::remove_cvref_t<C>, A...>,
-                       const_cast<void *>(static_cast<const void *>(std::addressof(closure))),
-                       frame, static_cast<unsigned>(sizeof...(A)));
-}
-
-// The rest of a staged function's body made a region (the compiler returns
-// this): run, its result kept by the interpreter for whoever waits for it.
-template <class C, class... A>
-staged __cppsh_region_staged(C &&closure, A &&...args) {
-  void *frame[] = {const_cast<void *>(static_cast<const void *>(std::addressof(args)))...,
-                   nullptr};
-  ::__cppsh_region_run_staged(&__cppsh_region_tag<std::remove_cvref_t<C>, A...>,
-                              const_cast<void *>(static_cast<const void *>(std::addressof(closure))),
-                              frame, static_cast<unsigned>(sizeof...(A)));
-  return {};
-}
-
 } // namespace sh
 
 template <>

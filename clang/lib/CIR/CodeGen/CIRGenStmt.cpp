@@ -512,6 +512,8 @@ mlir::LogicalResult CIRGenFunction::emitStmt(const Stmt *s,
   case Stmt::DeferStmtClass:
   case Stmt::CXXExpansionStmtPatternClass:
   case Stmt::CXXExpansionStmtInstantiationClass:
+  case Stmt::CppshStagedStmtClass:
+  case Stmt::CppshStagedExitStmtClass:
     cgm.errorNYI(s->getSourceRange(),
                  std::string("emitStmt: ") + s->getStmtClassName());
     return mlir::failure();

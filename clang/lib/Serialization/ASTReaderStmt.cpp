@@ -1816,6 +1816,27 @@ void ASTStmtReader::VisitCXXExpansionStmtInstantiation(
   S->setShouldApplyLifetimeExtensionToPreamble(Record.readBool());
 }
 
+void ASTStmtReader::VisitCppshStagedStmt(CppshStagedStmt *S) {
+  VisitStmt(S);
+  Record.skipInts(1); // The frame's size.
+  S->Leaves = Record.readInt();
+  S->KeepsResult = Record.readInt();
+  S->BeginLoc = readSourceLocation();
+  S->EndLoc = readSourceLocation();
+  S->StagedDecl = cast_or_null<CppshStagedDecl>(Record.readDeclRef());
+  for (Stmt *&Child : S->children())
+    Child = Record.readSubStmt();
+}
+
+void ASTStmtReader::VisitCppshStagedExitStmt(CppshStagedExitStmt *S) {
+  VisitStmt(S);
+  S->setKind(static_cast<CppshStagedExitStmt::ExitKind>(Record.readInt()));
+  S->setExitLoc(readSourceLocation());
+  S->setValue(cast_or_null<Expr>(Record.readSubStmt()));
+  S->setSlot(cast_or_null<Expr>(Record.readSubStmt()));
+  S->setLeave(Record.readSubStmt());
+}
+
 void ASTStmtReader::VisitCXXExpansionSelectExpr(CXXExpansionSelectExpr *E) {
   VisitExpr(E);
   E->setRangeExpr(cast<InitListExpr>(Record.readSubExpr()));
@@ -3712,6 +3733,15 @@ Stmt *ASTReader::ReadStmtFromStream(ModuleFile &F) {
       S = CXXExpansionStmtInstantiation::CreateEmpty(
           Context, Empty, Record[ASTStmtReader::NumStmtFields],
           Record[ASTStmtReader::NumStmtFields + 1]);
+      break;
+
+    case STMT_CPPSH_STAGED:
+      S = CppshStagedStmt::CreateEmpty(Context,
+                                       Record[ASTStmtReader::NumStmtFields]);
+      break;
+
+    case STMT_CPPSH_STAGED_EXIT:
+      S = new (Context) CppshStagedExitStmt(Empty);
       break;
 
     case STMT_CXX_FOR_RANGE:

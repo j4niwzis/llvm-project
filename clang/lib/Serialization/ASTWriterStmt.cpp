@@ -1834,6 +1834,29 @@ void ASTStmtWriter::VisitCXXExpansionStmtInstantiation(
   Code = serialization::STMT_CXX_EXPANSION_INSTANTIATION;
 }
 
+void ASTStmtWriter::VisitCppshStagedStmt(CppshStagedStmt *S) {
+  VisitStmt(S);
+  Record.push_back(S->getNumFrame());
+  Record.push_back(S->getLeaves());
+  Record.push_back(S->keepsResult());
+  Record.AddSourceLocation(S->getBeginLoc());
+  Record.AddSourceLocation(S->getEndLoc());
+  Record.AddDeclRef(S->getStagedDecl());
+  for (Stmt *Child : S->children())
+    Record.AddStmt(Child);
+  Code = serialization::STMT_CPPSH_STAGED;
+}
+
+void ASTStmtWriter::VisitCppshStagedExitStmt(CppshStagedExitStmt *S) {
+  VisitStmt(S);
+  Record.push_back(S->getKind());
+  Record.AddSourceLocation(S->getExitLoc());
+  Record.AddStmt(S->getValue());
+  Record.AddStmt(S->getSlot());
+  Record.AddStmt(S->getLeave());
+  Code = serialization::STMT_CPPSH_STAGED_EXIT;
+}
+
 void ASTStmtWriter::VisitCXXExpansionSelectExpr(CXXExpansionSelectExpr *E) {
   VisitExpr(E);
   Record.AddStmt(E->getRangeExpr());

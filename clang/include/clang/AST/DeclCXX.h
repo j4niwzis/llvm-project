@@ -2143,6 +2143,72 @@ public:
   }
 };
 
+class CppshStagedStmt;
+
+/// cppsh: the context of a staged statement (CppshStagedStmt): code of a
+/// function that needs a value only running the function gives -- a local's,
+/// as a template argument or an array bound -- compiled as the function runs,
+/// for the values it has then.
+///
+/// It is a dependent context, as a template's body is. In it, each local of
+/// the function around it that the code names is a staged parameter: an
+/// ImplicitParamDecl of kind CppshStaged standing for it, whose value is not
+/// known until then -- so what depends on that value is value-dependent, and
+/// instantiated when the statement runs (Sema::InstantiateCppshStaged), each
+/// staged parameter then the local itself, its value known. The result of a
+/// staged function the statement uses -- of a type known only once that
+/// function has run -- is a staged parameter whose type is a template type
+/// parameter of the context.
+class CppshStagedDecl : public Decl, public DeclContext {
+  CppshStagedStmt *Statement = nullptr;
+  ImplicitParamDecl **Params = nullptr;
+  unsigned NumParams = 0;
+  TemplateTypeParmDecl *ResultType = nullptr;
+  bool UsesThis = false;
+
+  CppshStagedDecl(DeclContext *DC, SourceLocation Loc)
+      : Decl(CppshStaged, DC, Loc), DeclContext(CppshStaged) {}
+
+public:
+  friend class ASTDeclReader;
+  friend class ASTDeclWriter;
+
+  static CppshStagedDecl *Create(ASTContext &C, DeclContext *DC,
+                                 SourceLocation Loc);
+  static CppshStagedDecl *CreateDeserialized(ASTContext &C, GlobalDeclID ID);
+
+  /// The statement it is the context of.
+  CppshStagedStmt *getStagedStmt() const { return Statement; }
+  void setStagedStmt(CppshStagedStmt *S) { Statement = S; }
+
+  /// The staged parameters, in the order of the statement's frame (each the
+  /// stand-in of the local its frame entry names).
+  ArrayRef<ImplicitParamDecl *> parameters() const {
+    return {Params, NumParams};
+  }
+  void setParameters(ASTContext &C, ArrayRef<ImplicitParamDecl *> Ps);
+
+  /// The type of a staged function's result the statement uses, if any.
+  TemplateTypeParmDecl *getResultTypeParm() const { return ResultType; }
+  void setResultTypeParm(TemplateTypeParmDecl *P) { ResultType = P; }
+
+  /// Whether the statement uses `this`: its frame's last entry then.
+  bool usesThis() const { return UsesThis; }
+  void setUsesThis(bool V) { UsesThis = V; }
+
+  // Implement isa/cast/dyncast/etc.
+  static bool classof(const Decl *D) { return classofKind(D->getKind()); }
+  static bool classofKind(Kind K) { return K == CppshStaged; }
+
+  static DeclContext *castToDeclContext(const CppshStagedDecl *D) {
+    return static_cast<DeclContext *>(const_cast<CppshStagedDecl *>(D));
+  }
+
+  static CppshStagedDecl *castFromDeclContext(const DeclContext *DC) {
+    return static_cast<CppshStagedDecl *>(const_cast<DeclContext *>(DC));
+  }
+};
+
 /// Represents a static or instance method of a struct/union/class.
 ///
 /// In the terminology of the C++ Standard, these are the (static and

@@ -113,6 +113,8 @@ def OMPAllocate : DeclNode<Decl>;
 def OMPRequires : DeclNode<Decl>;
 def Empty : DeclNode<Decl>;
 def RequiresExprBody : DeclNode<Decl>, DeclContext;
+// cppsh: a staged statement's context.
+def CppshStaged : DeclNode<Decl>, DeclContext;
 def LifetimeExtendedTemporary : DeclNode<Decl>;
 def HLSLBuffer : DeclNode<Named, "HLSLBuffer">, DeclContext;
 def HLSLRootSignature : DeclNode<Named, "HLSLRootSignature">;

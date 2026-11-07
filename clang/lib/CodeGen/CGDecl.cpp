@@ -108,6 +108,7 @@ void CodeGenFunction::EmitDecl(const Decl &D, bool EvaluateConditionDecl) {
   case Decl::UnresolvedUsingIfExists:
   case Decl::HLSLBuffer:
   case Decl::HLSLRootSignature:
+  case Decl::CppshStaged:
     llvm_unreachable("Declaration should not be in declstmts!");
   case Decl::Record:    // struct/union/class X;
   case Decl::CXXRecord: // struct/union/class X; [C++]

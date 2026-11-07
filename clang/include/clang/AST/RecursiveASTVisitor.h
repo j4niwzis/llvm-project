@@ -1634,6 +1634,9 @@ bool RecursiveASTVisitor<Derived>::canIgnoreChildDeclWhileTraversingDeclContext(
   // CapturedDecls are traversed through CapturedStmts.
   if (isa<BlockDecl>(Child) || isa<CapturedDecl>(Child))
     return true;
+  // cppsh: staged statements' contexts, through CppshStagedStmts.
+  if (isa<CppshStagedDecl>(Child))
+    return true;
   // Lambda classes are traversed through LambdaExprs.
   if (const CXXRecordDecl* Cls = dyn_cast<CXXRecordDecl>(Child))
     return Cls->isLambda();
@@ -2499,6 +2502,9 @@ DEF_TRAVERSE_DECL(ParmVarDecl, {
 
 DEF_TRAVERSE_DECL(RequiresExprBodyDecl, {})
 
+// cppsh: what it holds is reached through its statement.
+DEF_TRAVERSE_DECL(CppshStagedDecl, { ShouldVisitChildren = false; })
+
 DEF_TRAVERSE_DECL(ImplicitConceptSpecializationDecl, {
   TRY_TO(TraverseTemplateArguments(D->getTemplateArguments()));
 })
@@ -3179,6 +3185,8 @@ DEF_TRAVERSE_STMT(RequiresExpr, {
 
 DEF_TRAVERSE_STMT(CXXExpansionStmtPattern, {})
 DEF_TRAVERSE_STMT(CXXExpansionStmtInstantiation, {})
+DEF_TRAVERSE_STMT(CppshStagedStmt, {})
+DEF_TRAVERSE_STMT(CppshStagedExitStmt, {})
 DEF_TRAVERSE_STMT(CXXExpansionSelectExpr, {})
 
 // These literals (all of them) do not need any action.

@@ -5955,10 +5955,17 @@ Parser::DeclGroupPtrTy Parser::ParseTopLevelStmtDecl() {
     CppshCutNeeded = false;
     CppshDropPendingSince(CppshPendingBefore);
     StmtVector Region;
-    if (CppshEmitRegion(Region, R, CppshStmtBegin) && Region.size() == 1)
-      R = Region.front();
-    else
+    if (CppshEmitRegion(Region, R, CppshStmtBegin) && !Region.empty()) {
+      if (Region.size() == 1) {
+        R = Region.front();
+      } else {
+        Sema::CompoundScopeRAII CompoundScope(Actions);
+        R = Actions.ActOnCompoundStmt(CppshStmtBegin, CppshStmtBegin, Region,
+                                      /*isStmtExpr=*/false);
+      }
+    } else {
       CppshRegionError(CppshStmtBegin);
+    }
   }
   CppshTopBodyOpen() = CppshSavedOpen;
   Actions.ActOnFinishTopLevelStmtDecl(TLSD, R.get());

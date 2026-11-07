@@ -3188,6 +3188,14 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
     return;
   }
 
+  // cppsh: a function with a staged statement -- part of it compiled only as
+  // it runs, where it may return, break or continue: its control flow is not
+  // known here (as a template's is not until it is instantiated).
+  if (fscope && fscope->HasCppshStaged) {
+    flushDiagnostics(S, fscope);
+    return;
+  }
+
   const Stmt *Body = D->getBody();
   assert(Body);
 
