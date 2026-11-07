@@ -1404,6 +1404,8 @@ extern std::vector<SourceLocation> CppshTopLevelStarts;
 // What the shell does before each piece of an input is compiled (cppsh: the
 // snapshots of the variables it names); none by default.
 void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef) = nullptr;
+// How many inputs the staging probe forked for (CPPSH_TIME).
+unsigned CppshProbes = 0;
 
 extern std::vector<std::string> CppshCutRemainders;
 extern std::vector<std::string> CppshCutLoopRests;
@@ -1654,7 +1656,7 @@ llvm::Error Interpreter::ParseAndExecute(llvm::StringRef Code, Value *V) {
 
     CppshStagePlan Plan;
     if (cppshSeveralStatements(Code))
-      Plan = cppshProbe(*this, Code);
+      Plan = (++CppshProbes, cppshProbe(*this, Code));
 
     if (Plan.Split == 0) {
       // As it is: compiled, run, its value shown.

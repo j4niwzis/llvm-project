@@ -21,6 +21,7 @@
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Sema.h"
 
+#include "llvm/Support/Format.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
@@ -39,6 +40,7 @@
 #include "llvm/TargetParser/Triple.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <clocale>
 #include <cstdlib>
@@ -191,13 +193,46 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
   }
   if (!Snapshots.empty())
     // One expression statement: the staging probe forks only for several.
-    if (llvm::Error Err = Interp.ParseAndExecute("(" + Snapshots + ");"))
+    if (++CppshSnapshotCompiles;
+        llvm::Error Err = Interp.ParseAndExecute("(" + Snapshots + ");"))
       llvm::consumeError(std::move(Err));
 }
 
 namespace clang {
 extern void (*CppshBeforeChunk)(Interpreter &, llvm::StringRef);
+extern unsigned CppshProbes;
 } // namespace clang
+
+// CPPSH_TIME=1: how long each phase took, on stderr -- the start, piece by
+// piece, then each input (its parse and run, the staging probes it forked,
+// the snapshot compiles it made).
+static bool cppshTiming() {
+  static const bool On = std::getenv("CPPSH_TIME") != nullptr;
+  return On;
+}
+static unsigned CppshSnapshotCompiles = 0;
+struct CppshPhase {
+  const char *What;
+  std::string Detail;
+  std::chrono::steady_clock::time_point Start = std::chrono::steady_clock::now();
+  unsigned Probes = clang::CppshProbes, Snapshots = CppshSnapshotCompiles;
+  explicit CppshPhase(const char *What, std::string Detail = {})
+      : What(What), Detail(std::move(Detail)) {}
+  ~CppshPhase() {
+    if (!cppshTiming())
+      return;
+    double Ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - Start)
+                    .count();
+    llvm::errs() << llvm::format("[cppsh-time] %8.1f ms  %s", Ms, What);
+    if (clang::CppshProbes != Probes || CppshSnapshotCompiles != Snapshots)
+      llvm::errs() << " (probes " << (clang::CppshProbes - Probes) << ", snapshot compiles "
+                   << (CppshSnapshotCompiles - Snapshots) << ")";
+    if (!Detail.empty())
+      llvm::errs() << "  " << Detail;
+    llvm::errs() << "\n";
+  }
+};
 
 // Code run as the interpreter stages it (Interpreter::ParseAndExecute): whole,
 // cut only where a value it defines is needed by what follows -- before each
@@ -312,6 +347,7 @@ static llvm::Error runStatements(clang::Interpreter &Interp, llvm::StringRef Cod
     snapshotNamed(I, Piece);
   };
   const std::string Expanded = cppshCommandLines(Code);
+  CppshPhase Phase("input", llvm::StringRef(Code).trim().take_front(60).str());
   llvm::Error Err = Interp.ParseAndExecute(Expanded);
   // An input's output out before the next input runs, stdio's and LLVM's
   // streams alike, in the order it was written.
@@ -1570,12 +1606,15 @@ int main(int argc, const char **argv) {
   ClangArgv.push_back("-Wno-unused-result");
   ClangArgv.push_back("-Wno-unused-value");
 
+  std::optional<CppshPhase> Total(std::in_place, "start, in all");
+  std::optional<CppshPhase> Phase(std::in_place, "targets initialized");
   llvm::InitializeAllTargetInfos();
   llvm::InitializeAllTargets();
   llvm::InitializeAllTargetMCs();
   llvm::InitializeAllAsmPrinters();
   llvm::InitializeAllAsmParsers();
 
+  Phase.emplace("compiler instance");
   auto IEB = clang::IncrementalExecutorBuilder::createDefault();
   clang::IncrementalCompilerBuilder CB;
   CB.SetCompilerArgs(ClangArgv);
@@ -1589,8 +1628,10 @@ int main(int argc, const char **argv) {
                                     static_cast<void *>(&CI->getDiagnostics()));
   CI->LoadRequestedPlugins();
 
+  Phase.emplace("interpreter (executor, runtime prelude)");
   std::unique_ptr<clang::Interpreter> Interp =
       ExitOnErr(clang::Interpreter::create(std::move(CI), std::move(IEB)));
+  Phase.emplace("import std.sh");
 
   bool HasError = false;
 
@@ -1600,6 +1641,8 @@ int main(int argc, const char **argv) {
       HasError = true;
     }
   }
+  Phase.reset();
+  Total.reset();
 
   if (!CommandString.empty()) {
     if (auto Err = runStatements(*Interp, CommandString)) {
