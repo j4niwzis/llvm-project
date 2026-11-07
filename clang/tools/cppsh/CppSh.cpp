@@ -146,6 +146,7 @@ static std::string buildBashPrompt(bool LastFailed) {
 // and character literals are skipped.
 // How many snapshot compiles snapshotNamed made (CPPSH_TIME).
 static unsigned CppshSnapshotCompiles = 0;
+static unsigned long long CppshSnapshotNs = 0;
 
 static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
   clang::Sema &S = Interp.getCompilerInstance()->getSema();
@@ -196,9 +197,15 @@ static void snapshotNamed(clang::Interpreter &Interp, llvm::StringRef Stmt) {
   }
   if (!Snapshots.empty())
     // One expression statement: the staging probe forks only for several.
-    if (++CppshSnapshotCompiles;
-        llvm::Error Err = Interp.ParseAndExecute("(" + Snapshots + ");"))
+  {
+    auto Started = std::chrono::steady_clock::now();
+    ++CppshSnapshotCompiles;
+    if (llvm::Error Err = Interp.ParseAndExecute("(" + Snapshots + ");"))
       llvm::consumeError(std::move(Err));
+    CppshSnapshotNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - Started)
+                           .count();
+  }
 }
 
 namespace clang {
@@ -219,7 +226,8 @@ struct CppshPhase {
   std::string Detail;
   std::chrono::steady_clock::time_point Start = std::chrono::steady_clock::now();
   unsigned Probes = clang::CppshProbes, Snapshots = CppshSnapshotCompiles;
-  unsigned long long ParseNs = clang::CppshParseNs, ExecuteNs = clang::CppshExecuteNs;
+  unsigned long long ParseNs = clang::CppshParseNs, ExecuteNs = clang::CppshExecuteNs,
+                     SnapshotNs = CppshSnapshotNs;
   explicit CppshPhase(const char *What, std::string Detail = {})
       : What(What), Detail(std::move(Detail)) {}
   ~CppshPhase() {
@@ -235,7 +243,9 @@ struct CppshPhase {
                                    (clang::CppshExecuteNs - ExecuteNs) / 1e6);
     if (clang::CppshProbes != Probes || CppshSnapshotCompiles != Snapshots)
       llvm::errs() << " (probes " << (clang::CppshProbes - Probes) << ", snapshot compiles "
-                   << (CppshSnapshotCompiles - Snapshots) << ")";
+                   << (CppshSnapshotCompiles - Snapshots)
+                   << llvm::format(", %.1f ms of it", (CppshSnapshotNs - SnapshotNs) / 1e6)
+                   << ")";
     if (!Detail.empty())
       llvm::errs() << "  " << Detail;
     llvm::errs() << "\n";
