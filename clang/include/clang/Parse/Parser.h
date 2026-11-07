@@ -40,6 +40,7 @@ class Parser;
 class ParsingDeclRAIIObject;
 class ParsingDeclSpec;
 class ParsingDeclarator;
+struct CppshCutLocal;
 class ParsingFieldDeclarator;
 class ColonProtectionRAIIObject;
 class InMessageExpressionRAIIObject;
@@ -8703,6 +8704,18 @@ private:
     size_t RangeBase = 0;
     bool Cuts = false;
   };
+  /// cppsh: the locals live at Loc in the function being parsed.
+  SmallVector<VarDecl *, 8> CppshLiveLocals(SourceLocation Loc);
+  /// cppsh: a statement that needs a value only running its function gives
+  /// made one run on its own, the function going on in its frame
+  /// (std::sh::__cppsh_step); false where it cannot be.
+  bool CppshEmitStep(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
+                     SourceLocation Begin);
+  /// cppsh: the function a step runs, from the statement's recorded tokens
+  /// [Begin, End), in the unit being built (__cppsh_step_run).
+  Decl *ParseCppshStepFunction(IdentifierInfo *Name,
+                               ArrayRef<CppshCutLocal> Frame, unsigned Begin,
+                               unsigned End);
   CppshBuiltBody CppshBeginBuiltReturn(SourceLocation Open);
   void CppshFinishBuiltReturn(const CppshBuiltBody &Saved,
                               SmallVectorImpl<Stmt *> &Stmts, ExprResult E,

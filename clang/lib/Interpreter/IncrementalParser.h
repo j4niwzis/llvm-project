@@ -66,6 +66,9 @@ public:
 
   void CleanUpPTU(TranslationUnitDecl *MostRecentTU);
 
+  /// cppsh: the parser, for code built from recorded tokens.
+  Parser &getParser() { return *P; }
+
   /// cppsh: a unit built by Sema rather than parsed -- begun, each
   /// declaration of it handed over, then finished as a parsed one is.
   llvm::Error BeginBuild();

@@ -1572,11 +1572,78 @@ static ExprResult cppshShFunction(Sema &Actions, Preprocessor &PP, StringRef Nam
   return Actions.BuildDeclarationNameExpr(SS, R, /*NeedsADL=*/false);
 }
 
-// The cut: the function returns through std::sh::__cppsh_cut, its rest
-// (Rest) compiled and run with the values of its live locals -- each in
-// scope at Loc, the innermost of a name -- handed over.
-unsigned Parser::CppshEmitCut(SmallVectorImpl<Stmt *> &Stmts, StringRef Rest,
-                              SourceLocation Loc, FunctionDecl *FD) {
+// The tokens of W of code's own: not inside a loop (SkipLoops) or a switch
+// (SkipSwitch) the code holds itself -- its own `break`s, `continue`s,
+// `case` labels.
+static SmallVector<size_t, 4> cppshOwnTokens(ArrayRef<Token> Toks,
+                                             tok::TokenKind W, bool SkipLoops,
+                                             bool SkipSwitch) {
+  auto skipGroup = [&](size_t I) {
+    int Depth = 0;
+    for (; I < Toks.size(); ++I) {
+      if (Toks[I].isOneOf(tok::l_paren, tok::l_brace, tok::l_square))
+        ++Depth;
+      else if (Toks[I].isOneOf(tok::r_paren, tok::r_brace, tok::r_square) &&
+               --Depth <= 0)
+        return I + 1;
+    }
+    return I;
+  };
+  auto skipStmt = [&](size_t I) {
+    if (I < Toks.size() && Toks[I].is(tok::l_brace))
+      return skipGroup(I);
+    for (; I < Toks.size(); ++I) {
+      if (Toks[I].isOneOf(tok::l_paren, tok::l_brace, tok::l_square)) {
+        I = skipGroup(I) - 1;
+        continue;
+      }
+      if (Toks[I].is(tok::semi))
+        return I + 1;
+    }
+    return I;
+  };
+  SmallVector<size_t, 4> Found;
+  for (size_t I = 0; I < Toks.size();) {
+    if (Toks[I].is(W)) {
+      Found.push_back(I++);
+      continue;
+    }
+    if ((SkipLoops && Toks[I].isOneOf(tok::kw_for, tok::kw_while)) ||
+        (SkipSwitch && Toks[I].is(tok::kw_switch))) {
+      ++I;
+      if (I < Toks.size() && Toks[I].is(tok::l_paren))
+        I = skipGroup(I);
+      I = skipStmt(I);
+      continue;
+    }
+    if (SkipLoops && Toks[I].is(tok::kw_do)) {
+      I = skipStmt(I + 1);
+      continue;
+    }
+    ++I;
+  }
+  return Found;
+}
+
+// Whether a statement leaves itself other than by finishing: a return, a
+// goto, a co_* of the function, a break or continue of a loop around it, a
+// label of a switch around it. Such a statement cannot run on its own and
+// hand the function back.
+static bool cppshLeavesItself(ArrayRef<Token> Toks) {
+  for (const Token &T : Toks)
+    if (T.isOneOf(tok::kw_return, tok::kw_goto, tok::kw_co_return,
+                  tok::kw_co_yield, tok::kw_co_await))
+      return true;
+  return !cppshOwnTokens(Toks, tok::kw_break, true, true).empty() ||
+         !cppshOwnTokens(Toks, tok::kw_continue, true, false).empty() ||
+         !cppshOwnTokens(Toks, tok::kw_case, false, true).empty() ||
+         !cppshOwnTokens(Toks, tok::kw_default, false, true).empty();
+}
+
+// The locals live at Loc in the function being parsed, each the innermost of
+// its name, in the order declared -- and the iterators of the range-fors
+// being parsed, hidden from lookup.
+SmallVector<VarDecl *, 8> Parser::CppshLiveLocals(SourceLocation Loc) {
   SourceManager &SM = PP.getSourceManager();
   SmallVector<VarDecl *, 8> Live;
   llvm::SmallPtrSet<const IdentifierInfo *, 8> Seen;
@@ -1602,6 +1669,180 @@ unsigned Parser::CppshEmitCut(SmallVectorImpl<Stmt *> &Stmts, StringRef Rest,
         if (auto *VD = dyn_cast_or_null<VarDecl>(DS->getSingleDecl());
             VD && VD->getIdentifier() && Seen.insert(VD->getIdentifier()).second)
           Live.push_back(VD);
+  return Live;
+}
+
+// cppsh: a statement that needs a value only running the function gives,
+// which declares nothing the rest of the function could use and leaves
+// itself only by finishing: compiled when it runs, with the values known,
+// against the function's own locals -- then the function goes on, in its
+// frame. The statement becomes std::sh::__cppsh_step(id, __cppsh_frame(the
+// locals it names...)); a local it only reads is handed over by value (a
+// value it is compiled with), one it changes, or that has no copy, by
+// reference. False where it cannot be (a cut is made instead).
+bool Parser::CppshEmitStep(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
+                           SourceLocation Begin) {
+  // A value it needs: a local's (CppshCutNeedVar), a run-time template
+  // argument's. Not a staged function's result (no local named): its
+  // caller waits for that as ever.
+  if (!R.isUsable() || isa<DeclStmt>(R.get()) ||
+      (!CppshCutNeedVar && CppshCutNeedExprs.empty()))
+    return false;
+  std::optional<unsigned> B = cppshTokenIndex(Begin);
+  std::optional<unsigned> E = cppshTokenIndex(Tok.getLocation());
+  if (!B || !E || *E <= *B)
+    return false;
+  ArrayRef<Token> Toks = ArrayRef<Token>(CppshInputTokens).slice(*B, *E - *B);
+  if (cppshLeavesItself(Toks))
+    return false;
+  llvm::SmallPtrSet<const IdentifierInfo *, 16> Named;
+  for (const Token &T : Toks)
+    if (T.is(tok::identifier))
+      Named.insert(T.getIdentifierInfo());
+  std::vector<CppshCutLocal> Frame;
+  SmallVector<Expr *, 8> Refs;
+  for (VarDecl *VD : CppshLiveLocals(Begin)) {
+    if (!Named.count(VD->getIdentifier()))
+      continue;
+    const QualType T = VD->getType().getNonReferenceType();
+    const bool ByRef = T->isArrayType() || cppshMoveOnly(Actions, VD->getType()) ||
+                       cppshMutates(R.get(), VD);
+    Frame.push_back({VD->getIdentifier(), T.getUnqualifiedType(), false, ByRef});
+    Refs.push_back(Actions.BuildDeclRefExpr(VD, T, VK_LValue, Begin));
+  }
+  // The run-time template arguments it met, their values as long long.
+  for (Expr *NE : CppshCutNeedExprs) {
+    ExprResult AsLL = Actions.BuildCStyleCastExpr(
+        Begin, Actions.Context.getTrivialTypeSourceInfo(Actions.Context.LongLongTy, Begin),
+        Begin, NE);
+    if (!AsLL.isUsable())
+      return false;
+    Frame.push_back({nullptr, Actions.Context.LongLongTy, false, false});
+    Refs.push_back(AsLL.get());
+  }
+  ExprResult FrameFn = cppshShFunction(Actions, PP, "__cppsh_frame", Begin);
+  ExprResult StepFn = cppshShFunction(Actions, PP, "__cppsh_step", Begin);
+  if (!FrameFn.isUsable() || !StepFn.isUsable())
+    return false;
+  ExprResult FrameCall =
+      Actions.ActOnCallExpr(getCurScope(), FrameFn.get(), Begin, Refs, Begin);
+  if (!FrameCall.isUsable())
+    return false;
+  const unsigned Id = CppshSteps.size();
+  Expr *Args[2] = {IntegerLiteral::Create(Actions.Context, llvm::APInt(32, Id),
+                                          Actions.Context.UnsignedIntTy, Begin),
+                   FrameCall.get()};
+  ExprResult StepCall =
+      Actions.ActOnCallExpr(getCurScope(), StepFn.get(), Begin, Args, Begin);
+  StmtResult S = StepCall.isUsable()
+                     ? Actions.ActOnExprStmt(StepCall, /*DiscardedValue=*/true)
+                     : StmtError();
+  if (!S.isUsable())
+    return false;
+  CppshCutNeedExprs.clear();
+  CppshSteps.push_back({*B, *E, std::move(Frame), false});
+  Stmts.push_back(S.get());
+  return true;
+}
+
+// The function a step runs: `auto Name(auto x, auto &y, ...) { <its
+// statement> }` -- the statement's own tokens, parsed now, in the unit being
+// built (__cppsh_step_run).
+Decl *Parser::ParseCppshStepFunction(IdentifierInfo *Name,
+                                     ArrayRef<CppshCutLocal> Frame,
+                                     unsigned Begin, unsigned End) {
+  if (Begin >= End || End > CppshInputTokens.size())
+    return nullptr;
+  const SourceLocation Loc = CppshInputTokens[Begin].getLocation();
+  const PrintingPolicy &Policy = Actions.getASTContext().getPrintingPolicy();
+  ParsingDeclSpec DS(*this);
+  SetConciseAuto(DS, Loc);
+  DS.Finish(Actions, Policy);
+  ParsedAttributes DAttrs(AttrFactory);
+  ParsingDeclarator D(*this, DS, DAttrs, DeclaratorContext::File);
+  D.SetIdentifier(Name, Loc);
+  {
+    ParseScope PrototypeScope(this, Scope::FunctionPrototypeScope |
+                                        Scope::DeclScope |
+                                        Scope::FunctionDeclarationScope);
+    Actions.ActOnStartFunctionDeclarationDeclarator(D, TemplateParameterDepth);
+    SmallVector<DeclaratorChunk::ParamInfo, 8> ParamInfo;
+    for (const CppshCutLocal &L : Frame) {
+      if (!L.Name)
+        continue;
+      DeclSpec PDS(AttrFactory);
+      SetConciseAuto(PDS, Loc);
+      PDS.Finish(Actions, Policy);
+      Declarator PD(PDS, ParsedAttributesView::none(),
+                    DeclaratorContext::Prototype);
+      PD.SetIdentifier(L.Name, Loc);
+      if (L.ByRef)
+        PD.AddTypeInfo(DeclaratorChunk::getReference(0, Loc, /*lvalue=*/true),
+                       Loc);
+      Decl *Param = Actions.ActOnParamDeclarator(getCurScope(), PD);
+      ParamInfo.push_back(DeclaratorChunk::ParamInfo(L.Name, Loc, Param));
+    }
+    D.AddTypeInfo(DeclaratorChunk::getFunction(
+                      /*HasProto=*/true, /*IsAmbiguous=*/false, Loc,
+                      ParamInfo.data(), ParamInfo.size(), SourceLocation(), Loc,
+                      /*RefQualifierIsLvalueRef=*/true, SourceLocation(),
+                      SourceLocation(), EST_None, SourceRange(), nullptr,
+                      nullptr, 0, nullptr, nullptr, {}, Loc, Loc, D),
+                  ParsedAttributes(AttrFactory), Loc);
+    Actions.ActOnFinishFunctionDeclarationDeclarator(D);
+  }
+  TemplateParameterDepthRAII CurTemplateDepthTracker(TemplateParameterDepth);
+  ParseScope BodyScope(this, Scope::FnScope | Scope::DeclScope |
+                                 Scope::CompoundStmtScope);
+  Sema::FPFeaturesStateRAII SaveFPFeatures(Actions);
+  Decl *Fn = Actions.ActOnStartOfFunctionDef(getCurScope(), D,
+                                             MultiTemplateParamsArg());
+  D.complete(Fn);
+  D.getMutableDeclSpec().abort();
+  if (const auto *Template = dyn_cast_if_present<FunctionTemplateDecl>(Fn);
+      Template && Template->isAbbreviated() &&
+      Template->getTemplateParameters()->getParam(0)->isImplicit())
+    CurTemplateDepthTracker.addDepth(1);
+
+  // No cut in it: what it needs is known as it is compiled -- a need still
+  // left is one of a local it declares itself, not staged.
+  const SourceLocation SavedOpen = std::exchange(CppshBodyOpen, SourceLocation());
+  const bool SavedNeeded = std::exchange(CppshCutNeeded, false);
+  StmtResult Body;
+  {
+    Sema::CompoundScopeRAII CompoundScope(Actions);
+    StmtVector Stmts;
+    const void *Mark = &Stmts;
+    ConciseReplay(ArrayRef<Token>(CppshInputTokens).slice(Begin, End - Begin), Mark);
+    while (Tok.isNot(tok::eof)) {
+      if (ConsumeNullStmt(Stmts))
+        continue;
+      StmtResult R = ParseStatementOrDeclaration(Stmts, ParsedStmtContext::Compound);
+      if (R.isUsable())
+        Stmts.push_back(R.get());
+    }
+    ConciseEndReplay(Mark);
+    if (CppshCutNeeded)
+      Diag(Loc, Actions.getDiagnostics().getCustomDiagID(
+                    DiagnosticsEngine::Error,
+                    "this needs a value only running it gives, of a variable "
+                    "it declares itself: not staged yet"));
+    Body = Actions.ActOnCompoundStmt(Loc, Loc, Stmts, /*isStmtExpr=*/false);
+  }
+  CppshBodyOpen = SavedOpen;
+  CppshCutNeeded = SavedNeeded;
+  CppshCutNeedExprs.clear();
+  BodyScope.Exit();
+  return Actions.ActOnFinishFunctionBody(Fn, Body.get());
+}
+
+// The cut: the function returns through std::sh::__cppsh_cut, its rest
+// (Rest) compiled and run with the values of its live locals -- each in
+// scope at Loc, the innermost of a name -- handed over.
+unsigned Parser::CppshEmitCut(SmallVectorImpl<Stmt *> &Stmts, StringRef Rest,
+                              SourceLocation Loc, FunctionDecl *FD) {
+  SourceManager &SM = PP.getSourceManager();
+  SmallVector<VarDecl *, 8> Live = CppshLiveLocals(Loc);
   std::vector<CppshCutLocal> Locals;
   // The run-time template arguments of the statement cut at, their values
   // as long long: evaluated here, once, handed over (__cppsh_need<i>).
@@ -1798,6 +2039,11 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
     if (CppshCuts && CppshCutNeeded) {
       CppshCutNeeded = false;
       FunctionDecl *FD = Actions.getCurFunctionDecl();
+      // Run on its own, the function going on in its frame: no cut.
+      if (CppshEmitStep(Stmts, R, CppshStmtBegin)) {
+        LastIsError = false;
+        continue;
+      }
       SourceManager &SM = PP.getSourceManager();
       // In a continuation, a need at its very start (only blocks opened
       // before it) would be cut to the same continuation again.

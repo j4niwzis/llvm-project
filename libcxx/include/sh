@@ -1848,8 +1848,20 @@ std::array<void *, sizeof...(T)> __cppsh_frame(T &&...locals) noexcept {
 // locals at `frame` (an absolute symbol of the JIT).
 extern "C" void __cppsh_cut_run(unsigned id, void *const *frame, unsigned n);
 
+// The interpreter's: statement `id`, run on its own, compiled and run against
+// the locals at `frame`.
+extern "C" void __cppsh_step_run(unsigned id, void *const *frame, unsigned n);
+
 namespace std {
 namespace sh {
+
+// A statement that needed a value only running its function gives: compiled
+// with the values now, run against the function's locals, and the function
+// goes on (the compiler makes the statement this).
+template <std::size_t N>
+void __cppsh_step(unsigned id, std::array<void *, N> frame) {
+  ::__cppsh_step_run(id, frame.data(), static_cast<unsigned>(N));
+}
 
 template <std::size_t N>
 staged __cppsh_cut(unsigned id, std::array<void *, N> frame) {

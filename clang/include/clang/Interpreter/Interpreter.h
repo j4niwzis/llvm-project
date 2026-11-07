@@ -44,6 +44,7 @@ class CompilerInstance;
 class CXXRecordDecl;
 class Decl;
 class IncrementalParser;
+class Parser;
 class IncrementalDeviceParser;
 
 /// The device language to offload to. \c Detect selects the vendor of the
@@ -186,6 +187,8 @@ public:
   llvm::Error cppshBeginBuild();
   void cppshAddBuilt(Decl *D);
   llvm::Error cppshEndBuildAndExecute();
+  /// cppsh: the parser, for code built from recorded tokens.
+  Parser &cppshParser();
 
   llvm::Expected<PartialTranslationUnit &> Parse(llvm::StringRef Code);
   llvm::Error Execute(PartialTranslationUnit &T);

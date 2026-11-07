@@ -23,6 +23,7 @@
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Interpreter/PartialTranslationUnit.h"
 #include "clang/Parse/Parser.h"
+#include "clang/Sema/CppshStaging.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Module.h"
@@ -54,6 +55,9 @@ IncrementalParser::IncrementalParser(CompilerInstance &Instance,
   llvm::ErrorAsOutParameter EAO(&Err);
   Consumer = &S.getASTConsumer();
   P.reset(new Parser(S.getPreprocessor(), S, /*SkipBodies=*/false));
+  // cppsh: every token of what the user types, recorded once.
+  S.getPreprocessor().setTokenWatcher(
+      [&SM = S.getSourceManager()](const Token &T) { cppshRecordToken(SM, T); });
 
   if (ExternalASTSource *External = S.getASTContext().getExternalSource())
     External->StartTranslationUnit(Consumer);

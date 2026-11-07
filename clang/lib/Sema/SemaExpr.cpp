@@ -135,6 +135,40 @@ std::vector<std::string> CppshCutRemainders;
 // and what follows it (__cppsh_loopK); empty otherwise.
 std::vector<std::string> CppshCutLoopRests;
 std::vector<std::vector<CppshCutLocal>> CppshCutLocals;
+std::vector<CppshStep> CppshSteps;
+
+std::vector<Token> CppshInputTokens;
+// Where each recorded token is, by its location (each token's own, macro
+// expansions' too): a token lexed again (a backtrack) recorded once.
+static llvm::DenseMap<SourceLocation::UIntTy, unsigned> CppshTokenAt;
+
+void cppshRecordToken(const SourceManager &SM, const Token &T) {
+  if (T.isAnnotation() || T.isOneOf(tok::eof, tok::eod, tok::code_completion) ||
+      T.getLocation().isInvalid())
+    return;
+  // Of an input buffer: the file of the token as written, asked once a file.
+  static FileID LastFile;
+  static bool LastIsInput = false;
+  const FileID File = SM.getFileID(SM.getFileLoc(T.getLocation()));
+  if (File != LastFile) {
+    LastFile = File;
+    LastIsInput = SM.getBufferName(SM.getLocForStartOfFile(File))
+                      .starts_with("input_line_");
+  }
+  if (!LastIsInput ||
+      !CppshTokenAt.try_emplace(T.getLocation().getRawEncoding(),
+                                CppshInputTokens.size())
+           .second)
+    return;
+  CppshInputTokens.push_back(T);
+}
+
+std::optional<unsigned> cppshTokenIndex(SourceLocation Loc) {
+  auto It = CppshTokenAt.find(Loc.getRawEncoding());
+  if (It == CppshTokenAt.end())
+    return std::nullopt;
+  return It->second;
+}
 // A call of a staged function among the user's top-level statements: the
 // statement is staged and the call hoisted -- run on its own, its result put
 // in its place (Interpreter::ParseAndExecute) -- unless it is that hoisted
