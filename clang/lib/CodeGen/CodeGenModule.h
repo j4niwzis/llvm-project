@@ -442,6 +442,11 @@ private:
   /// member was, on every first reference in a module, a second definition.
   llvm::StringSet<> IncrementalExported;
 
+  /// What this module itself made external (Release): taken back from
+  /// IncrementalExported, and deferred again, where the module is thrown
+  /// away after all (an error at the end of its input).
+  std::vector<std::pair<std::string, GlobalDecl>> ExportedThisModule;
+
   void addEmittedDeferredDecl(GlobalDecl GD) {
     // Reemission is only needed in incremental mode.
     if (!Context.getLangOpts().IncrementalExtensions)

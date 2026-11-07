@@ -1237,6 +1237,7 @@ void CodeGenModule::Release() {
         GV && !GV->isDeclaration() &&
         (GV->hasLinkOnceLinkage() || GV->hasWeakLinkage()) &&
         IncrementalExported.insert(Name).second) {
+      ExportedThisModule.emplace_back(Name.str(), GD);
       GV->setLinkage(llvm::GlobalValue::ExternalLinkage);
       GV->setVisibility(llvm::GlobalValue::DefaultVisibility);
       GV->setDSOLocal(false);
@@ -9064,6 +9065,12 @@ void CodeGenModule::discardIncrementalModule() {
   EmittedLinkOnceDecls.clear();
   DeferredDeclsToEmit.clear();
   EmittedVTables = EmittedVTablesBefore;
+  // Exported by Release, then thrown away: no longer anyone's to link to.
+  for (auto &[Name, GD] : ExportedThisModule) {
+    IncrementalExported.erase(Name);
+    DeferredDecls[getMangledName(GD)] = GD;
+  }
+  ExportedThisModule.clear();
 }
 
 void CodeGenModule::forgetIncrementalUnit(const TranslationUnitDecl *TU) {
