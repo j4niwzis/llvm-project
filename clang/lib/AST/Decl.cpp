@@ -4439,6 +4439,16 @@ void FunctionDecl::setFunctionTemplateSpecialization(
   Template->addSpecialization(Info, InsertToken);
 }
 
+void FunctionDecl::setUnlistedFunctionTemplateSpecialization(
+    FunctionTemplateDecl *Template, TemplateArgumentList *TemplateArgs) {
+  assert(TemplateOrSpecialization.isNull() &&
+         "Function is already a specialization");
+  TemplateOrSpecialization = FunctionTemplateSpecializationInfo::Create(
+      getASTContext(), this, Template, TSK_ImplicitInstantiation, TemplateArgs,
+      /*TemplateArgsAsWritten=*/nullptr, SourceLocation(),
+      /*MSInfo=*/nullptr);
+}
+
 void FunctionDecl::setDependentTemplateSpecialization(
     ASTContext &Context, const UnresolvedSetImpl &Templates,
     const TemplateArgumentListInfo *TemplateArgs) {

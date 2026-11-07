@@ -3234,6 +3234,14 @@ public:
                                       PointOfInstantiation);
   }
 
+  /// cppsh: a specialization of \p Template on these arguments made for the
+  /// values of some of its parameters as well -- one of many with the same
+  /// template arguments, so not in the template's set of specializations
+  /// (found by the arguments alone), its instantiation pattern and mangled
+  /// template arguments the template's all the same.
+  void setUnlistedFunctionTemplateSpecialization(
+      FunctionTemplateDecl *Template, TemplateArgumentList *TemplateArgs);
+
   /// Specifies that this function declaration is actually a
   /// dependent function template specialization.
   void setDependentTemplateSpecialization(

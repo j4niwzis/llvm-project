@@ -3349,18 +3349,17 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
                  Sema::CodeSynthesisContext::BuildingDeductionGuides) {
     // Record this function template specialization.
     ArrayRef<TemplateArgument> Innermost = TemplateArgs.getInnermost();
-    FunctionTemplateDecl *SpecTemplate = FunctionTemplate;
-    if (HasCppshConstParam) {
-      SpecTemplate = FunctionTemplateDecl::Create(
-          SemaRef.Context, DC, Function->getLocation(), Function->getDeclName(),
-          FunctionTemplate->getTemplateParameters(),
-          const_cast<FunctionDecl *>(D));
-      SpecTemplate->setLexicalDeclContext(LexicalDC);
-    }
-    Function->setFunctionTemplateSpecialization(
-        SpecTemplate,
-        TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost),
-        /*InsertToken=*/{});
+    // cppsh: one on argument values is not the one found by the template
+    // arguments alone (CppshSpecializations finds it).
+    if (HasCppshConstParam)
+      Function->setUnlistedFunctionTemplateSpecialization(
+          FunctionTemplate,
+          TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost));
+    else
+      Function->setFunctionTemplateSpecialization(
+          FunctionTemplate,
+          TemplateArgumentList::CreateCopy(SemaRef.Context, Innermost),
+          /*InsertToken=*/{});
     if (HasCppshConstParam) {
       auto Spec = std::make_unique<CppshValueSpec>();
       Spec->Head = CppshHead;
