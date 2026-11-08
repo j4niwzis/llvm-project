@@ -579,11 +579,20 @@ constexpr auto __cppsh_variant_method_of(V &&v) {
   return __cppsh_variant_method<V &&, Cs...>{static_cast<V &&>(v)};
 }
 
-// What `std::cin >> x` reads, asked for when the shell is on a terminal (the
-// compiler wraps the stream the user reads from in it): `x? `.
+// Whether `std::cin >> x` asks for what it reads (`x? `, on a terminal): off
+// unless asked for -- a script prints its own prompts (std::print before
+// the read). On with CPPSH_ASK=1, or `std::sh::ask_prompts = true;`.
+inline bool ask_prompts = [] {
+  const char *Env = std::getenv("CPPSH_ASK");
+  return Env && *Env && *Env != '0';
+}();
+
+// What `std::cin >> x` reads, asked for when the shell is on a terminal and
+// ask_prompts is on (the compiler wraps the stream the user reads from in
+// it): `x? `.
 inline std::istream &__cppsh_ask(std::istream &in, const char *what) {
 #if !defined(_WIN32)
-  if (&in == &std::cin && ::isatty(0)) {
+  if (ask_prompts && &in == &std::cin && ::isatty(0)) {
     std::fprintf(stderr, "\033[36m%s?\033[0m ", what);
     std::fflush(stderr);
   }
