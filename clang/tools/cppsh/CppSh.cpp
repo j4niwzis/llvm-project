@@ -545,6 +545,29 @@ static llvm::Error runFileOrCode(clang::Interpreter &Interp,
     Chunk += '\n';
     if (Depth > 0 || InBlockComment || Continued)
       continue;
+    // The next line going on with this one -- it begins with an operator
+    // that takes a left operand (` | filter(...)`, `.take(5)`, `&& ok`,
+    // `<< x`): one statement over several lines, as a pipeline is written.
+    {
+      llvm::StringRef Next = Content;
+      while (!Next.empty()) {
+        auto [NextLine, After] = Next.split('\n');
+        llvm::StringRef T = NextLine.trim();
+        if (!T.empty() && !T.starts_with("//")) {
+          Next = T;
+          break;
+        }
+        Next = After;
+      }
+      auto IdentStart = [](char C) {
+        return std::isalpha(static_cast<unsigned char>(C)) || C == '_';
+      };
+      if (Next.starts_with("|") || Next.starts_with("&&") ||
+          Next.starts_with("<<") || Next.starts_with(">>") ||
+          Next.starts_with("->") || Next.starts_with("?") ||
+          (Next.size() > 1 && Next[0] == '.' && IdentStart(Next[1])))
+        continue;
+    }
     if (!llvm::StringRef(Chunk).trim().empty())
       if (llvm::Error E = runStatements(Interp, Chunk))
         Errs = llvm::joinErrors(std::move(Errs), std::move(E));

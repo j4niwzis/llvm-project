@@ -1975,6 +1975,12 @@ static int cppshRunStaged(const CppshStagedStmt *Staged, void *const *Frame,
     FunctionDecl *F = nullptr;
     QualType KeptType;
     for (bool Report = false;;) {
+      // The values wanted made first: one not plain data is snapshotted by
+      // compiled code (cppshSnapshotAt), a unit of its own -- never inside
+      // the one the attempt builds.
+      for (unsigned I : Want)
+        if (I < N)
+          (void)ValueOf(I);
       if (!cppshReport(Interp.cppshBeginBuild()))
         return Fail("no unit to compile it in");
       // A quiet attempt: its diagnostics counted (an error fails it), not

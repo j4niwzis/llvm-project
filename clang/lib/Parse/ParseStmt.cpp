@@ -1364,6 +1364,11 @@ bool Parser::CppshEmitRegion(SmallVectorImpl<Stmt *> &Stmts, StmtResult R,
   SmallVector<std::pair<SourceLocation, VarDecl *>, 2> Needs;
   SmallVector<Stmt *, 2> Before;
   for (Expr *NE : CppshCutNeedExprs) {
+    // One local for each argument, however many candidates met it.
+    if (llvm::any_of(Needs, [&](const auto &N) {
+          return N.first == NE->getBeginLoc();
+        }))
+      continue;
     VarDecl *V = CppshNeedVar(NE, Needs.size(), Before);
     if (!V)
       return Refuse("a run-time template argument's value has no local");

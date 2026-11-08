@@ -17,3 +17,11 @@ print_held(3);
 // CHECK: 3
 print_held(1.5);
 // CHECK: 1.5
+// A loop's variable: its index read each time round, the type of what it
+// holds each time its own.
+for (auto e : std::vector<std::variant<int, std::string>>{1, std::string("a")}) {
+  auto item = *e;
+  std::println("item {}", item);
+}
+// CHECK: item 1
+// CHECK: item a

@@ -65,6 +65,7 @@ const VarDecl *cppshRuntimeLocalIn(Sema &S, const Expr *E);
 extern std::vector<Expr *> CppshCutNeedExprs;
 extern bool CppshTopNeed;
 extern std::vector<SourceRange> CppshTopNeedExprs;
+extern llvm::DenseSet<const Expr *> CppshVariantIndexExprs;
 bool cppshExprNeedHere(Sema &S, const Expr *E);
 bool cppshTopNeedHere(Sema &S, const Expr *E);
 } // namespace clang
@@ -6925,7 +6926,7 @@ Sema::EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
     }
   }
 
-  if (CppshZero)
+  if (CppshZero && !CppshVariantIndexExprs.count(E->IgnoreImplicit()))
     if (const VarDecl *Local = cppshRuntimeLocalIn(*this, E)) {
       cppshMeetNeed(*this);
       CppshCutNeedVar = Local;

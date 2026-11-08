@@ -119,6 +119,10 @@ llvm::DenseMap<SourceLocation::UIntTy, Expr *> CppshSuppliedExprs;
 // variant begins (the tokens run, then .index() of their value), mapped to
 // where its `*` is (the index supplied there: cppshStageDecl).
 llvm::DenseMap<SourceLocation::UIntTy, SourceLocation> CppshVariantIndexNeeds;
+// cppsh: the index expressions `*v` makes (v.index()): a need of their own
+// value, an integer -- never of the variant's (a local's whole value, no
+// constant for a variant).
+llvm::DenseSet<const Expr *> CppshVariantIndexExprs;
 
 bool cppshTraceStaging() {
   static const bool On = ::getenv("CPPSH_TRACE_STAGING") != nullptr;
@@ -429,6 +433,7 @@ ExprResult cppshVariantDeref(Sema &S, SourceLocation OpLoc, Expr *Input) {
       return ExprEmpty();
     Index = Call.get();
     CppshVariantIndexNeeds[Input->getBeginLoc().getRawEncoding()] = OpLoc;
+    CppshVariantIndexExprs.insert(Index);
   }
   LookupResult R(S, &PP.getIdentifierTable().get("get"), OpLoc,
                  Sema::LookupOrdinaryName);
