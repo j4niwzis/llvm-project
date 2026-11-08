@@ -19,6 +19,7 @@ using std::println;
 using std::ranges::views::drop;
 using std::ranges::views::filter;
 using std::ranges::views::grep;
+using std::ranges::views::reverse;
 using std::ranges::views::show;
 using std::ranges::views::sort_by;
 using std::ranges::views::take;
