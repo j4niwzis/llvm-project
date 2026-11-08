@@ -49,6 +49,7 @@
 #  include <sys/wait.h>
 #  include <termios.h>
 #  include <thread>
+#  include <sys/ioctl.h>
 #  include <unistd.h>
 extern "C" char **environ;
 #endif
@@ -163,6 +164,39 @@ inline std::size_t __cppsh_utf8_width(std::string_view s) noexcept {
   return w;
 }
 
+// The first code points of s that fit in w columns, an ellipsis last where
+// some were cut.
+inline std::string __cppsh_utf8_fit(std::string_view s, std::size_t w) {
+  if (__cppsh_utf8_width(s) <= w)
+    return std::string(s);
+  if (w == 0)
+    return std::string();
+  std::size_t keep = w - 1, cols = 0, i = 0;
+  for (; i < s.size(); ++i) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    if ((c & 0xC0) != 0x80) {
+      if (cols == keep)
+        break;
+      ++cols;
+    }
+  }
+  return std::string(s.substr(0, i)) + "\u2026";
+}
+
+// The width of the terminal the output goes to; none (0) where it goes
+// elsewhere and COLUMNS says nothing.
+inline std::size_t __cppsh_terminal_columns() {
+#if !defined(_WIN32)
+  struct winsize ws{};
+  if (::isatty(1) && ::ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+    return ws.ws_col;
+#endif
+  if (const char *c = std::getenv("COLUMNS"))
+    if (long n = std::strtol(c, nullptr, 10); n > 0)
+      return static_cast<std::size_t>(n);
+  return 0;
+}
+
 inline std::string __cppsh_human_size(long long bytes) {
   char buf[64];
   if (bytes < 1024) {
@@ -232,6 +266,27 @@ inline void __cppsh_render_nu_table(
   for (const auto &row : rows)
     for (std::size_t c = 0; c < ncols && c < row.size(); ++c)
       widths[c] = std::max(widths[c], __cppsh_utf8_width(row[c].text));
+  // Fitted to the terminal: the widest column narrowed, one column at a
+  // time, down to a few characters at least -- its cells cut with an
+  // ellipsis.
+  if (std::size_t cols = __cppsh_terminal_columns()) {
+    auto total = [&] {
+      std::size_t t = 1;
+      for (std::size_t w : widths)
+        t += w + 3;
+      return t;
+    };
+    constexpr std::size_t MinWidth = 6;
+    while (total() > cols) {
+      std::size_t widest = 0;
+      for (std::size_t c = 1; c < ncols; ++c)
+        if (widths[c] > widths[widest])
+          widest = c;
+      if (widths[widest] <= MinWidth)
+        break;
+      widths[widest] = std::max(MinWidth, widths[widest] - std::min(widths[widest] - MinWidth, total() - cols));
+    }
+  }
 
   auto draw_hline = [&](const char *left, const char *mid, const char *right) {
     std::printf("%s%s", Dim, left);
@@ -248,15 +303,16 @@ inline void __cppsh_render_nu_table(
   // Header row
   std::printf("%s│%s", Dim, Reset);
   for (std::size_t c = 0; c < ncols; ++c) {
-    std::size_t w = __cppsh_utf8_width(headers[c]);
+    const std::string head = __cppsh_utf8_fit(headers[c], widths[c]);
+    std::size_t w = __cppsh_utf8_width(head);
     std::size_t pad = widths[c] > w ? (widths[c] - w) : 0;
     std::printf(" ");
     if (c == 0) {
       for (std::size_t k = 0; k < pad; ++k)
         std::putchar(' ');
-      std::printf("%s%s%s", HeadCol, headers[c].c_str(), Reset);
+      std::printf("%s%s%s", HeadCol, head.c_str(), Reset);
     } else {
-      std::printf("%s%s%s", HeadCol, headers[c].c_str(), Reset);
+      std::printf("%s%s%s", HeadCol, head.c_str(), Reset);
       for (std::size_t k = 0; k < pad; ++k)
         std::putchar(' ');
     }
@@ -271,21 +327,22 @@ inline void __cppsh_render_nu_table(
     std::printf("%s│%s", Dim, Reset);
     for (std::size_t c = 0; c < ncols; ++c) {
       const __cppsh_nu_cell &cell = row[c];
-      std::size_t w = __cppsh_utf8_width(cell.text);
+      const std::string text = __cppsh_utf8_fit(cell.text, widths[c]);
+      std::size_t w = __cppsh_utf8_width(text);
       std::size_t pad = widths[c] > w ? (widths[c] - w) : 0;
       std::printf(" ");
       if (cell.right_align) {
         for (std::size_t k = 0; k < pad; ++k)
           std::putchar(' ');
         if (!cell.color.empty())
-          std::printf("%s%s%s", cell.color.c_str(), cell.text.c_str(), Reset);
+          std::printf("%s%s%s", cell.color.c_str(), text.c_str(), Reset);
         else
-          std::printf("%s", cell.text.c_str());
+          std::printf("%s", text.c_str());
       } else {
         if (!cell.color.empty())
-          std::printf("%s%s%s", cell.color.c_str(), cell.text.c_str(), Reset);
+          std::printf("%s%s%s", cell.color.c_str(), text.c_str(), Reset);
         else
-          std::printf("%s", cell.text.c_str());
+          std::printf("%s", text.c_str());
         for (std::size_t k = 0; k < pad; ++k)
           std::putchar(' ');
       }
