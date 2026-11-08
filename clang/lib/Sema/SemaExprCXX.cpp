@@ -7082,6 +7082,10 @@ static void noteOperatorArrows(Sema &S,
   }
 }
 
+namespace clang {
+ExprResult cppshVariantDeref(Sema &S, SourceLocation OpLoc, Expr *Input);
+} // namespace clang
+
 ExprResult Sema::ActOnStartCXXMemberReference(Scope *S, Expr *Base,
                                               SourceLocation OpLoc,
                                               tok::TokenKind OpKind,
@@ -7110,6 +7114,28 @@ ExprResult Sema::ActOnStartCXXMemberReference(Scope *S, Expr *Base,
     MayBePseudoDestructor = true;
     return Base;
   }
+
+  // cppsh: `v->m` on a std::variant the user typed: `(*v).m` -- the member
+  // of the value it holds (cppshVariantDeref), its type the one known once
+  // the index is. A pointer to it, for the arrow to go through.
+  if (OpKind == tok::arrow)
+    if (ExprResult Held = cppshVariantDeref(*this, OpLoc, Base);
+        Held.isUsable()) {
+      Expr *H = Held.get();
+      // The alternative of a variant about to go (a temporary's, an
+      // xvalue): addressed as the object it is, until the full expression
+      // ends.
+      if (H->isXValue())
+        H = ImplicitCastExpr::Create(Context, H->getType(), CK_NoOp, H,
+                                     nullptr, VK_LValue, FPOptionsOverride());
+      ExprResult Addr = H->isLValue()
+                            ? CreateBuiltinUnaryOp(OpLoc, UO_AddrOf, H)
+                            : ExprError();
+      if (!Addr.isUsable())
+        return ExprError();
+      Base = Addr.get();
+      BaseType = Base->getType();
+    }
 
   // C++ [over.match.oper]p8:
   //   [...] When operator->returns, the operator-> is applied  to the value

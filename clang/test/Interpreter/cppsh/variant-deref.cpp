@@ -25,3 +25,12 @@ for (auto e : std::vector<std::variant<int, std::string>>{1, std::string("a")}) 
 }
 // CHECK: item 1
 // CHECK: item a
+// v->m: (*v).m, the member of the alternative held.
+struct pt { int x; };
+struct named { std::string x; };
+std::variant<pt, named> pv = named{"nm"};
+std::println("arrow {}", pv->x);
+// CHECK: arrow nm
+pv = pt{5};
+std::println("arrow {}", pv->x);
+// CHECK: arrow 5
